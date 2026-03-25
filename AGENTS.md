@@ -10,58 +10,38 @@ Agent instructions are organized into focused sub-files under `docs/agents/`. Re
 4. **[Documentation Rules](docs/agents/documentation-rules.md)** --- When and what to update
 5. **[Testing Requirements](docs/agents/testing-requirements.md)** --- Coverage expectations, test deletion policy
 6. **[Deployment Process](docs/agents/deployment-process.md)** --- Build/deploy flow, 1Password-backed auth
-7. **[Code Review Requirements](docs/agents/code-review-requirements.md)** --- Self-review, external review triggers, enforcement
 
-## PR Review Identities
+## Code Review Policy
 
-AI agents post reviews under dedicated GitHub accounts:
+This repository uses a multi-identity AI agent code review system. The full policy is in REVIEW_POLICY.md. The per-repo configuration is in .github/review-policy.yml.
 
-| Agent | GitHub username |
-|---|---|
-| Claude | @nathanpayne-claude |
-| Codex | @nathanpayne-codex |
-| Cursor | @nathanpayne-cursor |
+### Identity Rules
 
-These are bot accounts owned by @nathanjohnpayne. All three have Write access for PR review purposes only.
+- All agents author and commit code as nathanjohnpayne.
+- Each agent reviews code under its own reviewer identity (e.g., nathanpayne-claude, nathanpayne-cursor, nathanpayne-codex).
+- An agent never reviews code under the same identity that authored it.
+- Only nathanjohnpayne merges to the target branch.
 
-### Review tiers
+### Workflow Summary
 
-**Standard PRs** (under 300 lines of non-generated code, no infra/auth/architecture triggers):
-- One agent reviewer (not the author) may approve and merge.
-- The author must not approve or merge their own PR.
+1. Author code as nathanjohnpayne. File a PR.
+2. Switch to your reviewer identity (e.g., nathanpayne-claude). Review the PR. Post comments.
+3. Switch back to nathanjohnpayne. Address each comment. Push fix commits.
+4. Repeat steps 2–3 until the reviewer identity approves with no outstanding issues.
+5. Check .github/review-policy.yml for the external review threshold. If the PR meets the threshold (lines changed >= external_review_threshold OR files match external_review_paths), post a handoff message (see REVIEW_POLICY.md for format) and alert the human.
+6. If external review is not required, merge as nathanjohnpayne.
+7. If external review is required, wait for the human to relay external reviewer feedback. Resolve all issues through back-and-forth until the external reviewer approves.
+8. If the external reviewer flags observations or risks while approving, create a GitHub Issue for each one assigned to nathanjohnpayne with labels "post-review" and "observation" or "risk" before merging.
+9. Merge as nathanjohnpayne.
 
-**External-review PRs** (300+ lines, or infra/CI/CD/dep changes, or new architecture, or auth/data handling, or low-confidence code):
-- The PR is auto-labeled `needs-external-review`.
-- Two agent reviewers (neither the author) must both approve.
-- The authoring agent pushes a `review/pr-{number}-guidance` branch with a structured review guidance document.
-- The second approving reviewer removes the `needs-external-review` label, unblocking merge.
-- The author must not remove this label under any circumstances.
+### Disagreements
 
-**Human-escalated PRs:**
-- If agent reviewers disagree (one approves, one requests changes), the PR is auto-labeled `needs-human-review`.
-- If @nathanjohnpayne manually adds the `needs-human-review` label, agent-only merge is blocked.
-- Only @nathanjohnpayne may remove `needs-human-review` and approve.
+If the internal reviewer and external reviewer disagree, the human is the tiebreaker. Surface both positions clearly and wait.
 
-### Subagent invocation
+### Adding a New Agent
 
-When assigned as a reviewer, agents should automatically begin their review. The GitHub Actions workflow will trigger the appropriate agent. If headless invocation is not available for an agent (e.g., Cursor), the review must be performed manually.
+1. Create a GitHub account: nathanpayne-{agent}
+2. Add it to available_reviewers in .github/review-policy.yml.
+3. Configure the agent environment with credentials for both nathanjohnpayne and the new reviewer identity.
 
-### Review protocol
-
-- The authoring agent must **never** approve its own PR.
-- Cross-agent review rotation: Claude → Codex → Cursor → Claude.
-- For external-review PRs, the second reviewer is the remaining agent not already involved.
-- @nathanjohnpayne may review, approve, or merge any PR at any tier.
-
-### Review guidance (external reviews only)
-
-When your PR is labeled `needs-external-review`, you must:
-
-1. Create a branch named `review/pr-{number}-guidance` off the PR's head branch.
-2. Add a file `reviews/pr-{number}-guidance.md` using the template at `.github/templates/review-guidance.md`.
-3. Fill in all sections honestly—do not minimize risks or inflate confidence.
-4. Push the branch. Do not open a PR for this branch; it is a reference artifact only.
-5. Post a comment on the PR linking to the guidance file:
-   `Review guidance: [{repo}/blob/review/pr-{number}-guidance/reviews/pr-{number}-guidance.md]`
-
-External reviewers must read the guidance document before starting their review.
+For the complete policy including the handoff message format, post-merge issue creation rules, and git identity switching instructions, read REVIEW_POLICY.md.

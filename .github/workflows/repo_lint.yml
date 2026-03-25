@@ -28,3 +28,16 @@ jobs:
 
       - name: check_duplicate_docs
         run: ./scripts/ci/check_duplicate_docs
+
+      - name: check_review_policy_exists
+        run: |
+          MISSING=0
+          if [ ! -f ".github/review-policy.yml" ]; then
+            echo "ERROR: .github/review-policy.yml is missing"
+            MISSING=1
+          fi
+          if [ ! -f "REVIEW_POLICY.md" ]; then
+            echo "ERROR: REVIEW_POLICY.md is missing"
+            MISSING=1
+          fi
+          exit $MISSING

@@ -1,0 +1,57 @@
+# .github/review-policy.yml
+#
+# AI Agent Code Review Policy Configuration
+# See REVIEW_POLICY.md for full documentation.
+#
+# This file is read by AI coding agents at the start of every review cycle
+# to determine review requirements and identity configuration.
+
+# ---------------------------------------------------------------------------
+# External Review Threshold
+# ---------------------------------------------------------------------------
+# Total lines changed (additions + deletions) that trigger mandatory external
+# review by a different agent. The agent evaluates this after internal
+# self-peer review passes.
+#
+# Set to 0 to require external review on every PR.
+# Set to a very high number (e.g., 999999) to effectively disable.
+external_review_threshold: 300
+
+# ---------------------------------------------------------------------------
+# Protected Paths
+# ---------------------------------------------------------------------------
+# File paths that always require external review regardless of line count.
+# Glob patterns are supported. If any file in the PR diff matches a pattern
+# listed here, external review is mandatory.
+external_review_paths:
+  - "src/auth/**"
+  - "src/payments/**"
+  - "**/*secret*"
+  - "**/*credential*"
+  - ".github/**"
+
+# ---------------------------------------------------------------------------
+# Reviewer Identities
+# ---------------------------------------------------------------------------
+# Registered GitHub accounts that may post reviews. Each agent has exactly
+# one reviewer identity. To add a new agent, create a GitHub account
+# following the pattern nathanpayne-{agent} and add it here.
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-cursor
+  - nathanpayne-codex
+
+# ---------------------------------------------------------------------------
+# Default External Reviewer
+# ---------------------------------------------------------------------------
+# When the agent needs to suggest an external reviewer in a handoff message,
+# it defaults to this identity. The agent may override this suggestion based
+# on context (e.g., suggesting the agent with the most relevant expertise).
+default_external_reviewer: nathanpayne-codex
+
+# ---------------------------------------------------------------------------
+# Author Identity
+# ---------------------------------------------------------------------------
+# All agents commit code under this single shared identity.
+# Do not change this unless the repo owner account changes.
+author_identity: nathanjohnpayne
