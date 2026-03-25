@@ -38,3 +38,4 @@ All checks must pass before merge.
 - check_dist_not_modified
 - check_spec_test_alignment
 - check_duplicate_docs
+- check_review_policy_exists: .github/review-policy.yml and REVIEW_POLICY.md must both exist
