@@ -205,7 +205,7 @@ Agents must automate identity switching so that commits and PR activity are attr
 - Review comments and PR reviews are posted via `nathanpayne-{agent}`'s GitHub credentials.
 - The switch is fully automated within the agent session—no human intervention required for internal review.
 
-Example (Git CLI):
+### Git commit identity (user.name / user.email)
 
 ```bash
 # Switch to author identity
@@ -217,31 +217,87 @@ git config user.name "nathanpayne-claude"
 git config user.email "claude@nathanpayne-claude.example"
 ```
 
-Authentication for posting PR reviews under the reviewer identity requires a personal access token for that account.
+### SSH identity switching (push / pull)
 
-### PAT requirements for reviewer identities
+All repos use SSH remotes (`git@github.com:nathanjohnpayne/...`). SSH keys are managed by 1Password and served through its SSH agent. `~/.ssh/config` maps host aliases to specific keys:
 
-Reviewer accounts are **collaborators** on repos owned by `nathanjohnpayne`. This
-constrains the PAT type:
+| SSH Host | GitHub Account | Key (1Password) |
+|----------|----------------|-----------------|
+| `github.com` | nathanjohnpayne | GitHub (nathanjohnpayne) |
+| `github-claude` | nathanpayne-claude | GitHub Claude |
+| `github-cursor` | nathanpayne-cursor | GitHub Cursor |
+| `github-codex` | nathanpayne-codex | GitHub Codex |
 
-- **Classic PATs with `repo` scope** — required for collaborator accounts. Fine-grained
-  PATs on personal (non-org) GitHub accounts only cover repos the account *owns*.
-  The "All repositories" scope means all owned repos (zero for collaborators), and
-  "Only select repositories" does not list collaborator repos.
-- Store each PAT in 1Password as `GitHub PAT (pr-review-{agent})` with a concealed
-  field named `token`.
-- Access via item ID to avoid shell escaping issues with parentheses in the title:
-  `op read "op://Private/<item-uuid>/token"`
+The public key files (`~/.ssh/id_nathanjohnpayne.pub`, etc.) tell the 1Password agent which private key to sign with. `IdentitiesOnly yes` prevents SSH from trying all keys.
 
-### CLI usage for posting reviews
+To push/pull as the default author identity (`nathanjohnpayne`), no change is needed — the `github.com` host is the default.
+
+To push/pull as a reviewer identity, temporarily switch the remote:
 
 ```bash
-# Look up the 1Password item ID
-op item list --vault Private | grep "pr-review-claude"
+# Switch remote to reviewer identity
+git remote set-url origin git@github-claude:nathanjohnpayne/repo-name.git
 
+# ... do review work, push review branch ...
+
+# Switch back to author identity
+git remote set-url origin git@github.com:nathanjohnpayne/repo-name.git
+```
+
+### GitHub API authentication (gh CLI)
+
+For posting PR reviews and comments under a reviewer identity, use `gh` with a PAT:
+
+```bash
 # Post a review as the reviewer identity
 REVIEWER_TOKEN=$(op read "op://Private/<item-id>/token")
 GH_TOKEN="$REVIEWER_TOKEN" gh pr review <PR#> --approve --body "Review comment"
+```
+
+### PAT requirements for reviewer identities
+
+Reviewer accounts are **collaborators** on repos owned by `nathanjohnpayne`. This constrains the PAT type:
+
+- **Classic PATs with `repo` scope** — required for collaborator accounts. Fine-grained PATs on personal (non-org) GitHub accounts only cover repos the account *owns*. The "All repositories" scope means all owned repos (zero for collaborators), and "Only select repositories" does not list collaborator repos.
+- Store each PAT in 1Password as `GitHub PAT (pr-review-{agent})` with a concealed field named `token`.
+- Access via item ID to avoid shell escaping issues with parentheses in the title: `op read "op://Private/<item-uuid>/token"`
+
+### 1Password SSH agent setup (one-time)
+
+If `~/.ssh/config` does not exist or is missing the host aliases above:
+
+```bash
+# 1. Export public keys from the 1Password SSH agent
+export SSH_AUTH_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+ssh-add -L | grep "nathanjohnpayne" > ~/.ssh/id_nathanjohnpayne.pub
+ssh-add -L | grep "Claude"          > ~/.ssh/id_nathanpayne_claude.pub
+ssh-add -L | grep "Cursor"          > ~/.ssh/id_nathanpayne_cursor.pub
+ssh-add -L | grep "Codex"           > ~/.ssh/id_nathanpayne_codex.pub
+
+# 2. Create ~/.ssh/config (see the host alias table above for the full file)
+# 3. chmod 600 ~/.ssh/config
+
+# 4. Verify
+ssh -T git@github.com          # → Hi nathanjohnpayne!
+ssh -T git@github-claude        # → Hi nathanpayne-claude!
+```
+
+### Switching all repos to SSH remotes
+
+```bash
+for repo in ai_agent_repo_template swipewatch nathanpaynedotcom \
+            device-platform-reporting device-source-of-truth \
+            overridebroadway friends-and-family-billing docs; do
+  cd ~/Documents/GitHub/$repo
+  CURRENT=$(git remote get-url origin)
+  if [[ "$CURRENT" == https* ]]; then
+    SLUG=$(echo "$CURRENT" | sed 's|https://github.com/||;s|\.git$||')
+    git remote set-url origin "git@github.com:${SLUG}.git"
+    echo "$repo: https → ssh"
+  else
+    echo "$repo: already ssh"
+  fi
+done
 ```
 
 ## Adding a New Agent
@@ -251,10 +307,13 @@ GH_TOKEN="$REVIEWER_TOKEN" gh pr review <PR#> --approve --body "Review comment"
 3. Accept the invitation (browser or classic PAT — fine-grained PATs cannot accept invites).
 4. Generate a **classic** PAT with `repo` scope for the new account.
 5. Store the PAT in 1Password as `GitHub PAT (pr-review-{agent})`, field name `token`.
-6. Add the identity to `available_reviewers` in each relevant repo's `.github/review-policy.yml`.
-7. Add the PAT as a repository secret (e.g., `{AGENT}_PAT`) for CI workflows.
-8. Configure the new agent's environment with both the `nathanjohnpayne` author credentials and the `nathanpayne-{agent}` reviewer credentials.
-9. The new agent follows the same workflow described above.
+6. Create an SSH key in 1Password named `GitHub {Agent}`. Add the public key to the new GitHub account under Settings → SSH and GPG keys.
+7. Export the public key: `ssh-add -L | grep "{Agent}" > ~/.ssh/id_nathanpayne_{agent}.pub`
+8. Add a `Host github-{agent}` block to `~/.ssh/config` pointing at the new public key file.
+9. Add the identity to `available_reviewers` in each relevant repo's `.github/review-policy.yml`.
+10. Add the PAT as a repository secret (e.g., `{AGENT}_PAT`) for CI workflows.
+11. Configure the new agent's environment with both the `nathanjohnpayne` author credentials and the `nathanpayne-{agent}` reviewer credentials.
+12. The new agent follows the same workflow described above.
 
 ## Template Usage
 
