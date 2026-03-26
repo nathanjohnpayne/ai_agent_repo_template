@@ -1,5 +1,133 @@
 # Deployment
 
+## New Machine Setup
+
+Run these steps on any new or temporary machine. Tell your AI agent:
+
+> "Set up this machine for development. Run the new machine setup from DEPLOYMENT.md."
+
+### 1. Install system tools
+
+```bash
+# 1Password CLI
+brew install --cask 1password-cli
+
+# Firebase CLI
+npm install -g firebase-tools
+
+# Google Cloud SDK
+brew install google-cloud-sdk
+
+# GitHub CLI
+brew install gh
+```
+
+### 2. Authenticate
+
+```bash
+# 1Password — enables biometric unlock for op CLI
+# (Follow the prompts to sign in and enable Touch ID)
+op signin
+
+# GitHub CLI
+gh auth login
+
+# Google Cloud — use 1Password-backed ADC (no interactive login needed
+# if op is authenticated and the GCP ADC item exists in 1Password)
+```
+
+### 3. Install deploy scripts
+
+```bash
+# Clone the template repo if not already present
+git clone https://github.com/nathanjohnpayne/ai_agent_repo_template.git ~/Documents/GitHub/ai_agent_repo_template
+
+# Install canonical helper scripts
+mkdir -p ~/.local/bin
+cp ~/Documents/GitHub/ai_agent_repo_template/scripts/gcloud/gcloud ~/.local/bin/
+cp ~/Documents/GitHub/ai_agent_repo_template/scripts/firebase/op-firebase-deploy ~/.local/bin/
+cp ~/Documents/GitHub/ai_agent_repo_template/scripts/firebase/op-firebase-setup ~/.local/bin/
+chmod +x ~/.local/bin/gcloud ~/.local/bin/op-firebase-deploy ~/.local/bin/op-firebase-setup
+
+# Ensure PATH includes ~/.local/bin
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+```
+
+### 4. Clone and bootstrap all repos
+
+```bash
+cd ~/Documents/GitHub
+
+for repo in friends-and-family-billing device-platform-reporting device-source-of-truth swipewatch nathanpaynedotcom overridebroadway; do
+  git clone "https://github.com/nathanjohnpayne/$repo.git" 2>/dev/null || (cd "$repo" && git pull)
+  cd "$repo"
+  ./scripts/bootstrap.sh    # restores .env.local from 1Password via op inject
+  cd ..
+done
+```
+
+The bootstrap script for each repo:
+- Resolves `op://` references in `.env.tpl` → writes `.env.local` (via `op inject`)
+- Runs `npm install`
+- Runs `npm run build` (if applicable)
+
+### 5. Verify
+
+```bash
+# Quick check that each repo's local config was restored
+for repo in friends-and-family-billing device-platform-reporting device-source-of-truth overridebroadway; do
+  echo "=== $repo ==="
+  ls ~/Documents/GitHub/$repo/.env* 2>/dev/null || echo "  (no env files expected)"
+done
+```
+
+---
+
+## Returning to Your Main Machine
+
+When you return from a temporary machine, tell your agent:
+
+> "Sync any changes from this session back. Run the return-to-main workflow from DEPLOYMENT.md."
+
+### 1. On the temporary machine (before leaving)
+
+```bash
+cd ~/Documents/GitHub
+for repo in friends-and-family-billing device-platform-reporting device-source-of-truth swipewatch nathanpaynedotcom overridebroadway; do
+  cd "$repo"
+  # Push any local config changes to 1Password
+  ./scripts/bootstrap.sh --sync
+  # Ensure all code changes are committed and pushed
+  git status
+  cd ..
+done
+```
+
+### 2. On the main machine (when you return)
+
+```bash
+cd ~/Documents/GitHub
+for repo in friends-and-family-billing device-platform-reporting device-source-of-truth swipewatch nathanpaynedotcom overridebroadway; do
+  cd "$repo"
+  git pull                          # get code changes from the temp machine
+  ./scripts/bootstrap.sh --force    # re-resolve .env.tpl from 1Password (latest values)
+  cd ..
+done
+```
+
+The `--force` flag overwrites existing `.env.local` files with freshly resolved
+values from 1Password. This ensures you pick up any secrets that were updated
+on the temporary machine via `--sync`.
+
+### Conflict resolution
+
+If both machines modified the same 1Password item:
+- 1Password keeps the latest write (last-writer-wins)
+- The `.env.tpl` templates are in git, so structural changes merge normally
+- For true conflicts, compare with `op item get <id>` and resolve manually
+
+---
+
 ## Prerequisites
 
 - [Firebase CLI](https://firebase.google.com/docs/cli) (`firebase-tools`) installed globally
