@@ -61,10 +61,11 @@ for line in lines:
             break
         if indent == 0 and line_indent > 0:
             indent = line_indent
-        if stripped.startswith("- "):
-            val = stripped.lstrip("- ").strip().strip('"').strip("'")
+        trimmed = stripped.strip()
+        if trimmed.startswith("- "):
+            val = trimmed[2:].strip().strip('"').strip("'")
             values.append(val)
-        elif ": " in stripped or stripped.endswith(":"):
+        elif ": " in trimmed or trimmed.endswith(":"):
             # Map entry — print key:value
             parts = stripped.strip().split(":", 1)
             k = parts[0].strip().strip('"').strip("'")
@@ -110,11 +111,12 @@ for line in lines:
         if map_indent == 0 and line_indent > 0:
             map_indent = line_indent
 
-        if stripped.startswith("- "):
+        trimmed = stripped.strip()
+        if trimmed.startswith("- "):
             # List item under current key
-            val = stripped.lstrip("- ").strip().strip('"').strip("'")
+            val = trimmed[2:].strip().strip('"').strip("'")
             print(f"{current_key}={val}")
-        elif ": " in stripped and not stripped.strip().startswith("-"):
+        elif ": " in trimmed and not trimmed.startswith("-"):
             parts = stripped.strip().split(":", 1)
             k = parts[0].strip().strip('"').strip("'")
             v = parts[1].strip().strip('"').strip("'") if parts[1].strip() else ""
