@@ -137,18 +137,10 @@ if [[ ${#TEST_GLOBS[@]} -eq 0 ]]; then
   TEST_GLOBS=("tests/**/*.test.*")
 fi
 
-# Build spec_test_map associative array
-declare -A SPEC_MAP
-while IFS= read -r entry; do
-  [[ -z "$entry" ]] && continue
-  key="${entry%%=*}"
-  val="${entry#*=}"
-  if [[ -n "${SPEC_MAP[$key]+x}" ]]; then
-    SPEC_MAP[$key]="${SPEC_MAP[$key]}|$val"
-  else
-    SPEC_MAP[$key]="$val"
-  fi
-done < <(read_spec_test_map)
+# Build spec_test_map as a temp file (bash 3 compatible — no associative arrays)
+SPEC_MAP_FILE="$(mktemp "${TMPDIR:-/tmp}/spec-map-XXXXXX")"
+trap 'rm -f "$SPEC_MAP_FILE"' EXIT
+read_spec_test_map > "$SPEC_MAP_FILE"
 
 # Extract spec_id from YAML frontmatter
 extract_frontmatter() {
@@ -213,15 +205,16 @@ while IFS= read -r -d '' spec; do
   [[ -z "$spec_id" ]] && spec_id="$spec_basename"
 
   # 1. Check spec_test_map
-  if [[ -n "${SPEC_MAP[$spec_id]+x}" ]]; then
-    IFS='|' read -ra mapped_tests <<< "${SPEC_MAP[$spec_id]}"
+  mapped_entries="$(grep "^${spec_id}=" "$SPEC_MAP_FILE" 2>/dev/null || true)"
+  if [[ -n "$mapped_entries" ]]; then
     all_exist=true
-    for test_path in "${mapped_tests[@]}"; do
-      if [[ ! -f "$REPO_ROOT/$test_path" ]]; then
+    while IFS= read -r entry; do
+      test_path="${entry#*=}"
+      if [[ -n "$test_path" && ! -f "$REPO_ROOT/$test_path" ]]; then
         echo "WARN: Mapped test not found for $spec_id: $test_path"
         all_exist=false
       fi
-    done
+    done <<< "$mapped_entries"
     if $all_exist; then
       continue
     fi
