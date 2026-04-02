@@ -369,6 +369,29 @@ in 1Password with the field name `token` (not `credential` or `password`).
 Use the item ID (not the item title) to avoid shell issues with parentheses in
 1Password item names like `GitHub PAT (pr-review-claude)`.
 
+### Reviewer PAT quick check
+
+Before asking a reviewer identity to approve a PR, verify the token with
+`gh api user` and then reuse the same explicit `GH_TOKEN` override for
+`gh pr review`:
+
+```bash
+GH_TOKEN="$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')" \
+  gh api user --jq '.login'
+# expected: nathanpayne-codex
+
+GH_TOKEN="$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')" \
+  gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
+```
+
+- If `gh auth status` still shows `nathanjohnpayne`, that is okay.
+  `GH_TOKEN=...` overrides the ambient login for that command.
+- On local interactive machines, the `op read` command itself may trigger the
+  1Password biometric prompt even if `op whoami` says you are not signed in.
+- `Review Can not approve your own pull request` means the wrong GitHub
+  identity is still being used.
+- Use the 1Password item ID, not the item title, in `op read`.
+
 ### Token rotation (as needed)
 
 The current PATs are set to never expire. If you ever need to rotate them:

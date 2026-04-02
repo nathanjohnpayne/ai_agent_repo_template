@@ -32,6 +32,32 @@ To add a new agent, register a GitHub account following the pattern `nathanpayne
 - The author identity (`nathanjohnpayne`) is always the one that merges to the target branch.
 - Reviewer identities only post review comments, request changes, and approve PRs. They do not merge.
 
+### Reviewer PAT Quick Start
+
+When posting a PR review as a reviewer identity, always pass a PAT from 1Password
+to `gh` explicitly. Do not rely on the GitHub connector session or on the
+account shown by `gh auth status`.
+
+```bash
+# Example: verify the Codex reviewer identity before approving a PR
+GH_TOKEN="$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')" \
+  gh api user --jq '.login'
+# expected: nathanpayne-codex
+
+GH_TOKEN="$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')" \
+  gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
+```
+
+- If `gh auth status` still shows `nathanjohnpayne`, that is okay.
+  `GH_TOKEN=...` overrides the ambient login for that command.
+- If `op whoami` says you are not signed in, still run the `op read ...`
+  command in an interactive TTY. That is what triggers the 1Password biometric
+  prompt on local machines.
+- If GitHub returns `Review Can not approve your own pull request`, the wrong
+  reviewer identity is still being used.
+- Use the 1Password item ID, not the item title, in `op read`.
+- Swap the item ID for the Claude or Cursor reviewer as needed.
+
 ## Workflow
 
 ### Phase 1: Authoring
@@ -246,13 +272,29 @@ git remote set-url origin git@github.com:nathanjohnpayne/repo-name.git
 
 ### GitHub API authentication (gh CLI)
 
-For posting PR reviews and comments under a reviewer identity, use `gh` with a PAT:
+For posting PR reviews and comments under a reviewer identity, use `gh` with an
+explicit PAT from 1Password. Do not rely on the GitHub connector session or on
+the ambient `gh` login.
 
 ```bash
-# Post a review as the reviewer identity
-REVIEWER_TOKEN=$(op read "op://Private/<item-id>/token")
-GH_TOKEN="$REVIEWER_TOKEN" gh pr review <PR#> --approve --body "Review comment"
+# Example: verify the Codex reviewer identity before posting the review
+GH_TOKEN="$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')" \
+  gh api user --jq '.login'
+# expected: nathanpayne-codex
+
+# Post the review with the same explicit token
+GH_TOKEN="$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')" \
+  gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
 ```
+
+- If `gh auth status` shows `nathanjohnpayne`, that is fine.
+  `GH_TOKEN=...` overrides the ambient login for that command.
+- If `op whoami` says you are not signed in, still run the `op read ...`
+  command in an interactive TTY. That is what triggers the 1Password biometric
+  prompt on local machines.
+- If GitHub returns `Review Can not approve your own pull request`, the wrong
+  reviewer identity is still being used.
+- Use the 1Password item ID, not the item title, in `op read`.
 
 > **If `op read` fails with a sign-in or biometric error here**, follow the pause-and-prompt procedure in `docs/agents/operating-rules.md` under "1Password CLI authentication failures." Do not hardcode tokens, skip review, or retry in a loop.
 
