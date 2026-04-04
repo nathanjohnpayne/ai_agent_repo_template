@@ -51,3 +51,63 @@ This rule applies only to 1Password CLI sign-in and authentication
 errors. Other `op` failures (wrong item ID, missing field, network
 errors, vault permission errors) should be diagnosed and resolved
 normally.
+
+## Bug fix escalation policy
+
+These rules prevent agents from repeatedly patching symptoms of a
+structural defect. They are derived from a real failure where one agent
+made six unsuccessful fix attempts on the same issue because every
+attempt preserved the same broken architectural assumption.
+
+### Two-strike audit rule
+
+If an agent has made **two or more failed fix attempts** on the same
+issue (i.e., two merged PRs that were each intended to resolve the issue
+but did not), the next attempt **must** begin with a written audit of
+all prior attempts before any code changes. The audit must:
+
+1. List every prior PR that targeted this issue.
+2. For each, state what it changed and why it was insufficient.
+3. Identify the **shared assumption** across all prior attempts.
+4. Propose a fix that addresses that assumption directly, not another
+   symptom within it.
+
+The audit should appear in the PR description under a section titled
+"Audit Of Prior Failed Fixes."
+
+If the agent cannot identify a shared assumption, it must flag the issue
+to the human rather than filing another incremental fix.
+
+### Agent rotation for retries
+
+When an agent's fixes are not resolving an issue after two attempts,
+**hand the problem to a different agent**. A fresh agent without the
+prior context is less likely to inherit implicit assumptions about the
+system's architecture. The new agent should be given:
+
+- The issue description
+- Links to all prior fix PRs
+- No additional narrative framing (let it form its own model)
+
+This is a recommendation, not a hard rule. The human decides when to
+rotate.
+
+### Serialization layer review requirement
+
+When reviewing a PR that introduces or modifies a **serialization or
+deserialization layer**—any code that converts structured data to a flat
+format (strings, JSON, markdown, plain text) and back—the reviewer must
+verify:
+
+1. **Losslessness:** Does the round-trip preserve all semantically
+   meaningful information? If not, what is discarded?
+2. **Consumer parity:** Do all consumers of the serialized format
+   produce identical output from identical input? If there are multiple
+   parsers/renderers, are they tested for equivalence?
+3. **Necessity:** Is the intermediate format required, or can consumers
+   read the structured format directly?
+
+If the round-trip is lossy, the reviewer must flag the information loss
+as a design risk and require either:
+- An explicit justification for why the loss is acceptable, or
+- A plan to eliminate the intermediate format
