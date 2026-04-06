@@ -26,6 +26,8 @@ explicitly authorizes a break-glass override in chat.
 ## After opening the PR
 
 4. Switch to your reviewer identity (e.g., nathanpayne-claude).
+   Use `GH_TOKEN="$(op read 'op://Private/<item-id>/token')"` to authenticate
+   API calls. See REVIEW_POLICY.md § PAT lookup table for your agent's item ID.
 5. Review the PR. Post comments on any issues found.
 6. Switch back to nathanjohnpayne. Address each comment. Push fix commits.
 7. Repeat steps 4–6 until the reviewer identity approves.

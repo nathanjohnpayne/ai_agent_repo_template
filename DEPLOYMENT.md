@@ -376,21 +376,23 @@ Before asking a reviewer identity to approve a PR, verify the token with
 `gh pr review`:
 
 ```bash
-GH_TOKEN="$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')" \
+# Example: verify the Claude reviewer identity before approving a PR
+GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
   gh api user --jq '.login'
-# expected: nathanpayne-codex
+# expected: nathanpayne-claude
 
-GH_TOKEN="$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')" \
+GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
   gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
 ```
 
+- Use the item ID from the table above for your agent identity. Do not use the 1Password item title.
 - If `gh auth status` still shows `nathanjohnpayne`, that is okay.
   `GH_TOKEN=...` overrides the ambient login for that command.
 - On local interactive machines, the `op read` command itself may trigger the
   1Password biometric prompt even if `op whoami` says you are not signed in.
 - `Review Can not approve your own pull request` means the wrong GitHub
-  identity is still being used.
-- Use the 1Password item ID, not the item title, in `op read`.
+  identity is still being used. Check the table above and verify you are using
+  your agent's item ID, not the author identity's.
 
 ### Token rotation (as needed)
 

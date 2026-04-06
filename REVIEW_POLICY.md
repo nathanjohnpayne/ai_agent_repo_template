@@ -38,25 +38,34 @@ When posting a PR review as a reviewer identity, always pass a PAT from 1Passwor
 to `gh` explicitly. Do not rely on the GitHub connector session or on the
 account shown by `gh auth status`.
 
-```bash
-# Example: verify the Codex reviewer identity before approving a PR
-GH_TOKEN="$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')" \
-  gh api user --jq '.login'
-# expected: nathanpayne-codex
+#### PAT lookup table
 
-GH_TOKEN="$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')" \
+| Agent | Reviewer Identity | 1Password Item ID | `op read` path |
+|-------|-------------------|-------------------|----------------|
+| Claude | `nathanpayne-claude` | `pvbq24vl2h6gl7yjclxy2hbote` | `op://Private/pvbq24vl2h6gl7yjclxy2hbote/token` |
+| Cursor | `nathanpayne-cursor` | `bslrih4spwxgookzfy6zedz5g4` | `op://Private/bslrih4spwxgookzfy6zedz5g4/token` |
+| Codex | `nathanpayne-codex` | `o6ekjxjjl5gq6rmcneomrjahpu` | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
+| Human | `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `op://Private/sm5kopwk6t6p3xmu2igesndzhe/token` |
+
+```bash
+# Example: verify the Claude reviewer identity before approving a PR
+GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
+  gh api user --jq '.login'
+# expected: nathanpayne-claude
+
+GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
   gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
 ```
 
+- Use the item ID from the lookup table above for your agent identity. Do not use the 1Password item title.
 - If `gh auth status` still shows `nathanjohnpayne`, that is okay.
   `GH_TOKEN=...` overrides the ambient login for that command.
 - If `op whoami` says you are not signed in, still run the `op read ...`
   command in an interactive TTY. That is what triggers the 1Password biometric
   prompt on local machines.
 - If GitHub returns `Review Can not approve your own pull request`, the wrong
-  reviewer identity is still being used.
-- Use the 1Password item ID, not the item title, in `op read`.
-- Swap the item ID for the Claude or Cursor reviewer as needed.
+  reviewer identity is still being used. Check the lookup table and verify you
+  are using your agent's item ID, not the author identity's.
 
 ## Workflow
 
@@ -274,27 +283,29 @@ git remote set-url origin git@github.com:nathanjohnpayne/repo-name.git
 
 For posting PR reviews and comments under a reviewer identity, use `gh` with an
 explicit PAT from 1Password. Do not rely on the GitHub connector session or on
-the ambient `gh` login.
+the ambient `gh` login. Refer to the [PAT lookup table](#pat-lookup-table) for
+your agent's 1Password item ID.
 
 ```bash
-# Example: verify the Codex reviewer identity before posting the review
-GH_TOKEN="$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')" \
+# Example: verify the Claude reviewer identity before posting the review
+GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
   gh api user --jq '.login'
-# expected: nathanpayne-codex
+# expected: nathanpayne-claude
 
 # Post the review with the same explicit token
-GH_TOKEN="$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')" \
+GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
   gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
 ```
 
+- Use the item ID from the [PAT lookup table](#pat-lookup-table) for your agent identity. Do not use the 1Password item title.
 - If `gh auth status` shows `nathanjohnpayne`, that is fine.
   `GH_TOKEN=...` overrides the ambient login for that command.
 - If `op whoami` says you are not signed in, still run the `op read ...`
   command in an interactive TTY. That is what triggers the 1Password biometric
   prompt on local machines.
 - If GitHub returns `Review Can not approve your own pull request`, the wrong
-  reviewer identity is still being used.
-- Use the 1Password item ID, not the item title, in `op read`.
+  reviewer identity is still being used. Check the [PAT lookup table](#pat-lookup-table)
+  and verify you are using your agent's item ID, not the author identity's.
 
 > **If `op read` fails with a sign-in or biometric error here**, follow the pause-and-prompt procedure in `docs/agents/operating-rules.md` under "1Password CLI authentication failures." Do not hardcode tokens, skip review, or retry in a loop.
 
@@ -304,7 +315,7 @@ Reviewer accounts are **collaborators** on repos owned by `nathanjohnpayne`. Thi
 
 - **Classic PATs with `repo` scope** — required for collaborator accounts. Fine-grained PATs on personal (non-org) GitHub accounts only cover repos the account *owns*. The "All repositories" scope means all owned repos (zero for collaborators), and "Only select repositories" does not list collaborator repos.
 - Store each PAT in 1Password as `GitHub PAT (pr-review-{agent})` with a concealed field named `token`.
-- Access via item ID to avoid shell escaping issues with parentheses in the title: `op read "op://Private/<item-uuid>/token"`
+- Access via item ID to avoid shell escaping issues with parentheses in the title. See the [PAT lookup table](#pat-lookup-table) for all current item IDs.
 
 ### 1Password SSH agent setup (one-time)
 
