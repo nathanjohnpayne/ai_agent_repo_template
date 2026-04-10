@@ -1,38 +1,44 @@
 # .coderabbit.yml — CodeRabbit configuration
 # See https://docs.coderabbit.ai/configuration
-#
-# This file configures CodeRabbit's automated review behavior.
-# CodeRabbit is only active on repos where the GitHub App is installed
-# (typically public repos only). See .github/review-policy.yml for
-# whether this repo has CodeRabbit enabled in the review workflow.
 
 language: en-US
 
+tone_instructions: >-
+  Focus on bugs, security issues, and correctness over style nitpicks.
+  Flag any hardcoded credentials, exposed API keys, or secrets.
+  Keep comments actionable and concise.
+
 reviews:
-  # Post a review on every PR automatically
   auto_review:
     enabled: true
     drafts: false
     base_branches:
       - main
 
-  # Review profile: assertive catches more issues but may produce
-  # false positives. Use "chill" for a lighter touch.
   profile: assertive
-
-  # Advisory only — CodeRabbit posts review comments but does not
-  # submit a "Changes Requested" review state.
   request_changes_workflow: false
 
-  # Provide a high-level walkthrough summary at the top of each review
   high_level_summary: true
   high_level_summary_placeholder: "@coderabbitai summary"
-
-  # Professional tone — no poem/haiku at the end
+  high_level_summary_in_walkthrough: true
+  collapse_walkthrough: true
   poem: false
 
-  path_instructions: []
-  collapse_walkthrough: false
+  related_issues: true
+  related_prs: true
+  assess_linked_issues: true
+  estimate_code_review_effort: true
+
+  path_instructions:
+    - path: "scripts/**"
+      instructions: >-
+        Review shell scripts for safety: unquoted variables, missing error
+        handling (set -euo pipefail), command injection risks, and
+        cross-platform portability issues.
+    - path: "docs/**"
+      instructions: >-
+        Check documentation for accuracy against the actual scripts and
+        configuration it describes. Flag stale references.
 
 chat:
   auto_reply: true
