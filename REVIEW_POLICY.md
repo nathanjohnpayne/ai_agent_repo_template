@@ -69,6 +69,30 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
 
 ## Workflow
 
+### Phase 0: Credential Preflight
+
+> Run this once at the start of every PR review or deploy session. It front-loads all 1Password credential reads and SSH key authorization into a single burst of biometric prompts (~15 seconds), so the human can step away for the rest of the session.
+
+```bash
+eval "$(scripts/op-preflight.sh --agent claude --mode all)"
+```
+
+Replace `claude` with `cursor` or `codex` depending on which agent is running. The `--mode` flag controls what is loaded:
+
+| Mode | What's loaded |
+|------|--------------|
+| `review` | Reviewer PAT + author PAT + SSH keys |
+| `deploy` | GCP ADC credential |
+| `all` | Everything (recommended) |
+
+After preflight, these environment variables are set:
+- `OP_PREFLIGHT_REVIEWER_PAT` — use with `GH_TOKEN=` for reviewer commands
+- `OP_PREFLIGHT_AUTHOR_PAT` — use with `GH_TOKEN=` for author commands
+- `GOOGLE_APPLICATION_CREDENTIALS` — used automatically by gcloud/Firebase scripts
+- `OP_PREFLIGHT_DONE=1` — flag indicating preflight has been run
+
+If any `op` command fails mid-session (rare — only if 1Password locks or the 12-hour hard limit is reached), re-run the preflight command.
+
 ### Phase 1: Authoring
 
 1. The agent creates a feature branch from the target branch (e.g., `main`).
@@ -90,15 +114,28 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
 
 After internal review passes (Phase 2), CodeRabbit provides an independent automated review:
 
-1. CodeRabbit automatically posts a review when the PR is opened or updated. No manual trigger is needed.
-2. The agent reads CodeRabbit's review comments after internal review is complete.
-3. The agent addresses substantive CodeRabbit findings — fixing issues or posting a reply explaining why a finding is not applicable.
-4. The agent is not required to resolve every CodeRabbit comment. Use judgment: fix genuine issues, dismiss false positives with a brief explanation.
-5. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
+1. **Wait for CodeRabbit.** CodeRabbit automatically posts a review when the PR is opened or updated. The agent must wait for CodeRabbit to finish before proceeding. If CodeRabbit has not posted after 3 minutes, ask the human whether to continue waiting or skip.
+2. **Read both API endpoints.** CodeRabbit posts two types of comments that must both be checked:
+   - **PR-level summary:** `gh api repos/{owner}/{repo}/issues/{pr_number}/comments` — contains the high-level walkthrough and summary.
+   - **Inline review comments on the diff:** `gh api repos/{owner}/{repo}/pulls/{pr_number}/comments` — contains line-by-line findings anchored to specific code.
+3. **Scan for potential issues.** Before proceeding, grep CodeRabbit's inline review comments for `Potential issue` or `⚠️`. These markers indicate findings CodeRabbit considers high-severity. Every such finding must be explicitly addressed (fixed or dismissed with reasoning).
+4. The agent addresses substantive CodeRabbit findings — fixing issues or posting a reply explaining why a finding is not applicable.
+5. The agent is not required to resolve every CodeRabbit comment. Use judgment: fix genuine issues, dismiss false positives with a brief explanation. However, all `Potential issue` / `⚠️` findings require an explicit response.
+6. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
 
 **CodeRabbit runs on ALL PRs** in enabled repos, regardless of size or whether the external review threshold is met. It provides a consistent automated second opinion on every change.
 
 The agent proceeds to Phase 3 (Threshold Check) after addressing CodeRabbit comments, even if some remain open. CodeRabbit is an additional review layer, not a replacement for the existing threshold-based external agent handoff.
+
+#### CodeRabbit Review Checklist
+
+Before moving past Phase 2.5, confirm all of the following:
+
+- [ ] CodeRabbit has posted its review (waited up to 3 minutes, or human approved skip)
+- [ ] Read PR-level comments via `issues/{pr}/comments` endpoint
+- [ ] Read inline diff comments via `pulls/{pr}/comments` endpoint
+- [ ] Grepped inline comments for `Potential issue` and `⚠️` — all flagged findings addressed
+- [ ] Substantive findings fixed or dismissed with reasoning
 
 ### Phase 3: External Review Threshold Check
 
@@ -291,6 +328,8 @@ The public key files (`~/.ssh/id_nathanjohnpayne.pub`, etc.) tell the 1Password 
 
 To push/pull as the default author identity (`nathanjohnpayne`), no change is needed — the `github.com` host is the default.
 
+> **If preflight was run:** SSH keys for both the author and reviewer identities were pre-warmed during Phase 0. The `git push` / `git pull` commands below will not trigger additional biometric prompts.
+
 To push/pull as a reviewer identity, temporarily switch the remote:
 
 ```bash
@@ -311,12 +350,20 @@ the ambient `gh` login. Refer to the [PAT lookup table](#pat-lookup-table) for
 your agent's 1Password item ID.
 
 ```bash
-# Example: verify the Claude reviewer identity before posting the review
-GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
-  gh api user --jq '.login'
+# ── Preferred: use preflight-cached PATs (no biometric prompts) ──
+
+# As reviewer (after running op-preflight.sh):
+GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq '.login'
 # expected: nathanpayne-claude
 
-# Post the review with the same explicit token
+GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" \
+  gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
+
+# As author (merge, address comments, etc.):
+GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT" gh pr merge <PR#> --merge
+
+# ── Fallback: inline op read (triggers biometric if session expired) ──
+
 GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
   gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
 ```
@@ -400,10 +447,15 @@ This policy and the accompanying `review-policy.yml` should be included in every
 
 1. Copy `.github/review-policy.yml` into the new repo's `.github/` directory.
 2. Copy this document into the repo as `REVIEW_POLICY.md` (or the location specified by your project template).
-3. Adjust `external_review_threshold`, `external_review_paths`, and `default_external_reviewer` to fit the project.
-4. Ensure all agent environments have credentials configured for the repo.
-5. If the repo is public and using CodeRabbit, set `coderabbit.enabled: true` in `.github/review-policy.yml` and install the CodeRabbit GitHub App on the repo.
-6. The `.coderabbit.yml` file at the repo root ships with the template and requires no per-repo customization for default behavior.
+3. Copy the governance files from the template:
+   - `.github/dependabot.yml` — Dependabot version update schedule
+   - `.github/CODEOWNERS` — code ownership routing
+   - `SECURITY.md` — vulnerability reporting policy (update the repo name in the advisory URL)
+4. Adjust `external_review_threshold`, `external_review_paths`, and `default_external_reviewer` to fit the project.
+5. Ensure all agent environments have credentials configured for the repo.
+6. If the repo is public, enable secret scanning and push protection via GitHub settings (or API).
+7. If the repo is public and using CodeRabbit, set `coderabbit.enabled: true` in `.github/review-policy.yml` and install the CodeRabbit GitHub App on the repo.
+8. The `.coderabbit.yml` file at the repo root ships with the template and works out of the box. Customize `reviews.path_instructions` to add repo-specific review guidance (e.g., flag currency rounding in billing code, verify type compatibility in shared packages).
 
 ### CodeRabbit Removal
 
