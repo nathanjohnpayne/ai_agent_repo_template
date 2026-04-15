@@ -412,7 +412,6 @@ if [ -z "$REQUIRED_CHECK_NAMES" ]; then
 else
   # Build a jq array of required check names
   REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s .)
-  REQUIRED_FILTER="(.label as \$l | $REQUIRED_JSON | index(\$l)) != null"
 fi
 
 BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:-[]}" '

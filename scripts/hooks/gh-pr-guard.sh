@@ -292,6 +292,7 @@ SAW_GH=0
 SAW_PR=0
 SKIP_GLOBAL_AS=""        # "" | "repo"
 AT_COMMAND_POSITION=1    # 1 = at command position, 0 = walking unrelated-command args
+SEGMENT_HAS_COMMAND=0    # 1 = this segment has seen a non-assignment command (echo, cat, etc.)
 SKIP_PREFIX_VALUE=0      # 1 = next token is the value of a prefix-command flag
 CURRENT_PREFIX=""        # name of the most recently seen prefix command (sudo/time/etc.)
 for i in "${!TOKENS[@]}"; do
@@ -370,14 +371,27 @@ for i in "${!TOKENS[@]}"; do
     "&&"|"||"|";"|"|"|"&"|"("|")")
       AT_COMMAND_POSITION=1
       CURRENT_PREFIX=""
-      # CRITICAL: clear inline env vars captured from the PREVIOUS
-      # command segment. `BREAK_GLASS_ADMIN=1 echo ok ; gh pr merge
-      # --admin 65` should NOT carry the BREAK_GLASS_ADMIN across the
-      # `;` boundary — it was scoped to `echo`, not to `gh`.
-      # nathanpayne-codex caught this on nathanpaynedotcom propagation
-      # PR #180 round 7.
-      INLINE_CODEX_CLEARED=""
-      INLINE_BREAK_GLASS_ADMIN=""
+      # Clear inline env vars ONLY when the segment that just ended
+      # contained a non-assignment command. That means the assignment
+      # was a PREFIX scoped to that command, not a standalone
+      # assignment that persists in the shell:
+      #
+      #   BREAK_GLASS_ADMIN=1 echo ok ; gh pr merge --admin 65
+      #     → segment had `echo` (SEGMENT_HAS_COMMAND=1)
+      #     → assignment was prefix to echo → CLEAR at `;`
+      #
+      #   CODEX_CLEARED=1 && gh pr merge 76 --squash
+      #     → segment was ONLY the assignment (SEGMENT_HAS_COMMAND=0)
+      #     → standalone assignment → DON'T clear at `&&`
+      #
+      # nathanpayne-codex caught the over-clearing on template PR #76
+      # round 1 — `CODEX_CLEARED=1 && gh pr merge` was being cleared
+      # even though the assignment was standalone.
+      if [ "$SEGMENT_HAS_COMMAND" -eq 1 ]; then
+        INLINE_CODEX_CLEARED=""
+        INLINE_BREAK_GLASS_ADMIN=""
+      fi
+      SEGMENT_HAS_COMMAND=0
       continue
       ;;
   esac
@@ -471,7 +485,10 @@ for i in "${!TOKENS[@]}"; do
       # An unrelated command (echo, printf, cat, find, etc.).
       # gh-as-an-argument should NOT trigger the hook;
       # transition to skip mode and walk past the args.
+      # Mark the segment as having a real command so that
+      # separator-clearing of inline env vars fires correctly.
       AT_COMMAND_POSITION=0
+      SEGMENT_HAS_COMMAND=1
       continue
       ;;
   esac
