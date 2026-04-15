@@ -139,7 +139,7 @@ Before moving past Phase 2.5, confirm all of the following:
 
 ### Phase 3: External Review Threshold Check
 
-> **Note on automation timing:** CI workflows may apply the `needs-external-review` label automatically when a PR is opened or updated, as an early advisory based on line count and protected paths. This label blocks merge immediately. The agent's responsibility is to post the handoff message and alert the human after internal review passes—the label itself may already be present.
+> **Note on automation timing:** CI workflows may apply the `needs-external-review` label automatically when a PR is opened or updated, as an early advisory based on line count and protected paths. The label blocks merge via the label-gate until external review clears. When the label is present, the agent's responsibility after internal review passes is to proceed to [Phase 4](#phase-4-external-review) — which routes the PR to Phase 4a (automated via the Codex GitHub App) or Phase 4b (manual handoff) depending on `codex.enabled` and on whether 4a converges. The label itself does NOT imply immediate human mediation; Phase 4b only posts the handoff message when the fallback path is actually taken.
 
 8. After internal review passes, the agent evaluates whether the PR meets the external review threshold (see [Review Policy Configuration](#review-policy-configuration)).
 9. If the threshold is **not** met, the agent merges the PR as `nathanjohnpayne`. Done.
@@ -150,9 +150,9 @@ Before moving past Phase 2.5, confirm all of the following:
 Phase 4 has two sub-phases that together cover the two ways external review can run:
 
 - **Phase 4a — Automated external review** via the ChatGPT Codex Connector GitHub App. This is the default happy path. The authoring agent drives the review loop without human intervention until Codex signals clearance, then runs a merge-gate check and merges.
-- **Phase 4b — Manual CLI fallback** via a different agent's CLI session (e.g., Codex CLI as `nathanpayne-codex`, or Cursor, or Claude Code). This is the escape hatch when 4a escalates, times out twice, or is unavailable because `codex.enabled: false`. The human mediates the handoff.
+- **Phase 4b — Manual CLI fallback** via a different agent's CLI session (e.g., Codex CLI as `nathanpayne-codex`, or Cursor, or Claude Code). This is the escape hatch when 4a escalates (disagreement or runaway), times out, or is unavailable because `codex.enabled: false`. The human mediates the handoff.
 
-An agent proceeds to 4a first. If 4a escalates or is disabled, the agent falls back to 4b and surfaces the handoff to the human per [Handoff Message Format](#handoff-message-format).
+An agent proceeds to 4a first. If 4a escalates, times out, or is disabled, the agent falls back to 4b and surfaces the handoff to the human per [Handoff Message Format](#handoff-message-format).
 
 #### Phase 4a: Automated External Review (Codex GitHub App)
 
@@ -194,7 +194,7 @@ An agent proceeds to 4a first. If 4a escalates or is disabled, the agent falls b
 
 #### Phase 4b: Manual CLI Fallback (Human Handoff)
 
-Phase 4b is invoked when Phase 4a escalates to disagreement or runaway, times out twice consecutively, or when `codex.enabled: false` in the repo. It preserves the cross-agent review flow that existed before the Codex GitHub App integration and provides a human-mediated escape hatch.
+Phase 4b is invoked when Phase 4a escalates to disagreement or runaway, times out (single timeout, exit code `4` from `codex-review-request.sh`), or when `codex.enabled: false` in the repo. It preserves the cross-agent review flow that existed before the Codex GitHub App integration and provides a human-mediated escape hatch.
 
 11b. The authoring agent posts the handoff message (see [Handoff Message Format](#handoff-message-format)) as a PR comment and alerts the human.
 
@@ -261,7 +261,7 @@ Phase 4b is invoked when Phase 4a escalates to disagreement or runaway, times ou
   │  ├─ P0/P1 findings → fix or reply; round += 1; repeat   │
   │  ├─ repeat-after-rebuttal → ESCALATE (Disagreements)    │
   │  ├─ round > max_review_rounds → ESCALATE (Disagreements)│
-  │  └─ 2nd consecutive timeout → FALL BACK to Phase 4b     │
+  │  └─ timeout (exit code 4) → FALL BACK to Phase 4b       │
   └──────────────┬───────────────────────┬──────────────────┘
                  │ clearance              │ escalate / fallback
                  ▼                        ▼
