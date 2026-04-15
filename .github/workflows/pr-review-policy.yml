@@ -95,20 +95,42 @@ jobs:
             REASONS="$REASONS- ${LINES_CHANGED} lines changed (threshold: ${THRESHOLD})%0A"
           fi
 
-          # Read protected paths from review-policy.yml and check against diff
+          # Extract external_review_paths entries from review-policy.yml.
+          # Uses a state-machine awk parser that stops at the next top-level
+          # key (excluding comments/blanks). The previous range-based parser
+          # `awk '/^external_review_paths:/,/^[^ ]/'` was broken: awk's range
+          # start line also matched the end pattern (header starts with a
+          # non-space), so it only ever output the header line itself, the
+          # list entries were silently dropped, and PATHS was empty on every
+          # run. See #54.
+          PATHS=$(awk '
+            /^external_review_paths:/ {in_block=1; next}
+            in_block && /^[^[:space:]#]/ {in_block=0}
+            in_block && /^ *-/ {print}
+          ' "$CONFIG" | sed 's/^ *- *"//' | sed 's/"$//')
+
+          # Match changed files against patterns using bash native pattern
+          # matching in `[[ str == pattern ]]`. The previous glob-to-regex
+          # sed pipeline double-transformed `*`: `.github/**` became `.github/.*`
+          # (correct) and then the remaining `*` was re-subbed to `[^/]*`,
+          # yielding `.github/.[^/]*` — an overly restrictive regex that did
+          # not match nested paths like `.github/workflows/foo.yml`.
+          # Bash pattern matching in `[[ ]]` does not stop at `/` by default,
+          # so `[[ ".github/workflows/foo" == .github/** ]]` matches correctly
+          # without needing `shopt -s globstar`. See #54.
           CHANGED_FILES=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA")
-          PATHS=$(awk '/^external_review_paths:/,/^[^ ]/' "$CONFIG" \
-            | grep '^ *-' | sed 's/^ *- *"//' | sed 's/"$//')
 
           MATCHED_FILES=""
-          for pattern in $PATHS; do
-            # Convert glob to grep-compatible pattern
-            REGEX=$(echo "$pattern" | sed 's/\*\*/.*/g' | sed 's/\*\//[^\/]*\//g' | sed 's/\*/[^\/]*/g')
-            MATCHES=$(echo "$CHANGED_FILES" | grep -E "$REGEX" || true)
-            if [ -n "$MATCHES" ]; then
-              MATCHED_FILES="$MATCHED_FILES$MATCHES"$'\n'
-            fi
-          done
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            while IFS= read -r pattern; do
+              [ -z "$pattern" ] && continue
+              if [[ "$file" == $pattern ]]; then
+                MATCHED_FILES="$MATCHED_FILES$file"$'\n'
+                break
+              fi
+            done <<< "$PATHS"
+          done <<< "$CHANGED_FILES"
 
           if [ -n "$MATCHED_FILES" ]; then
             NEEDS_REVIEW=true
@@ -139,14 +161,14 @@ jobs:
           FORMATTED_REASONS=$(echo "$REASONS" | sed 's/%0A/\n/g')
 
           gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$(cat <<EOF
-**External Review Required**
+          **External Review Required**
 
-This PR has been labeled \`needs-external-review\` based on .github/review-policy.yml:
+          This PR has been labeled \`needs-external-review\` based on .github/review-policy.yml:
 
-$FORMATTED_REASONS
+          $FORMATTED_REASONS
 
-Per REVIEW_POLICY.md, the authoring agent must post a handoff message and alert the human. The human will coordinate external review by a different agent.
+          Per REVIEW_POLICY.md, the authoring agent must post a handoff message and alert the human. The human will coordinate external review by a different agent.
 
-> Automated check per .github/review-policy.yml
-EOF
+          > Automated check per .github/review-policy.yml
+          EOF
           )"
