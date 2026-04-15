@@ -85,76 +85,126 @@ if echo "$COMMAND" | grep -qE '^\s*gh\s+pr\s+merge'; then
   # Non-admin merge sub-guard: if the target PR has
   # `needs-external-review`, require CODEX_CLEARED=1.
   #
-  # Extract the PR selector as the first positional argument
-  # following the literal token `merge`. `gh pr merge` accepts
-  # `<number> | <url> | <branch>` per the gh CLI grammar, so the
-  # selector can be any of:
+  # Step 1: Tokenize the command with shell-quote awareness.
+  #
+  # An earlier iteration used `TOKENS=( $COMMAND )` which performs
+  # bash word splitting on whitespace WITHOUT respecting shell
+  # quotes. nathanpayne-codex caught the resulting bug on PR #66
+  # round 2: `gh pr merge --body "hello world" 65` would split into
+  # (gh, pr, merge, --body, "hello, world", 65), and the SKIP_NEXT
+  # logic for value-taking flags would consume `"hello` as the
+  # body value while `world"` would leak through as the
+  # PR_SELECTOR — wrong PR's labels inspected, false-clear / false-
+  # block possible.
+  #
+  # Fix: use `xargs -n 1` which honors POSIX single/double quoting
+  # when splitting input into args. The same command above
+  # tokenizes to (gh, pr, merge, --body, hello world, 65) — quotes
+  # stripped, value preserved as one token — which the value-flag
+  # SKIP logic then consumes correctly.
+  #
+  # Fails CLOSED on tokenization error (unmatched quote, bad
+  # backslash escape, etc.). The agent should fix the malformed
+  # command and retry.
+  TOKENS_OUTPUT=""
+  if ! TOKENS_OUTPUT=$(printf '%s' "$COMMAND" | xargs -n 1 2>&1); then
+    echo "BLOCKED: gh-pr-guard could not tokenize the merge command (malformed shell quoting)." >&2
+    echo "  command: $COMMAND" >&2
+    echo "  xargs error: $TOKENS_OUTPUT" >&2
+    echo "  Fix the quoting and retry, or use BREAK_GLASS_ADMIN=1 + --admin." >&2
+    exit 2
+  fi
+  # `mapfile` would be cleaner but is a bash 4+ builtin; macOS ships
+  # bash 3.2 by default, so use a portable read loop instead.
+  #
+  # Empty lines are PRESERVED (not skipped). xargs emits an empty
+  # line for legitimate empty-string args like `--body ""`, and the
+  # SKIP_NEXT_AS logic below needs to consume that empty value as
+  # the flag's value — otherwise the next token (the actual
+  # selector) would be wrongly captured as the flag value.
+  TOKENS=()
+  while IFS= read -r line; do
+    TOKENS+=("$line")
+  done <<<"$TOKENS_OUTPUT"
+
+  # Step 2: Extract PR_SELECTOR and REPO_ARG in one pass over the
+  # tokenized command.
+  #
+  # `gh pr merge` accepts `<number> | <url> | <branch>` per the gh
+  # CLI grammar, so the selector can be any of:
   #
   #   - A bare integer:      gh pr merge 65
   #   - A full PR URL:       gh pr merge https://github.com/foo/bar/pull/65
   #   - A branch name:       gh pr merge feat/my-branch
   #
   # Walk the tokens after `merge` looking for the first non-flag
-  # token, skipping value-taking flags and their values so a
-  # command like `gh pr merge --body "text" 65` correctly captures
-  # `65` as the selector rather than `"text"`. Inline-value forms
-  # (`--body=text`, `-b=text`) are handled as single tokens and are
-  # filtered by the `-*` prefix test.
+  # token (PR_SELECTOR), skipping value-taking flags and their
+  # values. Simultaneously capture --repo / -R values into
+  # REPO_ARG so the label lookup is unambiguous when invoked
+  # outside the target repo's working copy. CodeRabbit caught the
+  # earlier `-R`-not-handled bug on PR #66 round 2.
+  #
+  # Value-taking flags handled here mirror the `gh pr merge --help`
+  # flag list. Boolean flags (--squash, --merge, --rebase, --admin,
+  # --auto, --delete-branch, --disable-auto) do NOT need entries —
+  # they don't consume the next token.
+  #
+  # Inline-value forms (`--body=text`, `-b=text`, `--repo=foo/bar`,
+  # `-R=foo/bar`) are single tokens after xargs and are matched by
+  # explicit case branches below.
   #
   # If no selector is present (i.e., `gh pr merge` with only flags
   # or no arguments at all), the hook falls back to `gh pr view`
   # with no positional argument so gh resolves the PR from the
   # current branch, matching gh's own default behavior.
-  #
-  # Value-taking flags handled here mirror the `gh pr merge --help`
-  # flag list as of the gh CLI version shipped at the time this
-  # hook was written. Additions to gh's grammar may require updates
-  # here; boolean flags (--squash, --merge, --rebase, --admin,
-  # --auto, --delete-branch, --disable-auto) do NOT need entries.
   PR_SELECTOR=""
+  REPO_ARG=""
   FOUND_MERGE=0
-  SKIP_NEXT=0
-  # shellcheck disable=SC2206  # deliberate word-splitting on the command
-  TOKENS=( $COMMAND )
+  SKIP_NEXT_AS=""  # "" | "skip" | "repo"
   for tok in "${TOKENS[@]}"; do
-    if [[ "$SKIP_NEXT" -eq 1 ]]; then
-      SKIP_NEXT=0
+    if [[ "$SKIP_NEXT_AS" == "skip" ]]; then
+      SKIP_NEXT_AS=""
+      continue
+    fi
+    if [[ "$SKIP_NEXT_AS" == "repo" ]]; then
+      REPO_ARG="$tok"
+      SKIP_NEXT_AS=""
       continue
     fi
     if [[ "$FOUND_MERGE" -eq 1 ]]; then
-      # Value-taking flags consume the next token. gh pr merge takes
-      # --body / --body-file / --subject / --author-email /
-      # --match-head-commit / --repo (and their short aliases).
       case "$tok" in
-        --body|-b|--body-file|-F|--subject|-t|--author-email|-A|--match-head-commit|--repo|-R)
-          SKIP_NEXT=1
+        --repo|-R)
+          SKIP_NEXT_AS="repo"
+          continue
+          ;;
+        --repo=*)
+          REPO_ARG="${tok#--repo=}"
+          continue
+          ;;
+        -R=*)
+          REPO_ARG="${tok#-R=}"
+          continue
+          ;;
+        --body|-b|--body-file|-F|--subject|-t|--author-email|-A|--match-head-commit)
+          SKIP_NEXT_AS="skip"
           continue
           ;;
       esac
-      # Inline-value flags like --body=text already have the value
-      # embedded; skip them as ordinary flags via the -* test below.
       if [[ "$tok" == -* ]]; then
         continue
       fi
-      # First non-flag token after `merge` is the selector. Pass
-      # it through unmodified — gh pr view accepts the same
-      # <number> | <url> | <branch> grammar that gh pr merge does,
-      # so we don't need to parse the URL or validate the form.
-      PR_SELECTOR="$tok"
-      break
+      # First non-flag token after `merge` is the selector. Don't
+      # `break` — keep walking so a `--repo` / `-R` flag appearing
+      # AFTER the selector still gets captured into REPO_ARG.
+      if [[ -z "$PR_SELECTOR" ]]; then
+        PR_SELECTOR="$tok"
+      fi
+      continue
     fi
     if [[ "$tok" == "merge" ]]; then
       FOUND_MERGE=1
     fi
   done
-
-  # Also extract an explicit --repo flag if present so the label
-  # lookup is unambiguous. Handles both `--repo foo/bar` and
-  # `--repo=foo/bar` forms.
-  REPO_ARG=""
-  if echo "$COMMAND" | grep -qE '(^|\s)--repo(\s|=)'; then
-    REPO_ARG=$(echo "$COMMAND" | sed -nE 's/.*--repo[= ]([^ ]+).*/\1/p')
-  fi
 
   # Fetch labels. `gh pr view` with no positional argument resolves
   # the PR from the current branch; with a positional argument it
