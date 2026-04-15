@@ -114,8 +114,19 @@ coderabbit:
 #      to the manual handoff in REVIEW_POLICY.md § Phase 4b, targeting
 #      `cli_login` below.
 #   5. Before merging, run `scripts/codex-review-check.sh <PR#>` to verify
-#      the merge gate: CI green + internal reviewer approved + Codex
-#      approving with no unaddressed P0/P1 findings.
+#      the merge gate. All of the following must hold:
+#        a) required CI checks are green
+#        b) an approving review from a registered reviewer identity
+#           (`available_reviewers`) is present on the PR
+#        c) Codex has signaled clearance on the current HEAD in one of two
+#           forms — NEVER an `APPROVED` review state, because the Codex
+#           GitHub App does not post `APPROVED` reviews:
+#            - a `COMMENTED` review from `chatgpt-codex-connector[bot]`
+#              on or after the latest commit, with no unaddressed P0/P1
+#              inline findings on the `/pulls/{pr}/comments` endpoint, OR
+#            - a 👍 / `+1` reaction from `chatgpt-codex-connector[bot]`
+#              on the PR issue, posted after the latest commit
+#      See #29 for the observational evidence behind this behavior.
 codex:
   enabled: true
 
