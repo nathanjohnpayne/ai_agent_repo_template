@@ -138,10 +138,21 @@ fi
 # --body, hello world, 65) instead of being naively split into
 # (gh, pr, merge, --body, "hello, world", 65).
 #
+# IMPORTANT: pass `printf '%s\n'` as the explicit command. The
+# default `xargs` command is `echo`, and `echo` treats tokens
+# beginning with `-` (specifically `-n`, `-e`, `-E`) as ITS OWN
+# flags rather than printing them. That means a naive `xargs -n 1`
+# silently drops `-n` from the token stream, which broke the
+# pre-gh walk for inputs like `nice -n 5 gh pr merge 65` (the
+# `-n` was missing entirely, so the walk treated `5` as the
+# next command and switched to in_unrelated_args mode, missing
+# the real `gh` command). Using `printf '%s\n'` instead of the
+# implicit echo preserves every token literally.
+#
 # Fails CLOSED on tokenization error (unmatched quote, bad escape).
 # An agent should fix the malformed command and retry.
 TOKENS_OUTPUT=""
-if ! TOKENS_OUTPUT=$(printf '%s' "$COMMAND" | xargs -n 1 2>&1); then
+if ! TOKENS_OUTPUT=$(printf '%s' "$COMMAND" | xargs -n 1 printf '%s\n' 2>&1); then
   echo "BLOCKED: gh-pr-guard could not tokenize the gh command (malformed shell quoting)." >&2
   echo "  command: $COMMAND" >&2
   echo "  xargs error: $TOKENS_OUTPUT" >&2
@@ -206,6 +217,8 @@ SAW_GH=0
 SAW_PR=0
 SKIP_GLOBAL_AS=""        # "" | "repo"
 AT_COMMAND_POSITION=1    # 1 = at command position, 0 = walking unrelated-command args
+SKIP_PREFIX_VALUE=0      # 1 = next token is the value of a prefix-command flag
+CURRENT_PREFIX=""        # name of the most recently seen prefix command (sudo/time/etc.)
 for tok in "${TOKENS[@]}"; do
   # --- phase 2: walking after gh, looking for pr + subcommand ---
   if [ "$SAW_GH" -eq 1 ]; then
@@ -254,6 +267,15 @@ for tok in "${TOKENS[@]}"; do
 
   # --- phase 1: walking pre-gh, looking for gh in command position ---
 
+  # Consume the value of a prefix-command flag (e.g. the `user`
+  # in `sudo -u user gh ...`). Stays in command position because
+  # the prefix command may have additional flags or transition
+  # straight to the actual command.
+  if [ "$SKIP_PREFIX_VALUE" -eq 1 ]; then
+    SKIP_PREFIX_VALUE=0
+    continue
+  fi
+
   # Capture inline env assignments regardless of state. Doing it
   # here means a `CODEX_CLEARED=1 sudo gh pr merge 65` or even
   # `cat foo; CODEX_CLEARED=1 gh pr merge 65` form still picks up
@@ -276,6 +298,7 @@ for tok in "${TOKENS[@]}"; do
   case "$tok" in
     "&&"|"||"|";"|"|"|"&"|"("|")")
       AT_COMMAND_POSITION=1
+      CURRENT_PREFIX=""
       continue
       ;;
   esac
@@ -294,15 +317,56 @@ for tok in "${TOKENS[@]}"; do
     sudo|eval|time|nohup|env|command|exec|nice|ionice)
       # Known prefix command. Stay in command position so the
       # next non-flag token is still treated as the command.
-      continue
-      ;;
-    -*)
-      # Flag of a prefix command (e.g. `sudo -E`, `time -f ...`).
-      # Stay in command position.
+      # Track which prefix we're parsing flags for so we can
+      # tell value-taking flags from boolean ones — short flags
+      # like `-p` mean different things to different commands
+      # (boolean for time, value-taking for ionice/sudo).
+      CURRENT_PREFIX="$tok"
       continue
       ;;
     gh)
       SAW_GH=1
+      continue
+      ;;
+    -*)
+      # Flag of the most recently seen prefix command. Whether
+      # the next token is a value depends on which prefix command
+      # this flag belongs to. Without this distinction, putting
+      # `-p` on a generic value-flag list would consume `gh` as
+      # the value of `time -p` (which is actually the POSIX
+      # boolean format flag), and putting `-p` on a generic
+      # boolean list would let `ionice -p PID gh ...` walk past
+      # `PID` thinking it's the next command.
+      #
+      # Per-prefix value-flag map. nathanpayne-codex caught the
+      # original bug (sudo -u, time -f, nice -n) on PR #66
+      # round 6; the per-prefix scoping prevents the obvious
+      # over-fix from breaking `time -p`.
+      case "$CURRENT_PREFIX:$tok" in
+        sudo:-u|sudo:-g|sudo:-U|sudo:-h|sudo:-p|sudo:-r|sudo:-s|sudo:-t|sudo:-c|sudo:-D)
+          SKIP_PREFIX_VALUE=1
+          continue
+          ;;
+        time:-f|time:-o)
+          SKIP_PREFIX_VALUE=1
+          continue
+          ;;
+        nice:-n)
+          SKIP_PREFIX_VALUE=1
+          continue
+          ;;
+        ionice:-c|ionice:-n|ionice:-p)
+          SKIP_PREFIX_VALUE=1
+          continue
+          ;;
+        env:-u|env:-S)
+          SKIP_PREFIX_VALUE=1
+          continue
+          ;;
+      esac
+      # Otherwise: boolean flag of the current prefix (or a flag
+      # of an unknown prefix, which we conservatively assume is
+      # boolean to avoid eating `gh`). Stay in command position.
       continue
       ;;
     *)
@@ -356,32 +420,27 @@ fi
 # --- gh pr merge ---
 #
 # (PR_SUBCOMMAND must be "merge" by this point.)
-
-# --admin sub-guard: break-glass only. We grep the raw command for
-# `--admin` because the position doesn't matter and the token walk
-# below would also catch it; substring is simpler.
-if echo "$COMMAND" | grep -q '\-\-admin'; then
-  if [ "$EFFECTIVE_BREAK_GLASS_ADMIN" = "1" ]; then
-    echo "BREAK-GLASS: --admin merge authorized by human." >&2
-    exit 0
-  fi
-  echo "BLOCKED: --admin merge requires explicit human authorization." >&2
-  echo "Ask the human to confirm break-glass, then retry with BREAK_GLASS_ADMIN=1 (export or inline prefix)." >&2
-  exit 2
-fi
-
-# Non-admin merge sub-guard: extract PR_SELECTOR and subcommand-
-# scoped REPO_ARG by walking tokens AFTER the literal `merge`
-# subcommand token. This walk handles value-taking flags
-# (--body / --body-file / --subject / --author-email /
-# --match-head-commit / --repo) so their values are not mistaken
-# for the selector.
+#
+# Walk tokens AFTER the literal `merge` subcommand token to extract:
+#   - PR_SELECTOR (first non-flag positional)
+#   - REPO_ARG (--repo / -R value if present)
+#   - ADMIN_REQUESTED (--admin flag)
+#
+# All three are derived from the SAME tokenized walk so that
+# value-taking flags (--body / --body-file / --subject /
+# --author-email / --match-head-commit / --repo / -R) correctly
+# consume their next token as the value. An earlier round used
+# `grep -q -- --admin` on the raw command string for the admin
+# check, which over-matched any `--admin` substring inside a
+# quoted flag value (e.g., `--subject "--admin follow-up"`).
+# nathanpayne-codex caught that on PR #66 round 6.
 #
 # `gh pr merge` accepts the selector as <number> | <url> | <branch>;
 # we don't parse or validate the form, just pass it through to
 # `gh pr view` which accepts the same grammar.
 PR_SELECTOR=""
 REPO_ARG=""
+ADMIN_REQUESTED=0
 FOUND_MERGE=0
 SKIP_NEXT_AS=""  # "" | "skip" | "repo"
 for tok in "${TOKENS[@]}"; do
@@ -396,6 +455,10 @@ for tok in "${TOKENS[@]}"; do
   fi
   if [ "$FOUND_MERGE" -eq 1 ]; then
     case "$tok" in
+      --admin)
+        ADMIN_REQUESTED=1
+        continue
+        ;;
       --repo|-R)
         SKIP_NEXT_AS="repo"
         continue
@@ -419,8 +482,8 @@ for tok in "${TOKENS[@]}"; do
         ;;
     esac
     # First non-flag token after `merge` is the selector. Don't
-    # break — keep walking so a `--repo`/`-R` flag appearing AFTER
-    # the selector still gets captured into REPO_ARG.
+    # break — keep walking so a `--repo`/`-R` flag or `--admin`
+    # flag appearing AFTER the selector still gets captured.
     if [ -z "$PR_SELECTOR" ]; then
       PR_SELECTOR="$tok"
     fi
@@ -430,6 +493,19 @@ for tok in "${TOKENS[@]}"; do
     FOUND_MERGE=1
   fi
 done
+
+# --admin sub-guard: break-glass only. Now token-based: the walk
+# above sets ADMIN_REQUESTED=1 only when `--admin` appears as a
+# REAL flag of `merge`, not as a substring of another flag's value.
+if [ "$ADMIN_REQUESTED" -eq 1 ]; then
+  if [ "$EFFECTIVE_BREAK_GLASS_ADMIN" = "1" ]; then
+    echo "BREAK-GLASS: --admin merge authorized by human." >&2
+    exit 0
+  fi
+  echo "BLOCKED: --admin merge requires explicit human authorization." >&2
+  echo "Ask the human to confirm break-glass, then retry with BREAK_GLASS_ADMIN=1 (export or inline prefix)." >&2
+  exit 2
+fi
 
 # Subcommand-scoped REPO_ARG wins over global GLOBAL_REPO (mirrors
 # gh's typical "more specific flag wins" behavior). Fall back to
