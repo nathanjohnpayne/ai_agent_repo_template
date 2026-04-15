@@ -287,9 +287,13 @@ if has_signal "$INITIAL_SCAN"; then
   log "Codex has already responded on HEAD — skipping trigger comment"
 else
   log "posting '@codex review' trigger comment"
-  if ! gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" >/dev/null 2>&1; then
-    die 3 "failed to post '@codex review' comment"
-  fi
+  # Capture stderr (and stdout) into a diagnostic variable so a failure
+  # here surfaces the actual gh error — e.g. "404" from a nonexistent
+  # PR, "403" from a token without comment scope, or "422" from a closed
+  # PR — rather than a bare "failed to post". CodeRabbit non-blocking
+  # note on PR #64.
+  POST_OUTPUT=$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
+    || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
   TRIGGER_POSTED=true
 fi
 
