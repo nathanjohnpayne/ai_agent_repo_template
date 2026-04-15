@@ -191,7 +191,32 @@ fi
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
 
-log "HEAD = $HEAD_SHA    author = $PR_AUTHOR    committer date = $HEAD_COMMITTER_DATE"
+# HEAD_PUSHED_AT: the timestamp to use as the "when did this commit
+# become current on the PR" anchor for reaction freshness. committer
+# date is commit metadata and can be ARBITRARILY OLD if someone force-
+# pushes a previously-authored commit — a stale Codex 👍 from a prior
+# HEAD could then still satisfy `reaction.created_at >= committer_date`
+# even though the reaction predates the current HEAD's existence on
+# this PR. See #64 Codex P1 finding ("Anchor reaction freshness to PR
+# head update time").
+#
+# The best proxy available from the API: the earliest check-run start
+# time on the current HEAD. A CheckRun is created only AFTER a commit
+# exists on a PR and GitHub dispatches a workflow for it, so this time
+# is strictly after the commit became the PR's HEAD. If the repo has
+# no CI at all (no check-runs exist), fall back to committer date —
+# there's no force-push concern in that case because there's also no
+# stale CI signal to worry about.
+HEAD_CHECK_RUNS_MIN=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+  --jq '[.check_runs[].started_at] | min // ""' 2>/dev/null || echo "")
+if [ -n "$HEAD_CHECK_RUNS_MIN" ] && [ "$HEAD_CHECK_RUNS_MIN" != "null" ]; then
+  HEAD_PUSHED_AT="$HEAD_CHECK_RUNS_MIN"
+else
+  HEAD_PUSHED_AT="$HEAD_COMMITTER_DATE"
+fi
+
+log "HEAD = $HEAD_SHA    author = $PR_AUTHOR"
+log "committer_date = $HEAD_COMMITTER_DATE    pushed_at_proxy = $HEAD_PUSHED_AT"
 
 # --- preflight: blocking labels --------------------------------------------
 #
@@ -374,38 +399,78 @@ fi
 
 UNADDRESSED_COUNT=$(echo "$UNADDRESSED_P01" | jq 'length')
 
-# +1 reaction on the PR issue from the Codex bot, dated after HEAD commit.
+# Latest +1 reaction on the PR issue from the Codex bot, filtered to
+# reactions dated on or after HEAD_PUSHED_AT (see the anchor fetch
+# earlier in the script for the force-push rationale).
 REACTIONS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions")
 
-RECENT_THUMBS_UP=$(echo "$REACTIONS_JSON" | jq \
-  --arg bot "$BOT_LOGIN" --arg after "$HEAD_COMMITTER_DATE" '
-  [.[]
+LATEST_THUMBS_UP_TIME=$(echo "$REACTIONS_JSON" | jq -r \
+  --arg bot "$BOT_LOGIN" --arg after "$HEAD_PUSHED_AT" '
+  [ .[]
     | select(.user.login == $bot)
     | select(.content == "+1")
     | select(.created_at >= $after)
-  ] | length
+    | .created_at
+  ]
+  | max // ""
 ')
 
-# Decide: cleared iff (review on HEAD with zero P0/P1) OR (recent +1 reaction).
-CODEX_REVIEW_ON_HEAD=$(echo "$CODEX_REVIEW" | jq 'if . == null then false else true end')
+# Latest Codex review submission time on HEAD (empty if none).
+CODEX_REVIEW_TIME=$(echo "$CODEX_REVIEW" | jq -r 'if . == null then "" else .submitted_at end')
+
+# Decide clearance using the LATEST Codex signal, not whichever signal
+# the script happens to check first. See #64 Codex P1 finding ("Reject
+# stale thumbs-up when newer Codex findings exist").
+#
+# Semantics: Codex sends either a review OR a 👍 reaction per pass, but
+# on a PR with multiple rounds on the same HEAD it can end up with both
+# historical review comments AND a reaction. The LATEST one wins:
+#
+#   - If Codex's most recent signal is a review, inspect its P0/P1
+#     findings. Zero findings → clear. Any findings → block.
+#   - If Codex's most recent signal is a 👍 reaction, clear. Codex only
+#     reacts 👍 when it has no suggestions, so a newer 👍 overrides any
+#     earlier review's findings.
+#   - If both timestamps exist, use max() to pick the latest.
+#   - If neither exists, block.
+#
+# All review-side analysis still uses the latest review's
+# pull_request_review_id to scope findings (addressed in round 1's
+# finding 2), so an older review's stale comments are never counted.
 
 CLEARED=false
 CLEARANCE_REASON=""
 
-if [ "$RECENT_THUMBS_UP" -gt 0 ]; then
+if [ -n "$LATEST_THUMBS_UP_TIME" ] && [ -n "$CODEX_REVIEW_TIME" ]; then
+  # Both signals present on HEAD — compare timestamps. ISO 8601 sorts
+  # chronologically under lexicographic string comparison.
+  if [[ "$LATEST_THUMBS_UP_TIME" > "$CODEX_REVIEW_TIME" ]]; then
+    CLEARED=true
+    CLEARANCE_REASON="latest signal is 👍 reaction @ $LATEST_THUMBS_UP_TIME (newer than review @ $CODEX_REVIEW_TIME)"
+  else
+    if [ "$UNADDRESSED_COUNT" -eq 0 ]; then
+      CLEARED=true
+      CLEARANCE_REASON="latest signal is COMMENTED review @ $CODEX_REVIEW_TIME on $HEAD_SHA with no unaddressed P0/P1 findings (newer than 👍 @ $LATEST_THUMBS_UP_TIME)"
+    fi
+  fi
+elif [ -n "$LATEST_THUMBS_UP_TIME" ]; then
+  # Only a qualifying reaction, no review on HEAD.
   CLEARED=true
-  CLEARANCE_REASON="👍 reaction from $BOT_LOGIN on or after $HEAD_COMMITTER_DATE"
-elif [ "$CODEX_REVIEW_ON_HEAD" = "true" ] && [ "$UNADDRESSED_COUNT" -eq 0 ]; then
-  CLEARED=true
-  CLEARANCE_REASON="COMMENTED review from $BOT_LOGIN on $HEAD_SHA with no unaddressed P0/P1 findings"
+  CLEARANCE_REASON="👍 reaction from $BOT_LOGIN @ $LATEST_THUMBS_UP_TIME (on or after HEAD push time $HEAD_PUSHED_AT)"
+elif [ -n "$CODEX_REVIEW_TIME" ]; then
+  # Only a review on HEAD, no qualifying reaction.
+  if [ "$UNADDRESSED_COUNT" -eq 0 ]; then
+    CLEARED=true
+    CLEARANCE_REASON="COMMENTED review from $BOT_LOGIN @ $CODEX_REVIEW_TIME on $HEAD_SHA with no unaddressed P0/P1 findings"
+  fi
 fi
 
 if [ "$CLEARED" != "true" ]; then
-  if [ "$CODEX_REVIEW_ON_HEAD" = "false" ] && [ "$RECENT_THUMBS_UP" -eq 0 ]; then
-    fail_gate "Codex has not cleared current HEAD (no review and no +1 reaction from $BOT_LOGIN since $HEAD_COMMITTER_DATE)"
+  if [ -z "$LATEST_THUMBS_UP_TIME" ] && [ -z "$CODEX_REVIEW_TIME" ]; then
+    fail_gate "Codex has not cleared current HEAD (no review on $HEAD_SHA and no +1 reaction from $BOT_LOGIN since HEAD push time $HEAD_PUSHED_AT)"
   else
     PATHS=$(echo "$UNADDRESSED_P01" | jq -r '[.[] | "\(.path):\(.line)"] | join(", ")')
-    fail_gate "Codex review on HEAD has $UNADDRESSED_COUNT unaddressed P0/P1 finding(s): $PATHS"
+    fail_gate "latest Codex signal is a review on HEAD with $UNADDRESSED_COUNT unaddressed P0/P1 finding(s): $PATHS"
   fi
 fi
 
