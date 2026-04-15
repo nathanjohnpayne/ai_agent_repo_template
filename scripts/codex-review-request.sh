@@ -175,6 +175,22 @@ die() {
   exit "$code"
 }
 
+# Fetch a paginated GitHub REST API endpoint and return the flattened JSON
+# array on stdout. `gh api --paginate` emits one JSON value per page
+# concatenated into a single stream — `jq`'s default mode runs the filter
+# once per input (per page), which miscounts and misfilters on multi-page
+# PRs. Slurp with `-s` collects all inputs into an outer array, then `add`
+# concatenates the per-page arrays into one flat array. Defaults to `[]`
+# on empty input. Exits 3 on API or parse error.
+fetch_api_array() {
+  local endpoint=$1
+  local label=$2
+  local raw
+  raw=$(gh api --paginate "$endpoint" 2>&1) || die 3 "failed to fetch $label: $raw"
+  echo "$raw" | jq -s 'add // []' 2>/dev/null \
+    || die 3 "failed to flatten $label pagination output"
+}
+
 # --- fetch PR metadata ------------------------------------------------------
 
 log "PR $REPO#$PR_NUMBER — fetching HEAD commit metadata"
@@ -204,14 +220,9 @@ log "bot_login = $BOT_LOGIN    timeout = ${TIMEOUT_SECONDS}s"
 scan_codex_state() {
   local reviews comments reactions review findings reaction
 
-  reviews=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --paginate 2>&1) \
-    || { echo "API_ERROR: reviews: $reviews" >&2; return 3; }
-
-  comments=$(gh api "repos/$REPO/pulls/$PR_NUMBER/comments" --paginate 2>&1) \
-    || { echo "API_ERROR: comments: $comments" >&2; return 3; }
-
-  reactions=$(gh api "repos/$REPO/issues/$PR_NUMBER/reactions" --paginate 2>&1) \
-    || { echo "API_ERROR: reactions: $reactions" >&2; return 3; }
+  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
+  comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
+  reactions=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions")
 
   # Latest review from the Codex bot on the current HEAD commit, if any.
   # Codex always uses COMMENTED state regardless of findings.

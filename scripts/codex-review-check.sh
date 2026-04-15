@@ -164,6 +164,18 @@ die() {
   exit "$code"
 }
 
+# Fetch a paginated GitHub REST API endpoint and return the flattened JSON
+# array on stdout. See the identical helper in codex-review-request.sh for
+# the rationale; both scripts need the same fix (#64 review finding 3).
+fetch_api_array() {
+  local endpoint=$1
+  local label=$2
+  local raw
+  raw=$(gh api --paginate "$endpoint" 2>&1) || die 3 "failed to fetch $label: $raw"
+  echo "$raw" | jq -s 'add // []' 2>/dev/null \
+    || die 3 "failed to flatten $label pagination output"
+}
+
 # --- fetch PR metadata ------------------------------------------------------
 
 log "PR $REPO#$PR_NUMBER — fetching metadata"
@@ -180,6 +192,27 @@ HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.commi
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
 
 log "HEAD = $HEAD_SHA    author = $PR_AUTHOR    committer date = $HEAD_COMMITTER_DATE"
+
+# --- preflight: blocking labels --------------------------------------------
+#
+# `needs-human-review` is applied by the detect-disagreement job in
+# agent-review.yml when two reviewers have opposing opinionated states —
+# a human must resolve it. `policy-violation` is applied by
+# block-self-approval when a reviewer bot tries to approve its own PR.
+# Both block merge categorically and are not resolvable by Phase 4a flow.
+#
+# Note: `needs-external-review` is NOT a blocking label from this script's
+# perspective — it's the signal that this script should run, not a block.
+# Gate (c) resolves whether the external review is actually complete.
+PR_LABELS=$(echo "$PR_JSON" | jq -r '[.labels[].name] | join(",")')
+case ",$PR_LABELS," in
+  *,needs-human-review,*)
+    fail_gate "blocking label 'needs-human-review' present — human disagreement resolution required"
+    ;;
+  *,policy-violation,*)
+    fail_gate "blocking label 'policy-violation' present — policy violation must be resolved"
+    ;;
+esac
 
 # --- gate (a): CI checks green ---------------------------------------------
 
@@ -254,32 +287,49 @@ log "gate (a): CI is green (Label Gate failure, if present, is expected during P
 
 # --- gate (b): reviewer identity approval ----------------------------------
 
-log "gate (b): checking for APPROVED review from a reviewer identity"
+log "gate (b): checking for latest-state APPROVED review from a reviewer identity"
 
-REVIEWS_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --paginate 2>&1) \
-  || die 3 "failed to fetch reviews: $REVIEWS_JSON"
+REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
 
-# Build a JSON array of reviewer logins, then filter reviews to approved
-# ones from those logins, excluding the PR author.
+# Build a JSON array of reviewer logins for the filter.
 REVIEWERS_JSON=$(echo "$REVIEWERS" | jq -R . | jq -s .)
 
+# Take each reviewer identity's LATEST OPINIONATED review state — where
+# "opinionated" means APPROVED, CHANGES_REQUESTED, or DISMISSED. COMMENTED
+# reviews are informational and do not change a reviewer's position. The
+# gate passes iff at least one reviewer identity's latest opinionated
+# state is APPROVED.
+#
+# Note (#64 review finding 1): the previous implementation matched any
+# historical APPROVED review, which meant a reviewer who approved at t=0
+# and later submitted CHANGES_REQUESTED at t=5 still cleared the gate.
+# The group_by + max_by pattern below fixes that by collapsing each
+# reviewer's review history down to their latest opinionated state.
+#
+# Multi-reviewer disagreement (one reviewer approves, another requests
+# changes) is caught by the preflight blocking-label check above: the
+# Agent Review Pipeline's detect-disagreement job applies
+# `needs-human-review`, which the preflight rejects before this gate runs.
 APPROVING_REVIEWER=$(echo "$REVIEWS_JSON" | jq -r \
   --argjson reviewers "$REVIEWERS_JSON" \
   --arg author "$PR_AUTHOR" '
     [ .[]
-      | select(.state == "APPROVED")
+      | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
       | select(.user.login as $u | $reviewers | index($u))
       | select(.user.login != $author)
-      | .user.login
     ]
-    | first // empty
+    | group_by(.user.login)
+    | map(max_by(.submitted_at))
+    | map(select(.state == "APPROVED"))
+    | first
+    | if . == null then empty else .user.login end
 ')
 
 if [ -z "$APPROVING_REVIEWER" ]; then
-  fail_gate "no APPROVED review from a reviewer identity in available_reviewers"
+  fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review (COMMENTED reviews are ignored; later CHANGES_REQUESTED/DISMISSED overrides earlier APPROVED)"
 fi
 
-log "gate (b): APPROVED by $APPROVING_REVIEWER"
+log "gate (b): latest-state APPROVED by $APPROVING_REVIEWER"
 
 # --- gate (c): Codex cleared on current HEAD -------------------------------
 
@@ -290,29 +340,42 @@ log "gate (c): checking Codex clearance on $HEAD_SHA"
 CODEX_REVIEW=$(echo "$REVIEWS_JSON" | jq \
   --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
   [.[] | select(.user.login == $bot) | select(.commit_id == $sha)]
-  | sort_by(.submitted_at) | last
+  | max_by(.submitted_at) // null
 ')
 
-# Inline findings on the current HEAD. Filter for P0/P1 only — P2/P3
-# don't block clearance per REVIEW_POLICY.md § Phase 4a step 15a.
-COMMENTS_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER/comments" --paginate 2>&1) \
-  || die 3 "failed to fetch inline comments: $COMMENTS_JSON"
+# If a Codex review on HEAD exists, extract its id for filtering inline
+# comments down to THAT REVIEW ONLY. Older reviews on the same HEAD
+# (same-HEAD rebuttal flow) must not count, per #64 review finding 2:
+# if Codex posted a review with P1 findings, the agent replied with a
+# rebuttal, and Codex's next review on the same HEAD cleared the
+# finding, the earlier P1 comments are still visible in the API but
+# tied to the older review's id. Filtering by pull_request_review_id
+# scopes the findings to the latest round only.
+CODEX_REVIEW_ID=$(echo "$CODEX_REVIEW" | jq -r 'if . == null then "" else .id end')
 
-UNADDRESSED_P01=$(echo "$COMMENTS_JSON" | jq \
-  --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
-  [ .[]
-    | select(.user.login == $bot)
-    | select((.original_commit_id == $sha) or (.commit_id == $sha))
-    | select(.body | test("!\\[P[01] Badge\\]"))
-    | { path, line, comment_id: .id }
-  ]
-')
+COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
+
+# P0/P1 inline findings from the LATEST Codex review round on HEAD only.
+# P2/P3 don't block clearance per REVIEW_POLICY.md § Phase 4a step 15a.
+# If there's no Codex review on HEAD, UNADDRESSED_P01 is [] — the
+# reaction path is then the only way gate (c) can clear.
+if [ -n "$CODEX_REVIEW_ID" ] && [ "$CODEX_REVIEW_ID" != "null" ]; then
+  UNADDRESSED_P01=$(echo "$COMMENTS_JSON" | jq \
+    --argjson review_id "$CODEX_REVIEW_ID" '
+    [ .[]
+      | select(.pull_request_review_id == $review_id)
+      | select(.body | test("!\\[P[01] Badge\\]"))
+      | { path, line, comment_id: .id }
+    ]
+  ')
+else
+  UNADDRESSED_P01='[]'
+fi
 
 UNADDRESSED_COUNT=$(echo "$UNADDRESSED_P01" | jq 'length')
 
 # +1 reaction on the PR issue from the Codex bot, dated after HEAD commit.
-REACTIONS_JSON=$(gh api "repos/$REPO/issues/$PR_NUMBER/reactions" --paginate 2>&1) \
-  || die 3 "failed to fetch reactions: $REACTIONS_JSON"
+REACTIONS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions")
 
 RECENT_THUMBS_UP=$(echo "$REACTIONS_JSON" | jq \
   --arg bot "$BOT_LOGIN" --arg after "$HEAD_COMMITTER_DATE" '
