@@ -490,8 +490,21 @@ jobs:
   # ──────────────────────────────────────────────
   # Job 7: Auto-merge on approval (if no external review required)
   # ──────────────────────────────────────────────
+  # Must `needs:` on detect-disagreement and block-self-approval to force
+  # those sibling jobs to COMPLETE before this one starts. Both siblings
+  # can apply blocking labels as a side effect (`needs-human-review` from
+  # detect-disagreement, `policy-violation` from block-self-approval), and
+  # without the ordering constraint they run in parallel with auto-merge.
+  # A sibling applying a label 200ms after the runtime re-verify step
+  # below fetches labels but 100ms before `gh pr merge` dispatches would
+  # still slip through. `always()` in the if: expression keeps auto-merge
+  # running even if a sibling fails — ordering, not gating, is what
+  # `needs:` is for here. See #61 for the cross-event race and this PR
+  # for the same-workflow race nathanpayne-codex caught during review.
   auto-merge-on-approval:
+    needs: [detect-disagreement, block-self-approval]
     if: >
+      always() &&
       github.event_name == 'pull_request_review' &&
       github.event.review.state == 'approved' &&
       !contains(github.event.pull_request.labels.*.name, 'needs-external-review') &&
