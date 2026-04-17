@@ -2,7 +2,7 @@
 
 Automated tests live here.
 
-- `tests/test_mergepath_frontend.sh` validates `mockups/mergepath.html`
+- `tests/test_mergepath_frontend.sh` validates `mergepath/index.html`
   against `specs/mergepath_policy_configurator.md`. It checks for the
   required structural anchors (title, injection markers, control IDs,
   preset buttons, modal ARIA attributes, reduced-motion CSS), asserts

@@ -13,7 +13,7 @@ set -euo pipefail
 
 LIMIT="${1:-20}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TEMPLATE="$REPO_ROOT/mockups/mergepath.html"
+TEMPLATE="$REPO_ROOT/mergepath/index.html"
 
 # macOS mktemp only substitutes TRAILING Xs, so
 # `mktemp /tmp/name.XXXXXX.html` treats the template as literal —
