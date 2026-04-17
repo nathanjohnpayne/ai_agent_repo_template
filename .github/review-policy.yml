@@ -84,7 +84,7 @@ author_identity: nathanjohnpayne
 # CodeRabbit GitHub App. All agent instructions use conditional language
 # and will skip Phase 2.5 automatically.
 coderabbit:
-  enabled: false
+  enabled: true
 
 # ---------------------------------------------------------------------------
 # Codex (Automated External Review — Phase 4a)

@@ -1,3 +1,5 @@
+# Tests
+
 Automated tests live here.
 
 - `tests/test_mergepath_frontend.sh` validates `mockups/mergepath.html`

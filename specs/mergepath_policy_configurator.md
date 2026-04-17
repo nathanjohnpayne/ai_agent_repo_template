@@ -29,7 +29,11 @@ repo. Product name **Mergepath**.
   `<!-- MERGEPATH_INJECT -->` that `scripts/policy-sim.sh` rewrites
   to `<script>window.__PRS = [...]</script>`. The legacy marker
   `<!-- RUBRIC_INJECT -->` is also recognized for backward
-  compatibility.
+  compatibility. The injected JSON must be script-safe serialized —
+  `<`, `>`, `&`, and the line/paragraph separators `U+2028` / `U+2029`
+  are escaped to their `\uXXXX` forms before embedding — so a PR
+  title or path containing `</script>` cannot terminate the inline
+  block and inject markup.
 - When `window.__PRS` is populated, the header badge reads
   `live · N` and the simulation replays the injected PRs. Otherwise
   the badge reads `synthetic · N`.

@@ -40,6 +40,15 @@ grep -q 'prefers-reduced-motion'                 "$PAGE" || { echo "reduced-moti
 
 # Helper script must target the injection marker the page actually ships.
 grep -q "MERGEPATH_INJECT\|RUBRIC_INJECT"        "$SCRIPT" || { echo "policy-sim.sh has no marker"; exit 1; }
+# Helper script must target MERGEPATH_INJECT specifically (primary marker).
+grep -q "MERGEPATH_INJECT"                       "$SCRIPT" || { echo "policy-sim.sh missing primary MERGEPATH_INJECT marker"; exit 1; }
+# Helper script must script-safe escape injected JSON so a </script> token in
+# a PR title can't terminate the inline <script> block.
+grep -q '\\u003c'                                "$SCRIPT" || { echo "policy-sim.sh missing <-escape in JSON payload"; exit 1; }
+
+# YAML preview must emit full reviewer logins (nathanpayne-*), not short aliases.
+grep -q "nathanpayne-claude"                     "$PAGE" || { echo "YAML preview missing full reviewer login nathanpayne-claude"; exit 1; }
+grep -q "nathanpayne-codex"                      "$PAGE" || { echo "YAML preview missing full reviewer login nathanpayne-codex"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # XSS-safety stance: data must never flow through innerHTML.

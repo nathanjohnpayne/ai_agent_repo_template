@@ -59,7 +59,19 @@ with open(prs_path) as f:
     data = json.load(f)
 with open(template_path) as f:
     html = f.read()
-injection = "<script>window.__PRS = " + json.dumps(data) + ";</script>"
+# Script-safe JSON escaping: json.dumps alone does not neutralize `</script>`
+# or raw `<`/`>`/`&`, so a merged PR title or path could terminate the inline
+# <script> block and inject arbitrary markup. Escape those bytes as
+# unicode-encoded forms per the HTML5 "script-safe JSON" guidance.
+payload = (
+    json.dumps(data)
+    .replace("&", "\\u0026")
+    .replace("<", "\\u003c")
+    .replace(">", "\\u003e")
+    .replace("\u2028", "\\u2028")
+    .replace("\u2029", "\\u2029")
+)
+injection = "<script>window.__PRS = " + payload + ";</script>"
 for marker in ("<!-- MERGEPATH_INJECT -->", "<!-- RUBRIC_INJECT -->"):
     if marker in html:
         html = html.replace(marker, injection, 1)

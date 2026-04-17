@@ -986,7 +986,9 @@
     };
   }
 
-  const isLive = Array.isArray(window.__PRS) && window.__PRS.length > 0;
+  // Any injected array counts as live, including an empty one — a repo with
+  // zero merged PRs should show the empty state, not the synthetic sample.
+  const isLive = Array.isArray(window.__PRS);
   const samplePRs = (isLive ? window.__PRS : SYNTHETIC_PRS)
     .map(normalizePR)
     .filter(Boolean);
@@ -1188,10 +1190,18 @@
       add('v', String(state.codexRounds)); nl();
     }
     add('k', 'available_reviewers'); yaml.appendChild(document.createTextNode(':')); nl();
+    // The UI tracks reviewers by short alias; the real policy file lists full
+    // GitHub logins (nathanpayne-<alias>). Emit the login form so the preview
+    // YAML is a legal drop-in for .github/review-policy.yml.
+    const reviewerLogins = {
+      claude: 'nathanpayne-claude',
+      cursor: 'nathanpayne-cursor',
+      codex:  'nathanpayne-codex',
+    };
     Object.entries(state.reviewers).forEach(([k, v]) => {
       if (v) {
         yaml.appendChild(document.createTextNode('  - '));
-        add('s', k);
+        add('s', reviewerLogins[k] || k);
         nl();
       }
     });
