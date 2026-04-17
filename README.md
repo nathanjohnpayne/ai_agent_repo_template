@@ -1,9 +1,11 @@
-# Project Template
+# Mergepath
 
-This repository follows the **AI Agent Tooling Standard**.
+**Reference implementation of the AI Agent Tooling Standard.**
 
 The goal is to allow multiple AI coding agents and development tools to operate
-consistently without configuration drift.
+consistently without configuration drift. See [`BRAND.md`](BRAND.md) for
+the umbrella vocabulary (Playground, Cockpit, Tiebreaker, Checks) and
+naming history.
 
 ## For AI Agents
 
@@ -30,8 +32,9 @@ fallback (Phase 4b).
 | `DEPLOYMENT.md` | Build and deployment |
 | `CONTRIBUTING.md` | Development workflow |
 | `.ai_context.md` | High-level system context |
-| `mergepath/index.html` | Mergepath dashboard — tune the review policy and replay recent PRs against the draft |
-| `scripts/policy-sim.sh` | Bakes real `gh` PR data into a temp copy of the Mergepath dashboard for local replay |
+| `BRAND.md` | Mergepath umbrella vocabulary (surfaces, reserved names, naming history) |
+| `mergepath/playground/index.html` | Mergepath Playground — tune the review policy and replay recent PRs against the draft |
+| `scripts/policy-sim.sh` | Bakes real `gh` PR data into a temp copy of the Mergepath Playground for local replay |
 | `ai_agent_tooling_standard.md` | Full repository standard (reference) |
 
 ## Firebase Auth Template
@@ -55,7 +58,7 @@ See `DEPLOYMENT.md` for the full bootstrap and deploy flow.
 | `rules/` | Binding repository constraints |
 | `specs/` | Intended system behavior |
 | `plans/` | Execution and migration plans |
-| `mergepath/` | Static prototypes and interactive policy/playground mockups |
+| `mergepath/` | Mergepath Playground and reserved slots for future Mergepath surfaces (see `BRAND.md`) |
 | `tests/` | Automated validation |
 | `src/` | Application code |
 | `functions/` | Backend handlers |

@@ -1,11 +1,12 @@
-# Mergepath Policy Configurator
+# Mergepath Playground
 
-Feature: static, single-file review-policy playground for the template
-repo. Product name **Mergepath**.
+Feature: static, single-file review-policy playground. One surface of the
+Mergepath system — future surfaces (Cockpit, Tiebreaker, Checks) are
+reserved, see [`BRAND.md`](../BRAND.md).
 
 ## Acceptance criteria
 
-- The dashboard lives at `mergepath/index.html` and is a single
+- The dashboard lives at `mergepath/playground/index.html` and is a single
   self-contained HTML file with no network, build, or runtime
   dependencies.
 - The page opens directly from the filesystem and renders a synthetic
