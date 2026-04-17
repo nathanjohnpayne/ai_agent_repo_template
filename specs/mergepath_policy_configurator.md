@@ -5,7 +5,7 @@ repo. Product name **Mergepath**.
 
 ## Acceptance criteria
 
-- The dashboard lives at `mockups/mergepath.html` and is a single
+- The dashboard lives at `mergepath/index.html` and is a single
   self-contained HTML file with no network, build, or runtime
   dependencies.
 - The page opens directly from the filesystem and renders a synthetic

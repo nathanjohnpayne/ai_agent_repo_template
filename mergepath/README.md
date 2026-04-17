@@ -1,12 +1,12 @@
-# Mockups
+# Mergepath
 
 Static, single-file UI prototypes that illustrate how this template's
 review-policy tooling is meant to be used. Nothing here is wired to a
 backend or a build system. Open the HTML in a browser and it works.
 
-## Mergepath
+## Dashboard
 
-`mergepath.html` is the current dashboard. It lets you tune the policy
+`index.html` is the current dashboard. It lets you tune the policy
 knobs from `.github/review-policy.yml` and replay recent PRs against
 the draft policy so you can feel the shape of the change before
 committing the YAML.
@@ -27,9 +27,9 @@ committing the YAML.
 
 ```bash
 # From the repo root, open directly in your default browser:
-open mockups/mergepath.html             # macOS
-xdg-open mockups/mergepath.html         # Linux
-start mockups\mergepath.html            # Windows
+open mergepath/index.html             # macOS
+xdg-open mergepath/index.html         # Linux
+start mergepath\index.html            # Windows
 ```
 
 It opens with a synthetic set of sample PRs so the page demos without
@@ -44,7 +44,7 @@ any setup. The header badge reads **synthetic · 8**.
 
 The helper runs `gh pr list --state merged`, shapes the JSON into the
 `window.__PRS` format, injects it into a temporary copy of
-`mergepath.html`, and opens that copy in a new tab. The header badge
+`index.html`, and opens that copy in a new tab. The header badge
 flips to **live · N** and the routing simulation replays each PR
 against whichever policy draft you have loaded.
 

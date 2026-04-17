@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Justify the top-level `mockups/` directory as the home for static,
+Justify the top-level `mergepath/` directory as the home for static,
 single-file UI prototypes that illustrate how the template's
 review-policy tooling is meant to be used. These prototypes must not
 live in `dist/` (which is build output) or imply a production
@@ -10,13 +10,13 @@ application framework.
 
 ## Scope
 
-1. Ship a single dashboard at `mockups/mergepath.html`. Product name
+1. Ship a single dashboard at `mergepath/index.html`. Product name
    is **Mergepath**. The file is self-contained — no build step, no
    network, no auth.
 2. Ship a helper `scripts/policy-sim.sh` that uses `gh` to pull the
    repo's recent merged PRs and bakes them into a temp copy of the
    dashboard via an HTML comment injection marker.
-3. Document the dashboard in `mockups/README.md` and formalize its
+3. Document the dashboard in `mergepath/README.md` and formalize its
    intended behavior and hardening requirements in
    `specs/mergepath_policy_configurator.md`.
 4. Exercise the dashboard and helper from
@@ -33,5 +33,5 @@ now a playground for the frequently-tuned subset: threshold, protected
 paths, automation toggles, max rounds, reviewer roster, and presets.
 
 If a future iteration needs the full schema or read/write behavior, it
-should ship as a separate page in `mockups/` and keep `mergepath.html`
+should ship as a separate page in `mergepath/` and keep `index.html`
 simple.
