@@ -14,7 +14,16 @@ set -euo pipefail
 LIMIT="${1:-20}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="$REPO_ROOT/mockups/mergepath.html"
-OUT="$(mktemp /tmp/mergepath-sim.XXXXXX.html)"
+
+# macOS mktemp only substitutes TRAILING Xs, so
+# `mktemp /tmp/name.XXXXXX.html` treats the template as literal —
+# the first run succeeds and every subsequent run fails with
+# "File exists". Use a unique temp directory and place the baked
+# file inside with its extension intact; the dir name carries
+# uniqueness, the filename carries the .html so `open` picks the
+# right handler.
+OUT_DIR="$(mktemp -d -t mergepath-sim)"
+OUT="$OUT_DIR/mergepath.html"
 
 for bin in gh jq python3; do
   command -v "$bin" >/dev/null 2>&1 || {
@@ -30,8 +39,12 @@ done
 
 echo "Fetching last $LIMIT merged PRs via gh..."
 
-PRS_FILE="$(mktemp /tmp/mergepath-prs.XXXXXX.json)"
-trap 'rm -f "$PRS_FILE"' EXIT
+# PRs payload is intermediate; same trailing-X constraint, same
+# fix. The trap only cleans up this file — OUT stays so the browser
+# can open it.
+PRS_DIR="$(mktemp -d -t mergepath-prs)"
+PRS_FILE="$PRS_DIR/prs.json"
+trap 'rm -rf "$PRS_DIR"' EXIT
 
 gh pr list \
   --state merged \
