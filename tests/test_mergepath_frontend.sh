@@ -9,10 +9,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PAGE="$ROOT/mockups/mergepath.html"
 SCRIPT="$ROOT/scripts/policy-sim.sh"
-CHECK_FILE="$(mktemp /tmp/mergepath-check.XXXXXX.js)"
+# macOS mktemp only substitutes trailing Xs — `name.XXXXXX.js`
+# would work once and then fail with "File exists". Use a temp
+# directory and place fixed-name files inside.
+TMPDIR_SAFE="$(mktemp -d -t mergepath-test)"
+CHECK_FILE="$TMPDIR_SAFE/extracted.js"
 
 cleanup() {
-  rm -f "$CHECK_FILE"
+  rm -rf "$TMPDIR_SAFE"
 }
 trap cleanup EXIT
 
@@ -45,6 +49,11 @@ grep -q "MERGEPATH_INJECT"                       "$SCRIPT" || { echo "policy-sim
 # Helper script must script-safe escape injected JSON so a </script> token in
 # a PR title can't terminate the inline <script> block.
 grep -q '\\u003c'                                "$SCRIPT" || { echo "policy-sim.sh missing <-escape in JSON payload"; exit 1; }
+# Helper script must use `mktemp -d` for output paths. macOS mktemp only
+# substitutes TRAILING Xs, so `mktemp /tmp/name.XXXXXX.html` is literal —
+# it succeeds once, then every subsequent run fails with "File exists".
+grep -q 'mktemp -d'                              "$SCRIPT" || { echo "policy-sim.sh must use mktemp -d (macOS trailing-X limitation)"; exit 1; }
+grep -qE '\$\(mktemp [^)]*\.[A-Za-z]+\)'         "$SCRIPT" && { echo "policy-sim.sh uses mktemp with non-trailing Xs; will fail on macOS second run"; exit 1; } || true
 
 # YAML preview must emit full reviewer logins (nathanpayne-*), not short aliases.
 grep -q "nathanpayne-claude"                     "$PAGE" || { echo "YAML preview missing full reviewer login nathanpayne-claude"; exit 1; }
@@ -100,8 +109,7 @@ node --check "$CHECK_FILE"
 # Injection round-trip: inject a fake PR payload, confirm marker is consumed
 # and the baked copy still parses.
 # ---------------------------------------------------------------------------
-BAKED="$(mktemp /tmp/mergepath-baked.XXXXXX.html)"
-trap 'rm -f "$CHECK_FILE" "$BAKED"' EXIT
+BAKED="$TMPDIR_SAFE/baked.html"
 
 python3 - "$PAGE" "$BAKED" <<'PY'
 import sys
