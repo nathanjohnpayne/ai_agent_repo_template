@@ -14,7 +14,7 @@ set -euo pipefail
 LIMIT="${1:-20}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="$REPO_ROOT/mockups/mergepath.html"
-OUT="$(mktemp -t mergepath-sim.XXXXXX).html"
+OUT="$(mktemp /tmp/mergepath-sim.XXXXXX.html)"
 
 for bin in gh jq python3; do
   command -v "$bin" >/dev/null 2>&1 || {
@@ -30,7 +30,7 @@ done
 
 echo "Fetching last $LIMIT merged PRs via gh..."
 
-PRS_FILE="$(mktemp -t mergepath-prs.XXXXXX).json"
+PRS_FILE="$(mktemp /tmp/mergepath-prs.XXXXXX.json)"
 trap 'rm -f "$PRS_FILE"' EXIT
 
 gh pr list \
@@ -60,11 +60,13 @@ with open(prs_path) as f:
 with open(template_path) as f:
     html = f.read()
 injection = "<script>window.__PRS = " + json.dumps(data) + ";</script>"
-marker = "<!-- RUBRIC_INJECT -->"
-if marker not in html:
-    print("error: marker not found in template", file=sys.stderr)
+for marker in ("<!-- MERGEPATH_INJECT -->", "<!-- RUBRIC_INJECT -->"):
+    if marker in html:
+        html = html.replace(marker, injection, 1)
+        break
+else:
+    print("error: no injection marker found in template", file=sys.stderr)
     sys.exit(1)
-html = html.replace(marker, injection)
 with open(out_path, "w") as f:
     f.write(html)
 PY
