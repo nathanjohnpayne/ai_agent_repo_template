@@ -41,8 +41,7 @@ gh pr list \
     id: ("#\(.number)"),
     title: .title,
     author: (
-      (.body // "")
-      | capture("Authoring-Agent:\\s*(?<a>[a-zA-Z0-9_-]+)")?.a
+      ((.body // "") | (try capture("Authoring-Agent:\\s*(?<a>[a-zA-Z0-9_-]+)").a catch null))
       // .author.login
     ),
     lines: (.additions + .deletions),
