@@ -557,7 +557,7 @@ ssh -T git@github-claude        # → Hi nathanpayne-claude!
 ### Switching all repos to SSH remotes
 
 ```bash
-for repo in ai_agent_repo_template swipewatch nathanpaynedotcom \
+for repo in mergepath swipewatch nathanpaynedotcom \
             device-platform-reporting device-source-of-truth \
             overridebroadway friends-and-family-billing docs; do
   cd ~/Documents/GitHub/$repo

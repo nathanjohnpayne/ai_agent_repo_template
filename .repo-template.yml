@@ -10,8 +10,8 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
-  mergepath_policy_configurator:
-    - tests/test_mergepath_frontend.sh
+  mergepath_playground:
+    - tests/test_mergepath_playground.sh
 
 # Glob patterns that identify test files. Supplements the default
 # ("tests/**/*.test.*") which doesn't cover shell-based tests.

@@ -1,14 +1,16 @@
-# Mergepath
+# Mergepath — surfaces
 
-Static, single-file UI prototypes that illustrate how this template's
-review-policy tooling is meant to be used. Nothing here is wired to a
+This directory holds Mergepath's static, single-file surfaces.
+Currently only the **Playground** lives here; Cockpit, Tiebreaker, and
+Checks are reserved names for future surfaces — see
+[`BRAND.md`](../BRAND.md) at repo root. Nothing here is wired to a
 backend or a build system. Open the HTML in a browser and it works.
 
-## Dashboard
+## Mergepath Playground
 
-`index.html` is the current dashboard. It lets you tune the policy
-knobs from `.github/review-policy.yml` and replay recent PRs against
-the draft policy so you can feel the shape of the change before
+`playground/index.html` is the current Playground. It lets you tune the
+policy knobs from `.github/review-policy.yml` and replay recent PRs
+against the draft policy so you can feel the shape of the change before
 committing the YAML.
 
 ### What you can change
@@ -27,9 +29,9 @@ committing the YAML.
 
 ```bash
 # From the repo root, open directly in your default browser:
-open mergepath/index.html             # macOS
-xdg-open mergepath/index.html         # Linux
-start mergepath\index.html            # Windows
+open mergepath/playground/index.html             # macOS
+xdg-open mergepath/playground/index.html         # Linux
+start mergepath\playground\index.html            # Windows
 ```
 
 It opens with a synthetic set of sample PRs so the page demos without
@@ -44,7 +46,7 @@ any setup. The header badge reads **synthetic · 8**.
 
 The helper runs `gh pr list --state merged`, shapes the JSON into the
 `window.__PRS` format, injects it into a temporary copy of
-`index.html`, and opens that copy in a new tab. The header badge
+`playground/index.html`, and opens that copy in a new tab. The header badge
 flips to **live · N** and the routing simulation replays each PR
 against whichever policy draft you have loaded.
 
@@ -70,8 +72,8 @@ Each entry in the array must be `{ id, title, author, lines, paths }`.
 The page tolerates missing fields but expects those keys.
 
 The legacy marker `<!-- RUBRIC_INJECT -->` is still recognized for
-scripts carried over from earlier versions of this mockup; new tooling
-should target `MERGEPATH_INJECT`.
+scripts carried over from earlier versions of this Playground; new
+tooling should target `MERGEPATH_INJECT`.
 
 ### What this isn't
 
@@ -82,5 +84,5 @@ should target `MERGEPATH_INJECT`.
   knob configuration would look like as `.github/review-policy.yml`.
   It does not write to disk. Copy it yourself if you want to apply.
 - **Not canonical.** The spec for this page is
-  `specs/mergepath_policy_configurator.md`. If the spec and the page
-  disagree, the spec wins.
+  `specs/mergepath_playground.md`. If the spec and the page disagree,
+  the spec wins.

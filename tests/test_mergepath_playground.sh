@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# tests/test_mergepath_frontend.sh
+# tests/test_mergepath_playground.sh
 #
-# Validates mergepath/index.html against specs/mergepath_policy_configurator.md.
+# Validates mergepath/playground/index.html against specs/mergepath_playground.md.
 # Run manually or from CI. Requires: python3, node.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PAGE="$ROOT/mergepath/index.html"
+PAGE="$ROOT/mergepath/playground/index.html"
 SCRIPT="$ROOT/scripts/policy-sim.sh"
 # macOS mktemp only substitutes trailing Xs — `name.XXXXXX.js`
 # would work once and then fail with "File exists". Use a temp
@@ -139,4 +139,4 @@ sys.stdout.write('\n'.join(scripts))
 PY
 node --check "$CHECK_FILE"
 
-echo "OK: mergepath frontend checks passed"
+echo "OK: Mergepath Playground checks passed"

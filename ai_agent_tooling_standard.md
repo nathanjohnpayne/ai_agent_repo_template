@@ -7,7 +7,7 @@ coding agents and human developers. It governs structure, documentation
 placement, and agent behavior to prevent configuration drift and
 cross-tool inconsistency.
 
-The reference implementation is **ai_agent_repo_template**.
+The reference implementation is **Mergepath** (`mergepath`).
 When in doubt about structure or file placement, that repository is
 canonical.
 
@@ -392,13 +392,13 @@ To bring an existing repository into compliance:
 7. Verify `AGENTS.md` contains all required sections; add any missing.
 8. Add or update `.ai_context.md` if supplemental AI context is useful.
 9. Implement CI checks in `scripts/ci/`.
-10. Validate the result against **ai_agent_repo_template**.
+10. Validate the result against **Mergepath** (`mergepath`).
 
 ---
 
 ## Reference Implementation
 
-**`ai_agent_repo_template`** provides:
+**`mergepath`** (Mergepath) provides:
 - Example canonical documentation
 - Example directory structure
 - Example tool folder configuration

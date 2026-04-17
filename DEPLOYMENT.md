@@ -40,13 +40,13 @@ gh auth login
 
 ```bash
 # Clone the template repo if not already present
-git clone https://github.com/nathanjohnpayne/ai_agent_repo_template.git ~/Documents/GitHub/ai_agent_repo_template
+git clone https://github.com/nathanjohnpayne/mergepath.git ~/Documents/GitHub/mergepath
 
 # Install canonical helper scripts
 mkdir -p ~/.local/bin
-cp ~/Documents/GitHub/ai_agent_repo_template/scripts/gcloud/gcloud ~/.local/bin/
-cp ~/Documents/GitHub/ai_agent_repo_template/scripts/firebase/op-firebase-deploy ~/.local/bin/
-cp ~/Documents/GitHub/ai_agent_repo_template/scripts/firebase/op-firebase-setup ~/.local/bin/
+cp ~/Documents/GitHub/mergepath/scripts/gcloud/gcloud ~/.local/bin/
+cp ~/Documents/GitHub/mergepath/scripts/firebase/op-firebase-deploy ~/.local/bin/
+cp ~/Documents/GitHub/mergepath/scripts/firebase/op-firebase-setup ~/.local/bin/
 chmod +x ~/.local/bin/gcloud ~/.local/bin/op-firebase-deploy ~/.local/bin/op-firebase-setup
 
 # Ensure PATH includes ~/.local/bin
@@ -142,7 +142,7 @@ If both machines modified the same 1Password item:
 The canonical helper scripts live in this template repo. Install them once per machine:
 
 ```bash
-# From the ai_agent_repo_template directory:
+# From the mergepath directory:
 mkdir -p ~/.local/bin
 cp scripts/gcloud/gcloud ~/.local/bin/gcloud
 cp scripts/firebase/op-firebase-deploy ~/.local/bin/

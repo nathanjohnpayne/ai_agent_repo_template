@@ -2,8 +2,8 @@
 # scripts/policy-sim.sh
 #
 # Replay the current repo's recent merged PRs through the Mergepath
-# dashboard. Runs `gh pr list`, inlines the result into a copy of the
-# mockup HTML, and opens it in the default browser.
+# Playground. Runs `gh pr list`, inlines the result into a copy of the
+# Playground HTML, and opens it in the default browser.
 #
 # Usage:   ./scripts/policy-sim.sh [limit]   (default 20)
 #
@@ -13,7 +13,7 @@ set -euo pipefail
 
 LIMIT="${1:-20}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TEMPLATE="$REPO_ROOT/mergepath/index.html"
+TEMPLATE="$REPO_ROOT/mergepath/playground/index.html"
 
 # macOS mktemp only substitutes TRAILING Xs, so
 # `mktemp /tmp/name.XXXXXX.html` treats the template as literal —
