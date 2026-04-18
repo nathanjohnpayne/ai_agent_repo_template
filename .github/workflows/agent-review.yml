@@ -5,7 +5,12 @@ name: Agent Review Pipeline
 
 on:
   pull_request:
-    types: [opened, ready_for_review, labeled]
+    # `synchronize` (every push on an open PR) is in the list so
+    # `load-config` re-parses `.github/review-policy.yml` on every
+    # commit, not just on `opened` / `ready_for_review`. Without it,
+    # a shell-parser regression can land on main and only surface
+    # weeks later when the next PR happens to be opened. See #59.
+    types: [opened, ready_for_review, labeled, synchronize]
   pull_request_review:
     types: [submitted]
 
@@ -19,9 +24,13 @@ jobs:
   # Job 1: Read review-policy.yml configuration
   # ──────────────────────────────────────────────
   load-config:
-    if: >
-      github.event_name == 'pull_request' &&
-      (github.event.action == 'opened' || github.event.action == 'ready_for_review')
+    # Runs on every pull_request event (opened, ready_for_review,
+    # labeled, synchronize) so the parser exercises every commit
+    # push. Downstream jobs keep their own action-specific guards
+    # and are no-ops when action is synchronize or labeled — the
+    # wasted work is cheap and the regression detection is valuable.
+    # See #59 for the SKIPPED-as-SUCCESS miss this closes.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
       threshold: ${{ steps.config.outputs.threshold }}
