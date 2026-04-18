@@ -24,13 +24,21 @@ jobs:
   # Job 1: Read review-policy.yml configuration
   # ──────────────────────────────────────────────
   load-config:
-    # Runs on every pull_request event (opened, ready_for_review,
-    # labeled, synchronize) so the parser exercises every commit
-    # push. Downstream jobs keep their own action-specific guards
-    # and are no-ops when action is synchronize or labeled — the
-    # wasted work is cheap and the regression detection is valuable.
-    # See #59 for the SKIPPED-as-SUCCESS miss this closes.
-    if: github.event_name == 'pull_request'
+    # Runs on opened, ready_for_review, and synchronize so the
+    # parser exercises every commit pushed to an open PR, not just
+    # initial open. Explicitly excludes `labeled`: the `assign` job
+    # allows `labeled` as a trigger, and it depends on this job's
+    # outputs — letting load-config run on labeled would cause
+    # assign to re-fire on every label edit and re-request
+    # reviewers who have already reviewed. Downstream jobs keep
+    # their own action-specific guards; they stay no-ops on
+    # synchronize. See #59 for the SKIPPED-as-SUCCESS miss this
+    # closes and Codex's P2 on PR #131 for why labeled is excluded.
+    if: >
+      github.event_name == 'pull_request' &&
+      (github.event.action == 'opened' ||
+       github.event.action == 'ready_for_review' ||
+       github.event.action == 'synchronize')
     runs-on: ubuntu-latest
     outputs:
       threshold: ${{ steps.config.outputs.threshold }}
