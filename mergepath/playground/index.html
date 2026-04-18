@@ -528,13 +528,26 @@
   }
   .section-head .hint { font-size: 12px; color: var(--muted); }
 
-  .pr-panel { padding: 0; overflow: hidden; }
+  .pr-panel {
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100vh - 260px);
+  }
   .pr-panel .section-head { padding: 20px 24px 10px; margin-bottom: 0; }
+  .pr-panel #prList {
+    overflow-y: auto;
+    min-height: 0;
+  }
 
   /* YAML */
   .yaml-wrap {
     padding: 0;
     overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100vh - 260px);
   }
   .yaml-head {
     display: flex;
@@ -567,7 +580,9 @@
     line-height: 1.65;
     color: var(--ink);
     background: rgba(255, 252, 246, 0.4);
-    overflow-x: auto;
+    overflow: auto;
+    min-height: 0;
+    flex: 1;
   }
   pre.yaml .k { color: var(--p2); }
   pre.yaml .v { color: var(--p4a); }
@@ -960,7 +975,7 @@
     pathAllowed: /^[A-Za-z0-9_.\-/*?[\]{}:@+,!~$^=]+$/,
   };
 
-  const state = structuredClone
+  const state = typeof structuredClone === 'function'
     ? structuredClone(DEFAULTS)
     : JSON.parse(JSON.stringify(DEFAULTS));
 
@@ -1194,7 +1209,7 @@
       add('k', 'max_review_rounds'); yaml.appendChild(document.createTextNode(': '));
       add('v', String(state.codexRounds)); nl();
     }
-    add('k', 'available_reviewers'); yaml.appendChild(document.createTextNode(':')); nl();
+    add('k', 'available_reviewers');
     // The UI tracks reviewers by short alias; the real policy file lists full
     // GitHub logins (nathanpayne-<alias>). Emit the login form so the preview
     // YAML is a legal drop-in for .github/review-policy.yml.
@@ -1203,13 +1218,19 @@
       cursor: 'nathanpayne-cursor',
       codex:  'nathanpayne-codex',
     };
-    Object.entries(state.reviewers).forEach(([k, v]) => {
-      if (v) {
+    const checked = Object.entries(state.reviewers).filter(([, v]) => v);
+    if (checked.length === 0) {
+      // Bare `available_reviewers:` parses as null; emit an explicit empty
+      // flow-style list so the YAML round-trips as [].
+      yaml.appendChild(document.createTextNode(': ')); add('v', '[]'); nl();
+    } else {
+      yaml.appendChild(document.createTextNode(':')); nl();
+      checked.forEach(([k]) => {
         yaml.appendChild(document.createTextNode('  - '));
         add('s', reviewerLogins[k] || k);
         nl();
-      }
-    });
+      });
+    }
   }
 
   function renderAll() {
