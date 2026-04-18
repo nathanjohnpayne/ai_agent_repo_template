@@ -31,6 +31,15 @@ explicitly authorizes a break-glass override in chat.
    style, test coverage, and security/dependency hygiene.
 3. The PreToolUse hook (`scripts/hooks/gh-pr-guard.sh`) will block `gh pr create`
    if either field is missing.
+4. Before claiming "CI passes": confirm each required workflow actually
+   **ran and succeeded**, not that it was skipped. A `SKIPPED` result
+   means the job was not executed (usually because an `if:` guard or
+   a label excluded it) — it is not a verification signal. If you
+   need to verify a change to a job that is currently skipped, either
+   remove the guard temporarily to force a run, toggle
+   draft→ready_for_review to re-fire event-guarded jobs, or
+   acknowledge in the PR body that the fix has not been live-tested.
+   See #59 for the regression this rule closes.
 
 ## After opening the PR
 
