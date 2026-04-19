@@ -167,6 +167,13 @@ if ! [[ "$MAX_RATE_LIMIT_RETRIES" =~ ^[0-9]+$ ]]; then
   exit 3
 fi
 
+WALLCLOCK_FRESHNESS_WINDOW_SECONDS=$(coderabbit_field wallclock_freshness_window_seconds)
+WALLCLOCK_FRESHNESS_WINDOW_SECONDS=${WALLCLOCK_FRESHNESS_WINDOW_SECONDS:-1800}
+if ! [[ "$WALLCLOCK_FRESHNESS_WINDOW_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: coderabbit.wallclock_freshness_window_seconds must be an integer; got '$WALLCLOCK_FRESHNESS_WINDOW_SECONDS'" >&2
+  exit 3
+fi
+
 BOT_LOGIN=$(coderabbit_field bot_login)
 BOT_LOGIN=${BOT_LOGIN:-"coderabbitai[bot]"}
 POLL_INTERVAL_SECONDS=15
@@ -208,15 +215,36 @@ fi
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
 
-# HEAD freshness anchor. Committer date alone is unreliable — force-push of
-# an older commit, cherry-pick, or rebase with `--committer-date-is-author-date`
-# can produce a HEAD whose committer date predates prior CodeRabbit comments
-# on this PR. Filtering `comments.created_at >= HEAD_COMMITTER_DATE` would
-# then treat stale review-round comments as current and return a false
-# "cleared"/"findings" signal. Mirrors the Layer-1 anchor advance in
-# codex-review-request.sh: advance the anchor past any `head_ref_force_pushed`
-# timeline event. See nathanjohnpayne/mergepath#140 round-2 Codex finding
-# (P1, line 270) for the specific exposure this closes.
+# HEAD freshness anchor. Two stacked guards — committer date alone is
+# unreliable:
+#
+#   Layer 1 (force-push): advance the anchor past any
+#     `head_ref_force_pushed` event on this PR's timeline. Closes the
+#     force-push-with-old-commit false-clear. See #140 round-2 Codex
+#     finding (P1, line 270).
+#
+#   Layer 2 (wallclock floor): max the anchor with NOW - window.
+#     Without this, an ordinary push of a commit with an old committer
+#     date (cherry-pick, rebase with `--committer-date-is-author-date`,
+#     or a commit whose metadata was rewritten) lets CodeRabbit comments
+#     from a prior review round pass the filter and the script exits
+#     cleared/findings without waiting for a real review on the new
+#     HEAD. See #51/#52/#30/#35 round-3 Codex findings ("Anchor
+#     CodeRabbit freshness to push time", "Gate reviews against a
+#     fresh poll anchor", "Tie CodeRabbit freshness to push time",
+#     "Filter CodeRabbit state by current HEAD SHA", "Gate on review
+#     commit rather than comment timestamp").
+#
+# The two layers compose: force-push events get exact timestamps when
+# available, and the wallclock floor bounds residual exposure for the
+# ordinary-push path where the GitHub API does not expose a reliable
+# per-push time for non-force pushes.
+#
+# Mirrors the REACTION_THRESHOLD computation in codex-review-request.sh,
+# which uses `reaction_freshness_window_seconds` as its floor. Here the
+# knob is `coderabbit.wallclock_freshness_window_seconds` (default
+# 1800s / 30min — long enough for a typical Phase 2.5 cycle to land,
+# short enough that cross-cycle staleness is caught).
 HEAD_ANCHOR="$HEAD_COMMITTER_DATE"
 ANCHOR_SOURCE="HEAD committer date"
 TIMELINE_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline")
@@ -229,9 +257,23 @@ if [ -n "$LATEST_FORCE_PUSH_TIME" ] && [[ "$LATEST_FORCE_PUSH_TIME" > "$HEAD_ANC
   ANCHOR_SOURCE="head_ref_force_pushed @ $LATEST_FORCE_PUSH_TIME"
 fi
 
+# Layer 2 — wallclock freshness floor.
+EPOCH_NOW=$(date +%s)
+EPOCH_FLOOR=$((EPOCH_NOW - WALLCLOCK_FRESHNESS_WINDOW_SECONDS))
+if FLOOR_ISO=$(date -u -r "$EPOCH_FLOOR" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null); then
+  :
+else
+  FLOOR_ISO=$(date -u -d "@$EPOCH_FLOOR" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) \
+    || die 3 "could not compute wallclock freshness floor from epoch $EPOCH_FLOOR"
+fi
+if [[ "$FLOOR_ISO" > "$HEAD_ANCHOR" ]]; then
+  HEAD_ANCHOR="$FLOOR_ISO"
+  ANCHOR_SOURCE="wallclock floor (NOW - ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s)"
+fi
+
 log "HEAD = $HEAD_SHA committed at $HEAD_COMMITTER_DATE"
 log "anchor = $HEAD_ANCHOR (source: $ANCHOR_SOURCE)"
-log "max_wait = ${MAX_WAIT_SECONDS}s   max_rate_limit_retries = $MAX_RATE_LIMIT_RETRIES"
+log "max_wait = ${MAX_WAIT_SECONDS}s   max_rate_limit_retries = $MAX_RATE_LIMIT_RETRIES   freshness_window = ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s"
 
 # --- state machine ----------------------------------------------------------
 
