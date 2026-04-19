@@ -620,3 +620,34 @@ investigation and the longer-term fix under consideration
 (detect stale configstore in `op-firebase-deploy` and print a clear message
 instead of the current cryptic "Assertion failed: resolving hosting target"
 trailer).
+
+### 1Password ADC item refresh token expired (#137 failure mode B)
+
+A closely-related but distinct failure can fire immediately after the
+reauth above. If `scripts/op-preflight.sh` materializes a 1Password ADC
+item whose underlying `refresh_token` has been revoked or expired by
+Google, `op-firebase-deploy` will refuse the credential with:
+
+```
+Error: GOOGLE_APPLICATION_CREDENTIALS points to an unusable credential file: /var/folders/.../op-preflight-adc-*
+```
+
+Starting with the #137 fix, `op-preflight.sh` now validates the
+materialized ADC against the OAuth2 `/token` endpoint before exporting
+`GOOGLE_APPLICATION_CREDENTIALS`. When the credential is stale,
+preflight prints an actionable warning and skips the export — downstream
+callers (`op-firebase-deploy`, `gcloud` wrappers) then fall back to the
+local firebase-login / ADC path that the reauth has just refreshed.
+
+**Fix permanently** by refreshing the 1Password item:
+
+```bash
+gcloud auth application-default login
+# then copy the freshly-written JSON into the 1Password item:
+op document edit 'GCP ADC' --vault=Private \
+  ~/.config/gcloud/application_default_credentials.json
+# (or `op item edit` if stored as an item field)
+```
+
+After that, the next preflight run will materialize a usable credential
+and the `GOOGLE_APPLICATION_CREDENTIALS` export resumes normally.

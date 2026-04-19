@@ -203,6 +203,88 @@ session_is_fresh() {
   [[ "$age" -lt "$TTL_SECONDS" ]]
 }
 
+# Validate that a materialized ADC file still mints a token. Mirrors the
+# source_cred_is_usable check in scripts/firebase/op-firebase-deploy so a
+# stale 1Password ADC item (refresh_token expired by Google) gets caught
+# in preflight instead of inside firebase CLI after the user has already
+# eval'd the exports. See nathanjohnpayne/mergepath#137 failure mode B
+# for the concrete repro: 1Password holds an authorized_user cred whose
+# refresh_token has expired; op read succeeds and writes the file, but
+# the OAuth2 /token round-trip fails. Without this check, preflight
+# reports "GCP ADC: loaded" and downstream callers see
+# "GOOGLE_APPLICATION_CREDENTIALS points to an unusable credential file"
+# from inside op-firebase-deploy.
+#
+# Returns 0 if the file exists and mints a token (or is a self-contained
+# service_account key). Returns 1 otherwise — including when python3 is
+# unavailable or the oauth2 endpoint is unreachable in which case the
+# safer behavior is to treat the cred as stale and let downstream
+# callers fall back to their own auth path.
+adc_is_usable() {
+  local file="${1:-}"
+  [[ -n "$file" && -f "$file" && -s "$file" ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$file" <<'PY'
+import json, pathlib, sys, urllib.request, urllib.parse
+
+try:
+    cred = json.loads(pathlib.Path(sys.argv[1]).read_text())
+except Exception:
+    sys.exit(1)
+
+while cred.get("type") == "impersonated_service_account" and "source_credentials" in cred:
+    cred = cred["source_credentials"]
+
+if cred.get("type") == "service_account":
+    sys.exit(0)
+
+refresh_token = cred.get("refresh_token", "")
+client_id     = cred.get("client_id", "")
+client_secret = cred.get("client_secret", "")
+
+if not all([refresh_token, client_id, client_secret]):
+    sys.exit(1)
+
+data = urllib.parse.urlencode({
+    "client_id": client_id,
+    "client_secret": client_secret,
+    "refresh_token": refresh_token,
+    "grant_type": "refresh_token",
+}).encode()
+try:
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+    urllib.request.urlopen(req, timeout=10)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+# Emit the human-facing guidance for a stale 1Password ADC item. Called
+# from both the full-fetch path (after op read + adc_is_usable fails)
+# and the fast-path cache-hit path (when a cached ADC fails the same
+# check on the next invocation).
+log_stale_adc_guidance() {
+  echo "# ──────────────────────────────────────────────────────" >&2
+  echo "# WARNING: 1Password ADC item is stale (OAuth2 refresh rejected)." >&2
+  echo "#" >&2
+  echo "# The credential stored at $DEFAULT_ADC_OP_URI" >&2
+  echo "# was read successfully but Google rejected its refresh token —" >&2
+  echo "# typical causes: token revoked, expired (RAPT), or user account" >&2
+  echo "# password changed. Refresh it with:" >&2
+  echo "#" >&2
+  echo "#   gcloud auth application-default login" >&2
+  echo "#   op document edit 'GCP ADC' --vault=Private \\" >&2
+  echo "#     ~/.config/gcloud/application_default_credentials.json" >&2
+  echo "#" >&2
+  echo "# (use 'op item edit' if the ADC is stored as an item field instead)" >&2
+  echo "#" >&2
+  echo "# Preflight will NOT export GOOGLE_APPLICATION_CREDENTIALS this run" >&2
+  echo "# so downstream callers (op-firebase-deploy, gcloud wrappers) can" >&2
+  echo "# fall back to the local firebase-login / ADC path." >&2
+  echo "# See nathanjohnpayne/mergepath#137 for the failure mode this guards." >&2
+  echo "# ──────────────────────────────────────────────────────" >&2
+}
+
 # Emit the session file's export statements to stdout. Caller eval's them.
 emit_from_session_file() {
   # Source the session file and re-emit only the vars we own, so a
@@ -225,8 +307,17 @@ emit_from_session_file() {
   fi
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     # Both the cached-path pointer must be set AND the file it names
-    # must still be readable (non-empty).
+    # must still be readable (non-empty) AND still mint a token. The
+    # usability check catches the case where the cached ADC was valid
+    # at write time but has since been revoked/expired by Google —
+    # without it, a fresh session file would keep re-emitting a dead
+    # GOOGLE_APPLICATION_CREDENTIALS export for up to TTL_SECONDS.
+    # See #137 failure mode B.
     if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] || [[ ! -s "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+      return 2
+    fi
+    if ! adc_is_usable "${GOOGLE_APPLICATION_CREDENTIALS}"; then
+      log_stale_adc_guidance
       return 2
     fi
   fi
@@ -319,11 +410,17 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
   chmod 600 "$ADC_TMPFILE"
 
   if op read "$DEFAULT_ADC_OP_URI" > "$ADC_TMPFILE" 2>/dev/null && [[ -s "$ADC_TMPFILE" ]]; then
-    EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
-    EXPORTS+=("export OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
-    SESSION_LINES+=("GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
-    SESSION_LINES+=("OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
-    SUMMARY+=("GCP ADC: loaded -> $ADC_TMPFILE")
+    if adc_is_usable "$ADC_TMPFILE"; then
+      EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
+      EXPORTS+=("export OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
+      SESSION_LINES+=("GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
+      SESSION_LINES+=("OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
+      SUMMARY+=("GCP ADC: loaded -> $ADC_TMPFILE")
+    else
+      rm -f "$ADC_TMPFILE"
+      log_stale_adc_guidance
+      SUMMARY+=("GCP ADC: STALE (refresh_token rejected — see warning above)")
+    fi
   else
     rm -f "$ADC_TMPFILE"
     echo "# Warning: could not read GCP ADC. Deploy credentials not cached." >&2
