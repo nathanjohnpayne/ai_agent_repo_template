@@ -364,6 +364,25 @@ emit_json_and_exit() {
   exit "$exit_code"
 }
 
+# Sleep for up to `requested` seconds, but time out and emit JSON if the
+# sleep would push total elapsed past MAX_WAIT_SECONDS. Without this
+# guard, fixed 15s polling sleeps can overshoot the configured budget
+# (caller sees `waited_seconds > max_wait_seconds` in the JSON, which is
+# surprising from a knob named "max"). See #140 round-3 CodeRabbit
+# finding (Potential issue, Major, line 380).
+sleep_or_timeout() {
+  local requested=$1
+  local now elapsed remaining
+  now=$(date +%s)
+  elapsed=$((now - START_EPOCH))
+  remaining=$((MAX_WAIT_SECONDS - elapsed))
+  if [ "$remaining" -le 0 ] || [ "$requested" -ge "$remaining" ]; then
+    log "remaining budget (${remaining}s) is below next sleep (${requested}s) — timing out"
+    emit_json_and_exit "timeout" 4 "null" 0
+  fi
+  sleep "$requested"
+}
+
 while :; do
   NOW_EPOCH=$(date +%s)
   ELAPSED=$((NOW_EPOCH - START_EPOCH))
@@ -376,7 +395,7 @@ while :; do
 
   if [ "$(echo "$LATEST" | jq 'length')" = "0" ]; then
     log "no CodeRabbit comment yet (elapsed ${ELAPSED}s); sleeping ${POLL_INTERVAL_SECONDS}s"
-    sleep "$POLL_INTERVAL_SECONDS"
+    sleep_or_timeout "$POLL_INTERVAL_SECONDS"
     continue
   fi
 
@@ -394,7 +413,7 @@ while :; do
         # Same rate-limit comment as last iteration — still sleeping/waiting
         # through our own retry window. Don't double-count retries.
         log "still inside prior rate-limit window; sleeping ${POLL_INTERVAL_SECONDS}s"
-        sleep "$POLL_INTERVAL_SECONDS"
+        sleep_or_timeout "$POLL_INTERVAL_SECONDS"
         continue
       fi
       LAST_RATE_LIMIT_COMMENT_ID=$COMMENT_ID
@@ -420,7 +439,7 @@ while :; do
       NOW_EPOCH=$(date +%s)
       ELAPSED=$((NOW_EPOCH - START_EPOCH))
       REMAINING=$((MAX_WAIT_SECONDS - ELAPSED))
-      if [ "$SLEEP_FOR" -gt "$REMAINING" ]; then
+      if [ "$SLEEP_FOR" -ge "$REMAINING" ]; then
         log "rate-limit window (${SLEEP_FOR}s) exceeds remaining budget (${REMAINING}s) — timing out"
         RATE_LIMIT_REVIEW=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
         emit_json_and_exit "timeout" 4 "$RATE_LIMIT_REVIEW" 0
@@ -433,7 +452,7 @@ while :; do
       ;;
     in_progress)
       log "CodeRabbit review in progress; sleeping ${POLL_INTERVAL_SECONDS}s"
-      sleep "$POLL_INTERVAL_SECONDS"
+      sleep_or_timeout "$POLL_INTERVAL_SECONDS"
       continue
       ;;
     review)
