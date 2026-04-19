@@ -312,16 +312,39 @@ scan_latest_comment() {
   echo "$latest" | jq '{id, created_at, endpoint: "issues", body}'
 }
 
-# Count "Potential issue" / ⚠️ markers in the pulls inline comment list
-# on or after HEAD_ANCHOR. Used for exit code 2 when a real review
-# surfaces high-severity findings.
+# Count "Potential issue" / ⚠️ markers in the pulls inline comment list,
+# scoped to the LATEST CodeRabbit review on the current HEAD. The
+# naive "all bot comments after HEAD_ANCHOR" shape would keep stale
+# findings from an earlier review round (same HEAD, pre-retry) in the
+# count forever, so a PR could stay permanently in the `findings`
+# state even after the next review comes back clean. Mirror the
+# latest-review-scoping pattern codex-review-request.sh uses via
+# `pull_request_review_id`. See propagation-round Codex finding
+# (P1) on device-platform-reporting#51.
 count_potential_issues() {
-  local pulls_comments
-  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
-  echo "$pulls_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
+  local reviews pulls_comments latest_review_id
+  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
+  latest_review_id=$(echo "$reviews" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
     [ .[]
       | select(.user.login == $bot)
-      | select(.created_at >= $after)
+      | select(.submitted_at >= $after)
+    ]
+    | sort_by(.submitted_at) | last
+    | if . == null then null else .id end
+  ')
+
+  if [ -z "$latest_review_id" ] || [ "$latest_review_id" = "null" ]; then
+    echo "0"
+    return
+  fi
+
+  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
+  echo "$pulls_comments" | jq \
+    --arg bot "$BOT_LOGIN" \
+    --argjson review_id "$latest_review_id" '
+    [ .[]
+      | select(.user.login == $bot)
+      | select(.pull_request_review_id == $review_id)
       | select((.body // "") | test("Potential issue|⚠️"; "i"))
     ] | length
   '

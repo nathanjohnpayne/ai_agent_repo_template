@@ -286,10 +286,31 @@ log_stale_adc_guidance() {
 }
 
 # Emit the session file's export statements to stdout. Caller eval's them.
-emit_from_session_file() {
+#
+# Runs in a subshell with the relevant variables pre-unset so the
+# sourced file's definitions are NOT aliased to whatever the parent
+# shell happened to have in scope. Without this isolation a prior
+# `--agent claude` invocation could leak its PATs into an
+# `--agent codex --mode review` fast-path check, making an
+# incomplete codex session file look valid and causing gh to run as
+# the wrong identity. See round-5 Codex finding on the propagation
+# PRs for the multi-agent repro.
+emit_from_session_file() (
+  # Subshell: the (  ... ) above means unset/source/return here do
+  # not escape back to the caller. We still "return" rc codes via
+  # stdout+exit; parent stays clean.
+  unset OP_PREFLIGHT_REVIEWER_PAT OP_PREFLIGHT_AUTHOR_PAT
+  unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
+  unset OP_PREFLIGHT_DONE OP_PREFLIGHT_AGENT OP_PREFLIGHT_MODE
+  unset OP_PREFLIGHT_CREATED_AT_EPOCH OP_PREFLIGHT_TTL_SECONDS
+
   # Source the session file and re-emit only the vars we own, so a
   # hand-edited file with arbitrary content cannot inject exports.
-  # Also drop CREATED_AT from the exported set; it's bookkeeping.
+  # Permissions are 0600 in a 0700 cache dir (enforced at write time
+  # and re-checked here via stat), so the source boundary is "file
+  # owner writes the file; we trust them." Rebuttal to the P2
+  # safe-parse finding on the propagation PRs — a reader that also
+  # writes the file cannot protect themselves from themselves.
   # shellcheck disable=SC1090
   . "$SESSION_FILE"
 
@@ -302,23 +323,34 @@ emit_from_session_file() {
   # each case. See #141 round-1 Codex finding (P1, line 223).
   if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
     if [[ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]] || [[ -z "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]]; then
-      return 2
+      exit 2
     fi
   fi
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
-    # Both the cached-path pointer must be set AND the file it names
-    # must still be readable (non-empty) AND still mint a token. The
-    # usability check catches the case where the cached ADC was valid
-    # at write time but has since been revoked/expired by Google —
-    # without it, a fresh session file would keep re-emitting a dead
-    # GOOGLE_APPLICATION_CREDENTIALS export for up to TTL_SECONDS.
-    # See #137 failure mode B.
+    # Partial-cache allowance: if the caller asked for `--mode all`
+    # and the prior run captured PATs but could not read ADC (e.g.
+    # 1Password offline for the deploy vault), the session file has
+    # review-side fields only. Don't re-prompt biometric for PATs
+    # the file already has just because ADC is absent — treat it as
+    # "PATs cached, deploy credentials not available, downstream
+    # callers fall back" same as the full-fetch stale-ADC path. A
+    # literal `--mode deploy` still requires an ADC.
+    #
+    # The ADC-missing-and-mode-is-all case was surfaced by
+    # device-source-of-truth#52 round-5 Codex review (P2).
     if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] || [[ ! -s "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
-      return 2
-    fi
-    if ! adc_is_usable "${GOOGLE_APPLICATION_CREDENTIALS}"; then
+      if [[ "$MODE" == "deploy" ]]; then
+        exit 2
+      fi
+      # MODE=all with no ADC → emit PATs, skip ADC, continue.
+    elif ! adc_is_usable "${GOOGLE_APPLICATION_CREDENTIALS}"; then
+      # File exists but refresh token is rejected. Same behavior:
+      # warn, skip the export, let downstream fall back.
       log_stale_adc_guidance
-      return 2
+      unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
+      if [[ "$MODE" == "deploy" ]]; then
+        exit 2
+      fi
     fi
   fi
 
@@ -332,16 +364,54 @@ emit_from_session_file() {
     printf 'export OP_PREFLIGHT_ADC_TMPFILE=%q\n' "$OP_PREFLIGHT_ADC_TMPFILE"
   printf 'export OP_PREFLIGHT_DONE=1\n'
   printf 'export OP_PREFLIGHT_AGENT=%q\n' "$AGENT"
-  return 0
+  exit 0
+)
+
+# Warm author + reviewer SSH keys. Idempotent — each `ssh -T` exits
+# immediately with "You've successfully authenticated" when the agent
+# has the key, otherwise triggers the 1Password SSH-agent biometric
+# prompt for the underlying key. Called from both the full-fetch path
+# and the cache-hit fast path: skipping SSH warming on the fast path
+# means subsequent git/gh SSH operations can still block on auth even
+# after preflight reports success (friends-and-family-billing#227
+# round-5 Codex P2). Output goes to stderr so it's not eval'd.
+warm_ssh_keys() {
+  echo "# Preflight: warming SSH keys..." >&2
+  if ssh -T "git@${SSH_AUTHOR_HOST}" 2>&1 | grep -qi "successfully authenticated"; then
+    SUMMARY+=("SSH key ($SSH_AUTHOR_HOST): authorized")
+  else
+    SUMMARY+=("SSH key ($SSH_AUTHOR_HOST): warming attempted")
+  fi
+  local reviewer_host
+  reviewer_host="$(ssh_host_for "$AGENT")"
+  if ssh -T "git@${reviewer_host}" 2>&1 | grep -qi "successfully authenticated"; then
+    SUMMARY+=("SSH key ($reviewer_host): authorized")
+  else
+    SUMMARY+=("SSH key ($reviewer_host): warming attempted")
+  fi
 }
 
 # ── Fast path: reuse session file when fresh ──────────────────────────
 if ! $REFRESH && session_is_fresh; then
-  if emit_from_session_file; then
+  cached_exports=$(emit_from_session_file)
+  rc=$?
+  if [[ "$rc" == "0" ]]; then
+    echo "$cached_exports"
     age=$(( $(date +%s) - $(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$SESSION_FILE" | cut -d= -f2- | tr -d "'\"") ))
+    # Warm SSH keys on the cache-hit path too. The cached PATs are
+    # worthless for git push/pull if SSH auth isn't also primed, and
+    # the prior implementation skipped this step entirely on cache
+    # hit — a repro surfaced on the consumer-repo propagation PRs.
+    SUMMARY=()
+    if [[ "$MODE" == "review" || "$MODE" == "all" ]] && ! $SKIP_SSH; then
+      warm_ssh_keys
+    fi
     echo "" >&2
     echo "# ── Preflight cached hit (age ${age}s / TTL ${TTL_SECONDS}s) ──" >&2
     echo "# Session file: $SESSION_FILE" >&2
+    for line in "${SUMMARY[@]}"; do
+      echo "#   $line" >&2
+    done
     echo "# Run with --refresh to force a new biometric fetch." >&2
     echo "# ──────────────────────────────────────────────────────────" >&2
     exit 0
@@ -430,22 +500,7 @@ fi
 
 # ── Phase 2: SSH key warming ──────────────────────────────────────────
 if [[ "$MODE" == "review" || "$MODE" == "all" ]] && ! $SKIP_SSH; then
-  echo "# Preflight: warming SSH keys..." >&2
-
-  # Author key
-  if ssh -T "git@${SSH_AUTHOR_HOST}" 2>&1 | grep -qi "successfully authenticated"; then
-    SUMMARY+=("SSH key ($SSH_AUTHOR_HOST): authorized")
-  else
-    SUMMARY+=("SSH key ($SSH_AUTHOR_HOST): warming attempted")
-  fi
-
-  # Reviewer key
-  reviewer_host="$(ssh_host_for "$AGENT")"
-  if ssh -T "git@${reviewer_host}" 2>&1 | grep -qi "successfully authenticated"; then
-    SUMMARY+=("SSH key ($reviewer_host): authorized")
-  else
-    SUMMARY+=("SSH key ($reviewer_host): warming attempted")
-  fi
+  warm_ssh_keys
 fi
 
 # ── Persist session file ──────────────────────────────────────────────
