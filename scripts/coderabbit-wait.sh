@@ -167,7 +167,8 @@ if ! [[ "$MAX_RATE_LIMIT_RETRIES" =~ ^[0-9]+$ ]]; then
   exit 3
 fi
 
-BOT_LOGIN="coderabbitai[bot]"
+BOT_LOGIN=$(coderabbit_field bot_login)
+BOT_LOGIN=${BOT_LOGIN:-"coderabbitai[bot]"}
 POLL_INTERVAL_SECONDS=15
 RATE_LIMIT_BUFFER_SECONDS=30
 
