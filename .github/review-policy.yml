@@ -109,6 +109,27 @@ coderabbit:
   # rate-limit comment). See nathanjohnpayne/mergepath#138.
   max_rate_limit_retries: 2
 
+  # Wallclock freshness floor for the HEAD_ANCHOR in
+  # `scripts/coderabbit-wait.sh`. Stacked with the `head_ref_force_pushed`
+  # anchor advance — `HEAD_ANCHOR = max(HEAD_COMMITTER_DATE,
+  # latest_force_push, NOW - wallclock_freshness_window_seconds)`.
+  #
+  # Without this floor, an ordinary push of a commit with an old
+  # committer date (cherry-pick, rebase with
+  # `--committer-date-is-author-date`, or rewritten metadata) lets
+  # prior-round CodeRabbit comments pass the `created_at >= HEAD_ANCHOR`
+  # filter and the script can exit cleared/findings without waiting
+  # for a review on the actual current HEAD. The floor bounds that
+  # exposure to this many seconds.
+  #
+  # Mirrors codex-review-request.sh's `reaction_freshness_window_seconds`.
+  # Default 1800s (30min): long enough for a typical Phase 2.5 cycle
+  # (push → CodeRabbit → merge) to complete without forcing extra
+  # waits, short enough that cross-cycle staleness is caught. Raise
+  # for repos where PRs commonly take longer than 30min of wall time
+  # between consecutive CodeRabbit reviews.
+  wallclock_freshness_window_seconds: 1800
+
 # ---------------------------------------------------------------------------
 # Codex (Automated External Review — Phase 4a)
 # ---------------------------------------------------------------------------

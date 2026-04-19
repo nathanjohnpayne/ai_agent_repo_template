@@ -425,8 +425,9 @@ author_identity: nathanjohnpayne
 coderabbit:
   enabled: false
   bot_login: "coderabbitai[bot]"
-  max_wait_seconds: 300          # grace window for scripts/coderabbit-wait.sh
-  max_rate_limit_retries: 2      # retries after CodeRabbit posts "Rate limit exceeded"
+  max_wait_seconds: 300                    # grace window for scripts/coderabbit-wait.sh
+  max_rate_limit_retries: 2                # retries after CodeRabbit posts "Rate limit exceeded"
+  wallclock_freshness_window_seconds: 1800 # HEAD_ANCHOR floor; closes cherry-pick false-clear
 
 # Codex (Phase 4a automated external review) — see Phase 4a above.
 # Same semantics note as coderabbit: this flag governs agent behavior,
