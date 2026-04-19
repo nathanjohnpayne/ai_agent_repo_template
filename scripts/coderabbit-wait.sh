@@ -208,7 +208,29 @@ fi
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
 
+# HEAD freshness anchor. Committer date alone is unreliable — force-push of
+# an older commit, cherry-pick, or rebase with `--committer-date-is-author-date`
+# can produce a HEAD whose committer date predates prior CodeRabbit comments
+# on this PR. Filtering `comments.created_at >= HEAD_COMMITTER_DATE` would
+# then treat stale review-round comments as current and return a false
+# "cleared"/"findings" signal. Mirrors the Layer-1 anchor advance in
+# codex-review-request.sh: advance the anchor past any `head_ref_force_pushed`
+# timeline event. See nathanjohnpayne/mergepath#140 round-2 Codex finding
+# (P1, line 270) for the specific exposure this closes.
+HEAD_ANCHOR="$HEAD_COMMITTER_DATE"
+ANCHOR_SOURCE="HEAD committer date"
+TIMELINE_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline")
+LATEST_FORCE_PUSH_TIME=$(echo "$TIMELINE_JSON" | jq -r '
+  [ .[] | select(.event == "head_ref_force_pushed") | .created_at ]
+  | max // ""
+')
+if [ -n "$LATEST_FORCE_PUSH_TIME" ] && [[ "$LATEST_FORCE_PUSH_TIME" > "$HEAD_ANCHOR" ]]; then
+  HEAD_ANCHOR="$LATEST_FORCE_PUSH_TIME"
+  ANCHOR_SOURCE="head_ref_force_pushed @ $LATEST_FORCE_PUSH_TIME"
+fi
+
 log "HEAD = $HEAD_SHA committed at $HEAD_COMMITTER_DATE"
+log "anchor = $HEAD_ANCHOR (source: $ANCHOR_SOURCE)"
 log "max_wait = ${MAX_WAIT_SECONDS}s   max_rate_limit_retries = $MAX_RATE_LIMIT_RETRIES"
 
 # --- state machine ----------------------------------------------------------
@@ -256,14 +278,15 @@ classify_comment() {
 }
 
 # Scan both comment endpoints for the latest CodeRabbit comment on or
-# after HEAD_COMMITTER_DATE. Emits JSON to stdout. Sets LATEST_* globals.
-# Empty JSON object {} if no qualifying comment found.
+# after HEAD_ANCHOR (max of HEAD committer date and latest force-push
+# timeline event). Emits JSON to stdout. Empty object {} if nothing
+# qualifying yet.
 scan_latest_comment() {
   local issue_comments pulls_comments combined latest
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
   pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
 
-  combined=$(jq -s --arg bot "$BOT_LOGIN" --arg after "$HEAD_COMMITTER_DATE" '
+  combined=$(jq -s --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
     ( (.[0] // []) | map(. + {endpoint: "issues"}) ) +
     ( (.[1] // []) | map(. + {endpoint: "pulls"}) )
     | map(select(.user.login == $bot))
@@ -280,12 +303,12 @@ scan_latest_comment() {
 }
 
 # Count "Potential issue" / ⚠️ markers in the pulls inline comment list
-# on or after HEAD_COMMITTER_DATE. Used for exit code 2 when a real
-# review surfaces high-severity findings.
+# on or after HEAD_ANCHOR. Used for exit code 2 when a real review
+# surfaces high-severity findings.
 count_potential_issues() {
   local pulls_comments
   pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
-  echo "$pulls_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_COMMITTER_DATE" '
+  echo "$pulls_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
     [ .[]
       | select(.user.login == $bot)
       | select(.created_at >= $after)
@@ -388,6 +411,20 @@ while :; do
         WINDOW_SECONDS=60
       fi
       SLEEP_FOR=$((WINDOW_SECONDS + RATE_LIMIT_BUFFER_SECONDS))
+      # Clamp against remaining budget — if the published rate-limit
+      # window exceeds max_wait_seconds anyway, there's no point
+      # burning through the entire sleep only to time out on the next
+      # iteration. Time out immediately instead so the caller sees a
+      # prompt, well-formed timeout rather than a stalled process.
+      # See #140 round-2 Codex finding (P2, line 392).
+      NOW_EPOCH=$(date +%s)
+      ELAPSED=$((NOW_EPOCH - START_EPOCH))
+      REMAINING=$((MAX_WAIT_SECONDS - ELAPSED))
+      if [ "$SLEEP_FOR" -gt "$REMAINING" ]; then
+        log "rate-limit window (${SLEEP_FOR}s) exceeds remaining budget (${REMAINING}s) — timing out"
+        RATE_LIMIT_REVIEW=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
+        emit_json_and_exit "timeout" 4 "$RATE_LIMIT_REVIEW" 0
+      fi
       log "rate-limited; sleeping ${SLEEP_FOR}s (window=${WINDOW_SECONDS}s + ${RATE_LIMIT_BUFFER_SECONDS}s buffer)"
       sleep "$SLEEP_FOR"
       post_retry_trigger
