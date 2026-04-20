@@ -236,29 +236,29 @@ Go to the new repo → Settings → Secrets and variables → Actions → New re
 
 | Secret name | Value | PAT type |
 |---|---|---|
-| `CLAUDE_PAT` | Classic PAT for `nathanpayne-claude` with `repo` scope | **Classic** (not fine-grained) |
-| `CODEX_PAT` | Classic PAT for `nathanpayne-codex` with `repo` scope | **Classic** (not fine-grained) |
-| `CURSOR_PAT` | Classic PAT for `nathanpayne-cursor` with `repo` scope | **Classic** (not fine-grained) |
 | `REVIEWER_ASSIGNMENT_TOKEN` | PAT for `nathanjohnpayne` | Fine-grained OK (owns repo) |
-| `ANTHROPIC_API_KEY` | Anthropic API key for Claude Code headless review | — |
-| `OPENAI_API_KEY` | OpenAI API key for Codex headless review | — |
 
-**Why classic PATs?** Machine users are collaborators, not repo owners. Fine-grained
-PATs on personal (non-org) GitHub accounts only cover repos the account *owns*.
-The "All repositories" scope means all owned repos (zero for collaborators), and
-"Only select repositories" does not list collaborator repos.
-
-Or use the CLI (faster). Use 1Password item IDs to avoid shell issues with parentheses:
+Or use the CLI (faster):
 
 ```bash
-# Use exact 1Password item IDs (avoids shell issues with parentheses in item titles):
-gh secret set CLAUDE_PAT --repo {owner}/{repo} --body "$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')"
-gh secret set CURSOR_PAT --repo {owner}/{repo} --body "$(op read 'op://Private/bslrih4spwxgookzfy6zedz5g4/token')"
-gh secret set CODEX_PAT --repo {owner}/{repo} --body "$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')"
 gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Private/sm5kopwk6t6p3xmu2igesndzhe/token')"
-gh secret set ANTHROPIC_API_KEY --repo {owner}/{repo} --body "$(op read 'op://Private/ey6stbr75px3mx6nzthh6z54o4/credential')"  # Claude API Key (Test/Dev) — generate a project-specific key for long-term use
-gh secret set OPENAI_API_KEY --repo {owner}/{repo} --body "$(op read 'op://Private/ooj5vq25ynj5n56mqm7xrmumsq/credential')"  # ChatGPT API Key (Test/Dev) — generate a project-specific key for long-term use
 ```
+
+**Reviewer identity PATs (`nathanpayne-claude`, `nathanpayne-codex`,
+`nathanpayne-cursor`) are intentionally NOT stored as repo CI secrets.**
+Phase 2 internal self-peer review runs in the agent's own session: the
+agent switches its Git identity to its reviewer account with a PAT
+read directly from 1Password (`op read 'op://Private/<item-id>/token'`)
+and posts the review with that PAT. See REVIEW_POLICY.md § Phase 2 and
+each repo's `CLAUDE.md` / `AGENTS.md` for the identity-switch procedure.
+
+**Do NOT add `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `CLAUDE_PAT` /
+`CODEX_PAT` / `CURSOR_PAT` as repo secrets.** An earlier iteration of
+`agent-review.yml` had an `invoke-reviewer` job that ran the Claude
+Code CLI headlessly as a CI-side reviewer; this was the wrong flow
+(parallel to the authoring session, stale-API-key failure surface,
+duplicate work) and was removed. Phase 2 now lives entirely inside
+the authoring agent's session.
 
 ### 4. Configure branch protection
 
