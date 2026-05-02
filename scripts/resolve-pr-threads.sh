@@ -99,46 +99,71 @@ fi
 OWNER="${REPO%/*}"
 NAME="${REPO#*/}"
 
-# Fetch all review threads with their isResolved state, author, and
-# first comment. Use GraphQL because reviewThreads aren't exposed via
-# the REST endpoint.
-THREADS=$(gh api graphql -f query='
-  query($owner: String!, $repo: String!, $pr: Int!) {
-    repository(owner: $owner, name: $repo) {
-      pullRequest(number: $pr) {
-        reviewThreads(first: 100) {
-          nodes {
-            id
-            isResolved
-            isOutdated
-            comments(first: 1) {
-              nodes {
-                author { login }
-                path
-                body
-                createdAt
+# Fetch the PR's current HEAD commit oid — used by --auto-resolve-bots
+# to verify each thread's latest comment is on the current HEAD before
+# resolving. Codex P2 on PR #172 caught that the docstring promised
+# this check but the code didn't enforce it.
+HEAD_OID=$(gh api "repos/$OWNER/$NAME/pulls/$PR_NUM" --jq .head.sha 2>/dev/null) || {
+  echo "Could not resolve PR HEAD oid for $REPO#$PR_NUM" >&2
+  exit 2
+}
+
+# Fetch all review threads with isResolved state, author, and the
+# LATEST comment's commit_id (so --auto-resolve-bots can verify
+# current-HEAD membership). Use GraphQL because reviewThreads aren't
+# exposed via REST. Paginate through reviewThreads — Codex P2 on PR
+# #172 caught that the prior `first: 100` could undercount on PRs
+# with many threads. Ditto comments: fetch `last: 1` to anchor the
+# resolved-against-HEAD check on the most recent comment per thread.
+THREADS_JSON='[]'
+CURSOR="null"
+while :; do
+  PAGE=$(gh api graphql -f query='
+    query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $pr) {
+          reviewThreads(first: 50, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              isResolved
+              isOutdated
+              comments(last: 1) {
+                nodes {
+                  author { login }
+                  path
+                  body
+                  createdAt
+                  commit { oid }
+                }
               }
             }
           }
         }
       }
     }
+  ' -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -f cursor="$CURSOR" 2>&1) || {
+    echo "GraphQL query failed: $PAGE" >&2
+    exit 2
   }
-' -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" 2>&1) || {
-  echo "GraphQL query failed: $THREADS" >&2
-  exit 2
-}
+  THREADS_JSON=$(jq -c --argjson acc "$THREADS_JSON" \
+    '$acc + .data.repository.pullRequest.reviewThreads.nodes' <<<"$PAGE")
+  HAS_NEXT=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' <<<"$PAGE")
+  [ "$HAS_NEXT" = "true" ] || break
+  CURSOR=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor' <<<"$PAGE")
+done
 
-UNRESOLVED=$(echo "$THREADS" | jq -c '
-  .data.repository.pullRequest.reviewThreads.nodes[]
+UNRESOLVED=$(echo "$THREADS_JSON" | jq -c '
+  .[]
   | select(.isResolved == false)
   | {
       id: .id,
       outdated: .isOutdated,
-      author: (.comments.nodes[0].author.login // "unknown"),
-      path: (.comments.nodes[0].path // "(no path)"),
-      created: (.comments.nodes[0].createdAt // ""),
-      excerpt: ((.comments.nodes[0].body // "") | .[0:160])
+      author: (.comments.nodes[-1].author.login // "unknown"),
+      path: (.comments.nodes[-1].path // "(no path)"),
+      created: (.comments.nodes[-1].createdAt // ""),
+      commit_oid: (.comments.nodes[-1].commit.oid // ""),
+      excerpt: ((.comments.nodes[-1].body // "") | .[0:160])
     }
 ')
 
@@ -170,17 +195,31 @@ fi
 # loop and the trailing summary is accurate.
 RESOLVED_COUNT=0
 SKIPPED_HUMAN=0
+SKIPPED_STALE=0
 FAILED_COUNT=0
 while IFS= read -r thread; do
   AUTHOR=$(echo "$thread" | jq -r .author)
   THREAD_ID=$(echo "$thread" | jq -r .id)
   PATH_=$(echo "$thread" | jq -r .path)
   EXCERPT=$(echo "$thread" | jq -r .excerpt)
+  COMMIT_OID=$(echo "$thread" | jq -r .commit_oid)
 
   if ! [[ "$AUTHOR" =~ $BOT_LOGINS_RE ]]; then
     echo "  SKIP (human author $AUTHOR): $PATH_"
     echo "    $EXCERPT"
     SKIPPED_HUMAN=$((SKIPPED_HUMAN + 1))
+    continue
+  fi
+
+  # Current-HEAD check (Codex P2 on PR #172). The advertised contract
+  # is "resolve only when the latest comment is on the current HEAD"
+  # — a thread anchored to an older commit means the agent's most
+  # recent push hasn't been re-reviewed by the bot, so resolving it
+  # would force-clear an unaddressed finding. Skip with a clear note.
+  if [ -n "$COMMIT_OID" ] && [ "$COMMIT_OID" != "$HEAD_OID" ]; then
+    echo "  SKIP (stale: latest comment on ${COMMIT_OID:0:7}, HEAD is ${HEAD_OID:0:7}): [$AUTHOR] $PATH_"
+    echo "    Push a fix commit (or rebuttal reply) to re-trigger the bot, then retry."
+    SKIPPED_STALE=$((SKIPPED_STALE + 1))
     continue
   fi
 
@@ -210,6 +249,6 @@ if $DRY_RUN; then
   echo "(dry-run; no threads modified)"
   exit 0
 fi
-echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Failed: $FAILED_COUNT"
+echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Failed: $FAILED_COUNT"
 [ "$FAILED_COUNT" -gt 0 ] && exit 2
 exit 0

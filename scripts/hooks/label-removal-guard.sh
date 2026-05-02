@@ -59,12 +59,19 @@ fi
 # Empty command → allow (nothing to gate).
 if [ -z "$COMMAND" ]; then exit 0; fi
 
-# Cheap pre-check: if the command doesn't mention any prohibited label,
-# skip the tokenize work entirely.
-case "$COMMAND" in
-  *needs-external-review*|*needs-human-review*|*policy-violation*) ;;
-  *) exit 0 ;;
-esac
+# Cheap pre-check: if the command isn't `gh pr edit`, skip the tokenize
+# work entirely. We deliberately do NOT pre-check for the prohibited
+# label name as a substring — Codex P1 on PR #172 caught that the
+# substring gate is bypassable when the label value is supplied via
+# shell expansion (`--remove-label "$VAR"`) or ANSI-C quoting
+# (`--remove-label $'needs-human-review'`). The token-walk below sees
+# the EXPANDED value (because the harness passes the literal command
+# string the agent intends to run) — which means the post-tokenize
+# regex check is the source of truth, and any pre-check on label name
+# would either let bypasses through (bug) or false-positive on
+# unrelated commands. The `gh pr edit` form check is structural (the
+# binary name + subcommand must be literal for the command to do
+# anything), so it remains safe.
 case "$COMMAND" in
   *gh*pr*edit*|*gh*-R*pr*edit*|*gh*--repo*pr*edit*) ;;
   *) exit 0 ;;
@@ -114,21 +121,31 @@ for i in "${!TOKENS[@]}"; do
 done
 [ "$saw_edit" -eq 1 ] || exit 0
 
-# Scan tokens AFTER `edit` for --remove-label or --add-label values that
-# match the prohibited set. Both forms are blocked: removing a label
-# bypasses human gating; adding one (e.g. spuriously re-applying
-# policy-violation) is also a human action.
+# Scan tokens AFTER `edit` for --remove-label or --add-label values.
+# Both forms are blocked: removing a label bypasses human gating;
+# adding one (e.g. spuriously re-applying policy-violation) is also a
+# human action.
+#
+# Two block triggers:
+#   1. Literal value matches the prohibited set.
+#   2. Value undergoes shell expansion (contains $, backtick, or starts
+#      with $') — Codex P1 on PR #172. The hook receives the literal
+#      command string before bash expands variables, so a value like
+#      `--remove-label "$VAR"` would tokenize as the literal `$VAR`
+#      and slip past a value-only regex check, even though the bash
+#      that actually runs the command would expand it to a prohibited
+#      label. Block any expansion-bearing value with a message
+#      directing the agent to use a literal label name (so the hook
+#      can see what's being modified) or scripts/request-label-removal.sh.
 PROHIBITED_RE='^(needs-external-review|needs-human-review|policy-violation)$'
+EXPANSION_RE='[$`]'
 walk_start=$((edit_index + 1))
 SKIP_AS=""  # "" | "label-flag-value"
-for j in "${!TOKENS[@]}"; do
-  if [ "$j" -lt "$walk_start" ]; then continue; fi
-  tok="${TOKENS[$j]}"
-  if [ "$SKIP_AS" = "label-flag-value" ]; then
-    SKIP_AS=""
-    if [[ "$tok" =~ $PROHIBITED_RE ]]; then
-      cat <<EOF >&2
-BLOCKED: agents must not modify the '$tok' label on PRs.
+
+block_prohibited() {
+  local label="$1"
+  cat <<EOF >&2
+BLOCKED: agents must not modify the '$label' label on PRs.
 
 Per REVIEW_POLICY.md § Agent prohibitions, the labels:
   - needs-external-review
@@ -138,14 +155,40 @@ are HUMAN-ACTION labels. One-time chat authorization does not extend to
 agent action on these labels.
 
 If the PR is otherwise green and only this label is blocking merge:
-  scripts/request-label-removal.sh <PR#> $tok
+  scripts/request-label-removal.sh <PR#> $label
 
 That helper posts a templated ask on the PR (and optionally iMessages
 the human). The human clears the label from any device; auto-merge
 fires immediately.
 EOF
-      exit 2
-    fi
+  exit 2
+}
+
+block_expansion() {
+  local val="$1"
+  cat <<EOF >&2
+BLOCKED: --add-label / --remove-label value '$val' contains shell
+expansion (\$, backtick, or \$'…' quoting). The hook can't see what
+this expands to until bash runs the command — so it cannot verify the
+label isn't one of the prohibited set (needs-external-review,
+needs-human-review, policy-violation).
+
+Use a literal label name so the guard can verify it, OR — if you
+intended to remove a prohibited label — run:
+  scripts/request-label-removal.sh <PR#> <label>
+
+See REVIEW_POLICY.md § Agent prohibitions.
+EOF
+  exit 2
+}
+
+for j in "${!TOKENS[@]}"; do
+  if [ "$j" -lt "$walk_start" ]; then continue; fi
+  tok="${TOKENS[$j]}"
+  if [ "$SKIP_AS" = "label-flag-value" ]; then
+    SKIP_AS=""
+    if [[ "$tok" =~ $PROHIBITED_RE ]]; then block_prohibited "$tok"; fi
+    if [[ "$tok" =~ $EXPANSION_RE ]]; then block_expansion "$tok"; fi
     continue
   fi
   case "$tok" in
@@ -155,15 +198,8 @@ EOF
       ;;
     --remove-label=*|--add-label=*)
       val="${tok#*=}"
-      if [[ "$val" =~ $PROHIBITED_RE ]]; then
-        cat <<EOF >&2
-BLOCKED: agents must not modify the '$val' label on PRs.
-
-Use: scripts/request-label-removal.sh <PR#> $val
-See REVIEW_POLICY.md § Agent prohibitions.
-EOF
-        exit 2
-      fi
+      if [[ "$val" =~ $PROHIBITED_RE ]]; then block_prohibited "$val"; fi
+      if [[ "$val" =~ $EXPANSION_RE ]]; then block_expansion "$val"; fi
       continue
       ;;
   esac
