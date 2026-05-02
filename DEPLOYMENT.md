@@ -391,10 +391,11 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
 # for the byline. Just run the command.
 gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
 
-# Author-identity write: switch around the call.
+# Author-identity write: switch around the call. Substitute your
+# agent identity (claude / cursor / codex) for the switch-back.
 gh auth switch -u nathanjohnpayne && \
   gh pr merge <PR#> --squash --delete-branch && \
-  gh auth switch -u nathanpayne-claude
+  gh auth switch -u nathanpayne-<agent>
 ```
 
 - Use the item ID from the table above for your agent identity. Do not use the 1Password item title.

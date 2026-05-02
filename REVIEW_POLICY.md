@@ -51,20 +51,18 @@ need a temporary `gh auth switch -u nathanjohnpayne` around them,
 paired with a switch-back. See nathanjohnpayne/mergepath#164 for the
 empirical diagnosis (matchline PRs #181, #182).
 
-PATs are still required for read-path API calls and for the helper
-scripts (`coderabbit-wait.sh`, `codex-review-request.sh`,
-`codex-review-check.sh`) that drive the review pipeline.
-
-Note that `coderabbit-wait.sh` and `codex-review-request.sh` are
-**not** purely read-path: both can POST a retry / re-trigger comment
-on the PR (`gh api --method POST .../issues/{pr}/comments`). The PAT
-in `GH_TOKEN` authenticates the API call, but the **byline of the
-posted comment** is the keyring's active account (same as any other
-gh write-path call) — so the active-account convention applies to
-these helpers too. Set the active account once per machine
-(`gh auth switch -u nathanpayne-<agent>`) and the comments attribute
-correctly. The retry comment content (`@coderabbitai, try again.`)
-is identity-agnostic, so a wrong byline isn't load-bearing — but
+PATs are still required for the helper scripts (`coderabbit-wait.sh`,
+`codex-review-request.sh`, `codex-review-check.sh`) that drive the
+review pipeline. Of these, `codex-review-check.sh` is purely
+read-path; `coderabbit-wait.sh` and `codex-review-request.sh` BOTH
+post comments on the PR (a retry trigger and an `@codex review`
+trigger respectively, via `gh pr comment` or `gh api`). The PAT in
+`GH_TOKEN` authenticates the API call, but the **byline of the
+posted comment** is the keyring's active account — so the
+active-account convention applies to these helpers too. Set the
+active account once per machine (`gh auth switch -u nathanpayne-<agent>`)
+and the comments attribute correctly. The trigger-comment bodies are
+identity-agnostic, so a wrong byline isn't load-bearing — but
 matters for audit-trail consistency.
 
 #### PAT lookup table
@@ -563,9 +561,14 @@ Short form:
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq '.login'
 # expected: nathanpayne-claude
 
-# Helper scripts that wrap read-path API calls:
-GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/coderabbit-wait.sh <PR#>
+# Read-only helper:
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-check.sh <PR#>
+
+# Helpers that may also POST a trigger comment — GH_TOKEN authenticates
+# the API call, but the comment byline is the active keyring account.
+# Set active = nathanpayne-<agent> once per machine; then byline is correct.
+GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/coderabbit-wait.sh <PR#>
+GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-request.sh <PR#>
 
 # ── Write-path: active keyring is the byline; GH_TOKEN is ignored ──
 
