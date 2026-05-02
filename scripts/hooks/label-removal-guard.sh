@@ -40,6 +40,8 @@ set -eo pipefail
 # use that; otherwise treat stdin as the raw command.
 INPUT=$(cat)
 COMMAND=""
+TMP_CMD=$(mktemp)
+trap 'rm -f "$TMP_CMD" "${TMP_TOKENS:-}"' EXIT
 if echo "$INPUT" | python3 -c '
 import sys, json
 try:
@@ -48,9 +50,8 @@ try:
     sys.stdout.write(cmd)
 except Exception:
     sys.exit(1)
-' > /tmp/lrg-cmd.$$ 2>/dev/null; then
-  COMMAND=$(cat /tmp/lrg-cmd.$$)
-  rm -f /tmp/lrg-cmd.$$
+' > "$TMP_CMD" 2>/dev/null; then
+  COMMAND=$(cat "$TMP_CMD")
 else
   COMMAND="$INPUT"
 fi
@@ -70,7 +71,7 @@ case "$COMMAND" in
 esac
 
 TMP_TOKENS=$(mktemp)
-trap 'rm -f "$TMP_TOKENS"' EXIT
+trap 'rm -f "$TMP_CMD" "$TMP_TOKENS"' EXIT
 if ! printf '%s' "$COMMAND" | python3 -c '
 import sys, shlex
 try:

@@ -165,9 +165,13 @@ if [ "$MODE" = "list" ]; then
 fi
 
 # auto-resolve-bots mode: resolve bot threads, leave human threads alone.
+# Use process substitution (`< <(...)`) instead of `echo $UNRESOLVED | while`
+# so the loop runs in the parent shell — counter increments survive past the
+# loop and the trailing summary is accurate.
 RESOLVED_COUNT=0
 SKIPPED_HUMAN=0
-echo "$UNRESOLVED" | while IFS= read -r thread; do
+FAILED_COUNT=0
+while IFS= read -r thread; do
   AUTHOR=$(echo "$thread" | jq -r .author)
   THREAD_ID=$(echo "$thread" | jq -r .id)
   PATH_=$(echo "$thread" | jq -r .path)
@@ -197,12 +201,15 @@ echo "$UNRESOLVED" | while IFS= read -r thread; do
     RESOLVED_COUNT=$((RESOLVED_COUNT + 1))
   else
     echo "  FAILED [$AUTHOR] $PATH_ — mutation rejected" >&2
+    FAILED_COUNT=$((FAILED_COUNT + 1))
   fi
-done
+done < <(printf '%s\n' "$UNRESOLVED")
 
+echo ""
 if $DRY_RUN; then
-  echo ""
   echo "(dry-run; no threads modified)"
   exit 0
 fi
+echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Failed: $FAILED_COUNT"
+[ "$FAILED_COUNT" -gt 0 ] && exit 2
 exit 0
