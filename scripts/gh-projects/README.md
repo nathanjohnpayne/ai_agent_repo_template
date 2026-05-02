@@ -99,9 +99,11 @@ Create children in dependency order: if child C2's body references C1, create C1
 
 [Sub-issues](https://docs.github.com/en/issues/tracking-your-work-with-issues/about-sub-issues) render as a real parent-child tree in the GitHub UI and in Projects, and the parent's progress bar tracks children automatically. Task-list checkboxes in the body work but don't roll up. `lib.sh` uses the REST API:
 
-```
+```http
 POST /repos/{owner}/{repo}/issues/{parent_num}/sub_issues
-Body: {"sub_issue_id": <child_db_id>}
+Content-Type: application/json
+
+{"sub_issue_id": <child_db_id>}
 ```
 
 Note the `sub_issue_id` is the **integer database ID** of the child (from `gh api repos/.../issues/<num> --jq .id`), not the issue number. `gh api` must send it as a number with `-F`, not a string with `-f`.
