@@ -305,14 +305,26 @@ log_stale_adc_guidance() {
 # diagnosis (matchline PRs #181, #182 — wrong-byline reviews when active
 # was nathanjohnpayne instead of the agent identity).
 warn_active_account_mismatch() {
-  local expected="nathanpayne-${AGENT}"
+  # Skip silently when no agent is selected (e.g. deploy-only runs that
+  # don't need a reviewer identity). The check only makes sense when
+  # we know which agent identity SHOULD be active. Codex P2 on PR #171.
+  [[ -z "$AGENT" ]] && return 0
   command -v gh >/dev/null 2>&1 || return 0
-  local actual
-  actual=$(gh auth status 2>/dev/null | awk '
+  local expected="nathanpayne-${AGENT}"
+  local actual=""
+  # Capture in a way that cannot abort the parent script under
+  # `set -eo pipefail` if `gh auth status` fails (no login, network
+  # blip) or if the awk pipeline returns no match. Codex P1 on PR
+  # #171: bare `actual=$(... | awk ... | head -1)` propagates the
+  # failure and terminates the whole script. Wrap in a subshell with
+  # pipefail disabled and `|| true` to neutralize both failure modes.
+  actual=$( ( set +o pipefail; gh auth status 2>/dev/null | awk '
     /Active account: true/ {found=1; next}
     /account / && found { print $NF; found=0; exit }
-  ' | head -1)
-  [[ -z "$actual" ]] && actual=$(gh api user --jq .login 2>/dev/null || echo "")
+  ' | head -1 ) || true )
+  if [[ -z "$actual" ]]; then
+    actual=$(gh api user --jq .login 2>/dev/null || true)
+  fi
   if [[ -n "$actual" ]] && [[ "$actual" != "$expected" ]]; then
     echo "# WARNING: gh active account is '$actual' (expected '$expected')." >&2
     echo "#   Reviewer-identity writes (gh pr review) will mis-attribute." >&2
