@@ -26,7 +26,11 @@ explicitly authorizes a break-glass override in chat.
   label edits (`gh pr review`, `gh pr create`, `gh pr merge`,
   `gh pr edit`, `gh api -X POST repos/.../pulls/.../reviews`) use the
   keyring's **active** account regardless of `GH_TOKEN`. The byline is
-  whoever `gh auth status` shows as `Active: true` when the call lands.
+  whoever owns the active keyring entry — read it with `gh config get
+  -h github.com user`, NOT `gh auth status`. (`gh auth status` is
+  GH_TOKEN-poisonable: when GH_TOKEN is set, it reports the GH_TOKEN
+  entry as Active and the keyring entry as inactive, even though
+  writes still attribute to the keyring.)
 
 Each agent's working machine has the agent identity as the **active**
 gh account, set once per machine: `gh auth switch -u nathanpayne-claude`

@@ -52,19 +52,25 @@
 #   Format:      bash-sourceable KEY='value' lines (printf %q-escaped)
 #   TTL anchor:  OP_PREFLIGHT_CREATED_AT_EPOCH (embedded in file, not mtime)
 #
-# After eval, downstream scripts and agent commands use the exported env
-# vars for READ-path operations and helper scripts. WRITE-path operations
-# (`gh pr review`, `gh pr create`, `gh pr merge`, `gh pr edit`) use the
-# keyring's active account regardless of GH_TOKEN — see
-# CLAUDE.md § Active-account convention. Examples:
-#   # Read paths honor GH_TOKEN:
+# After eval, downstream usage splits along the gh read/write boundary
+# (see CLAUDE.md § Active-account convention):
+#
+#   # Read-path: GH_TOKEN authenticates and sets the byline.
 #   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login
+#   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-check.sh <PR#>
+#
+#   # Helpers that may also POST a trigger comment — GH_TOKEN authenticates
+#   # the API call, but the comment byline is the active keyring account.
 #   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/coderabbit-wait.sh <PR#>
-#   # Write paths use active keyring (this script warns if active != expected):
+#   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-request.sh <PR#>
+#
+#   # Write-path: active keyring is the byline; GH_TOKEN is irrelevant.
+#   # This script warns if active != expected.
 #   gh pr review <PR#> --comment --body "..."   # active = nathanpayne-<agent>
 #   gh auth switch -u nathanjohnpayne && gh pr merge <PR#> ... && \
 #     gh auth switch -u nathanpayne-<agent>     # author write
-#   # gcloud/firebase use GOOGLE_APPLICATION_CREDENTIALS automatically
+#
+#   # gcloud/firebase use GOOGLE_APPLICATION_CREDENTIALS automatically.
 
 set -eo pipefail
 umask 077  # Restrict file permissions before any mktemp/cache writes

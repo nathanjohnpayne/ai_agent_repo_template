@@ -41,7 +41,11 @@ To add a new agent, register a GitHub account following the pattern `nathanpayne
 - **Write paths** (`gh pr review`, `gh pr create`, `gh pr merge`,
   `gh pr edit`, `gh api -X POST repos/.../pulls/.../reviews`) use the
   keyring's **active** account regardless of `GH_TOKEN`. The byline is
-  whoever `gh auth status` shows as `Active: true`.
+  whoever owns the active keyring entry — read it with `gh config get
+  -h github.com user`, NOT `gh auth status` (the latter is
+  GH_TOKEN-poisonable: with GH_TOKEN set it reports the GH_TOKEN entry
+  as Active and the keyring entry as inactive, masking real
+  mismatches).
 
 Each agent's working machine has the agent identity as the **active**
 gh account, set once: `gh auth switch -u nathanpayne-<agent>`.
@@ -93,11 +97,13 @@ gh auth switch -u nathanjohnpayne && \
 ```
 
 - Use the item ID from the lookup table above for your agent identity. Do not use the 1Password item title.
-- `gh auth status` should show your **agent identity** as `Active: true`.
-  If it shows `nathanjohnpayne` instead, reviewer-identity writes will
-  attribute to nathanjohnpayne (not the reviewer). Fix once with
-  `gh auth switch -u nathanpayne-<agent>`. The `op-preflight.sh` script
-  warns when active ≠ expected.
+- Verify the keyring active account with `gh config get -h github.com user`
+  (NOT `gh auth status` — that command honors GH_TOKEN and will
+  mis-report when GH_TOKEN is set). The result should be your agent
+  identity (`nathanpayne-<agent>`). If it shows `nathanjohnpayne`
+  instead, reviewer-identity writes will attribute to nathanjohnpayne
+  (not the reviewer). Fix once with `gh auth switch -u nathanpayne-<agent>`.
+  The `op-preflight.sh` script warns when active ≠ expected.
 - If `op whoami` says you are not signed in, still run the `op read ...`
   command in an interactive TTY. That is what triggers the 1Password biometric
   prompt on local machines.
@@ -584,9 +590,11 @@ gh auth switch -u nathanjohnpayne && \
 ```
 
 - Use the item ID from the [PAT lookup table](#pat-lookup-table) for your agent identity. Do not use the 1Password item title.
-- `gh auth status` should show your **agent identity** as `Active: true`.
-  Fix once with `gh auth switch -u nathanpayne-<agent>`. The
-  `op-preflight.sh` script warns when active ≠ expected.
+- Verify the keyring active account with `gh config get -h github.com user`
+  (NOT `gh auth status` — that command honors GH_TOKEN and
+  mis-reports when GH_TOKEN is set). Fix once with
+  `gh auth switch -u nathanpayne-<agent>`. The `op-preflight.sh`
+  script warns when active ≠ expected.
 - If `op whoami` says you are not signed in, still run the `op read ...`
   command in an interactive TTY. That is what triggers the 1Password biometric
   prompt on local machines.

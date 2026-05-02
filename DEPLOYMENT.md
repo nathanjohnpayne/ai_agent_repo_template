@@ -399,9 +399,11 @@ gh auth switch -u nathanjohnpayne && \
 ```
 
 - Use the item ID from the table above for your agent identity. Do not use the 1Password item title.
-- `gh auth status` should show your **agent identity** as `Active: true`.
-  Fix once with `gh auth switch -u nathanpayne-<agent>`. The
-  `op-preflight.sh` script warns when active ≠ expected.
+- Verify the keyring active account with `gh config get -h github.com user`
+  (NOT `gh auth status` — that command honors GH_TOKEN and
+  mis-reports when GH_TOKEN is set). Fix once with
+  `gh auth switch -u nathanpayne-<agent>`. The `op-preflight.sh`
+  script warns when active ≠ expected.
 - On local interactive machines, the `op read` command itself may trigger the
   1Password biometric prompt even if `op whoami` says you are not signed in.
 - `Review Can not approve your own pull request` means you are the active
