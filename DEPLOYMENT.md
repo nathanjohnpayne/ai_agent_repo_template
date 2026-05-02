@@ -477,7 +477,7 @@ The guards (see [mergepath#77](https://github.com/nathanjohnpayne/mergepath/issu
 
 Both guards can be bypassed with `--force` for break-glass scenarios. Never use `--force` during routine deploys.
 
-Cloudflare cache purge runs when `CF_API_TOKEN` and `CF_ZONE_ID` are set in the environment (typical source: `op read 'op://...'`). Without both variables the purge step no-ops with a clear log line.
+Cloudflare cache purge runs when `CF_API_TOKEN` and `CF_ZONE_ID` are set in the environment. `CF_API_TOKEN` is sourced automatically by `scripts/op-preflight.sh --mode deploy` (or `--mode all`) from the shared "All Domains — Cache Purge API token" 1Password item — no `op read` needed in your shell. `CF_ZONE_ID` is per-repo; each downstream consumer sets its own zone ID (e.g., in the repo's bootstrap or as a hardcoded value in its `scripts/deploy.sh` wrapper) since one CF token covers all domains but each domain has its own zone. Without both variables the purge step no-ops with a clear log line.
 
 **Do not run `op-firebase-deploy` or `firebase deploy` directly for routine deploys.** They skip the branch + freshness guards and the cache purge. Direct invocation is reserved for debugging or one-off flows where the deploy surface is known.
 
