@@ -26,7 +26,7 @@
 #
 # Modes:
 #   review  — reviewer PAT + author PAT + SSH key warming
-#   deploy  — GCP ADC credential
+#   deploy  — GCP ADC credential + Cloudflare cache-purge token
 #   all     — everything (default)
 #
 # Flags:
@@ -105,6 +105,15 @@ TTL_SECONDS="${OP_PREFLIGHT_TTL_SECONDS:-$DEFAULT_TTL_SECONDS}"
 
 # ── GCP ADC ───────────────────────────────────────────────────────────
 DEFAULT_ADC_OP_URI="${GCP_ADC_OP_URI:-op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential}"
+
+# ── Cloudflare Cache Purge token (#167) ───────────────────────────────
+# Shared API token with Purge:Edit permission across all domains. Wired
+# into preflight so scripts/deploy.sh's existing CF purge step
+# (currently no-op when CF_API_TOKEN is unset) actually fires on
+# agent-driven deploys without an extra biometric prompt. CF_ZONE_ID
+# is intentionally NOT sourced here — it's per-repo and lives in each
+# downstream consumer's own bootstrap, not in this shared wiring.
+DEFAULT_CF_TOKEN_OP_URI="${CF_TOKEN_OP_URI:-op://Private/4x6wslp3f6pal5t6h3jhhe63ie/credential}"
 SSH_AUTHOR_HOST="github.com"
 
 # ── Parse arguments ───────────────────────────────────────────────────
@@ -195,6 +204,7 @@ if $DRY_RUN; then
   fi
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     echo "# Would read: GCP ADC ($DEFAULT_ADC_OP_URI)" >&2
+    echo "# Would read: Cloudflare cache-purge token ($DEFAULT_CF_TOKEN_OP_URI)" >&2
   fi
   exit 0
 fi
@@ -359,6 +369,7 @@ emit_from_session_file() (
   # stdout+exit; parent stays clean.
   unset OP_PREFLIGHT_REVIEWER_PAT OP_PREFLIGHT_AUTHOR_PAT
   unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
+  unset CF_API_TOKEN
   unset OP_PREFLIGHT_DONE OP_PREFLIGHT_AGENT OP_PREFLIGHT_MODE
   unset OP_PREFLIGHT_CREATED_AT_EPOCH OP_PREFLIGHT_TTL_SECONDS
 
@@ -423,6 +434,8 @@ emit_from_session_file() (
     printf 'export GOOGLE_APPLICATION_CREDENTIALS=%q\n' "$GOOGLE_APPLICATION_CREDENTIALS"
   [[ -n "${OP_PREFLIGHT_ADC_TMPFILE:-}" ]] && \
     printf 'export OP_PREFLIGHT_ADC_TMPFILE=%q\n' "$OP_PREFLIGHT_ADC_TMPFILE"
+  [[ -n "${CF_API_TOKEN:-}" ]] && \
+    printf 'export CF_API_TOKEN=%q\n' "$CF_API_TOKEN"
   printf 'export OP_PREFLIGHT_DONE=1\n'
   printf 'export OP_PREFLIGHT_AGENT=%q\n' "$AGENT"
   exit 0
@@ -568,6 +581,20 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     rm -f "$ADC_TMPFILE"
     echo "# Warning: could not read GCP ADC. Deploy credentials not cached." >&2
     SUMMARY+=("GCP ADC: SKIPPED (not available)")
+  fi
+
+  # Cloudflare cache-purge token (#167). Optional — if 1Password is
+  # unreachable for this item the deploy still proceeds; deploy.sh's
+  # CF purge step gracefully no-ops on empty CF_API_TOKEN.
+  echo "# Preflight: reading Cloudflare cache-purge token..." >&2
+  cf_token=$(op read "$DEFAULT_CF_TOKEN_OP_URI" 2>/dev/null || true)
+  if [[ -n "$cf_token" ]]; then
+    EXPORTS+=("export CF_API_TOKEN=$(printf '%q' "$cf_token")")
+    SESSION_LINES+=("CF_API_TOKEN=$(printf '%q' "$cf_token")")
+    SUMMARY+=("Cloudflare cache-purge token: loaded")
+  else
+    echo "# Warning: could not read Cloudflare cache-purge token. CF_API_TOKEN not exported; deploy.sh will skip the purge step." >&2
+    SUMMARY+=("Cloudflare cache-purge token: SKIPPED (not available)")
   fi
 fi
 
