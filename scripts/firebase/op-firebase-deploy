@@ -273,22 +273,47 @@ fi
 echo "[op-firebase-deploy] source credential: ${SOURCE_CRED_DESCRIPTION:-unknown}" >&2
 
 if ! source_cred_is_usable "$SOURCE_CRED_FILE"; then
+  # Distinguish a GENUINELY user-supplied GOOGLE_APPLICATION_CREDENTIALS
+  # (exit immediately — the human meant it) from a preflight-injected
+  # one (fall through to lower ranks). Codex P2 on PR #181 caught that
+  # the prior unconditional equality check exited 1 even when the env
+  # var was preflight's, masking ranks 4-5 fallbacks (shared op ADC,
+  # local ADC) that were specifically designated for this case.
   if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && "$SOURCE_CRED_FILE" == "${GOOGLE_APPLICATION_CREDENTIALS}" ]]; then
-    echo "Error: GOOGLE_APPLICATION_CREDENTIALS points to an unusable credential file: $SOURCE_CRED_FILE" >&2
-    exit 1
+    if [[ -n "${OP_PREFLIGHT_ADC_TMPFILE:-}" && "$SOURCE_CRED_FILE" == "${OP_PREFLIGHT_ADC_TMPFILE}" ]]; then
+      # Preflight-injected and unusable — log and continue down the
+      # fallback chain. Don't treat as explicit override.
+      echo "[op-firebase-deploy] preflight-injected ADC ($SOURCE_CRED_FILE) is unusable; falling through to shared op ADC + local ADC" >&2
+    else
+      echo "Error: GOOGLE_APPLICATION_CREDENTIALS points to an unusable credential file: $SOURCE_CRED_FILE" >&2
+      exit 1
+    fi
   fi
 
   cleanup_source_cred
   SOURCE_CRED_FILE=""
   SOURCE_CRED_TMPFILE=""
 
-  if [[ -f "$DEFAULT_ADC_FILE" ]]; then
+  # Rank 4 fallback: shared op ADC (in case the preflight tempfile is
+  # stale but a fresh op read of the same item works).
+  resolved="$(materialize_op_source_cred "$DEFAULT_ADC_OP_URI" || true)"
+  if [[ -n "$resolved" ]]; then
+    SOURCE_CRED_FILE="$resolved"
+    SOURCE_CRED_TMPFILE="$resolved"
+    SOURCE_CRED_DESCRIPTION="shared 1Password ADC ($DEFAULT_ADC_OP_URI; rank 4 fallback after rank-3 unusable)"
+    echo "[op-firebase-deploy] source credential: $SOURCE_CRED_DESCRIPTION" >&2
+  fi
+
+  # Rank 5 fallback: local ADC file on disk.
+  if ! source_cred_is_usable "$SOURCE_CRED_FILE" && [[ -f "$DEFAULT_ADC_FILE" ]]; then
     SOURCE_CRED_FILE="$DEFAULT_ADC_FILE"
+    SOURCE_CRED_DESCRIPTION="local ADC file ($DEFAULT_ADC_FILE; rank 5 fallback)"
+    echo "[op-firebase-deploy] source credential: $SOURCE_CRED_DESCRIPTION" >&2
   fi
 
   if ! source_cred_is_usable "$SOURCE_CRED_FILE"; then
     echo "Error: No usable GCP source credential found." >&2
-    echo "Refresh the shared 1Password GCP ADC item or provide a working GOOGLE_APPLICATION_CREDENTIALS file." >&2
+    echo "Provision the project Firebase-vault SA key (preferred — see DEPLOYMENT.md § Secrets Management), refresh the shared 1Password GCP ADC item, or provide a working GOOGLE_APPLICATION_CREDENTIALS file." >&2
     exit 1
   fi
 fi
