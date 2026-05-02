@@ -267,10 +267,12 @@ if ! resolve_source_cred_file; then
   exit 1
 fi
 
-# Log which credential source was selected (#137 + #154 — debugging
-# deploy auth was previously opaque). Goes to stderr so deploy
-# stdout/stderr stays clean for log-grepping by the caller.
-echo "[op-firebase-deploy] source credential: ${SOURCE_CRED_DESCRIPTION:-unknown}" >&2
+# Note: the source-credential log line fires AFTER the usability check
+# below settles, so a credential that gets rejected and falls through
+# to ranks 4/5 doesn't get its name in the log. CodeRabbit r1 on
+# PR #181 caught the prior position of this log (right after
+# resolve_source_cred_file) being misleading when the initial
+# candidate failed the usability check.
 
 if ! source_cred_is_usable "$SOURCE_CRED_FILE"; then
   # Distinguish a GENUINELY user-supplied GOOGLE_APPLICATION_CREDENTIALS
@@ -301,14 +303,12 @@ if ! source_cred_is_usable "$SOURCE_CRED_FILE"; then
     SOURCE_CRED_FILE="$resolved"
     SOURCE_CRED_TMPFILE="$resolved"
     SOURCE_CRED_DESCRIPTION="shared 1Password ADC ($DEFAULT_ADC_OP_URI; rank 4 fallback after rank-3 unusable)"
-    echo "[op-firebase-deploy] source credential: $SOURCE_CRED_DESCRIPTION" >&2
   fi
 
   # Rank 5 fallback: local ADC file on disk.
   if ! source_cred_is_usable "$SOURCE_CRED_FILE" && [[ -f "$DEFAULT_ADC_FILE" ]]; then
     SOURCE_CRED_FILE="$DEFAULT_ADC_FILE"
     SOURCE_CRED_DESCRIPTION="local ADC file ($DEFAULT_ADC_FILE; rank 5 fallback)"
-    echo "[op-firebase-deploy] source credential: $SOURCE_CRED_DESCRIPTION" >&2
   fi
 
   if ! source_cred_is_usable "$SOURCE_CRED_FILE"; then
@@ -317,6 +317,12 @@ if ! source_cred_is_usable "$SOURCE_CRED_FILE"; then
     exit 1
   fi
 fi
+
+# Source-credential log AFTER the usability check + any fallback walk
+# settles. This guarantees the logged name matches the credential the
+# subsequent firebase deploy actually uses, not a candidate that got
+# rejected mid-flow.
+echo "[op-firebase-deploy] source credential: ${SOURCE_CRED_DESCRIPTION:-unknown}" >&2
 
 python3 - <<'PY' "$SOURCE_CRED_FILE" "$ADC_TMPFILE" "$SA_EMAIL" "$PROJECT"
 import json

@@ -620,9 +620,44 @@ Each project's SA key is stored in the 1Password **Firebase** vault with the nam
 ## Secrets Management
 
 - No API keys or secrets should be committed to the repository.
-- **Deploy auth uses the project Firebase-vault SA key as the default credential** (#154 — codified after recurring `firebase login --reauth` friction from #137 traced to RAPT/refresh-token expiry on the shared 1Password ADC). The SA key lives in the 1Password Firebase vault — it's not stored on disk except as a tempfile during a single deploy invocation, and never committed to a repo. Impersonated credentials remain available for cases where the SA key isn't provisioned, but the policy default is to provision the key per-project per § First-Time Setup.
+- **Deploy auth uses the project Firebase-vault SA key as the default credential** (#154 — codified after recurring `firebase login --reauth` friction from #137 traced to RAPT/refresh-token expiry on the shared 1Password ADC). The SA key lives in the 1Password Firebase vault — it's not stored on disk except as a tempfile during a single deploy invocation, and never committed to a repo. Impersonated credentials remain available for cases where the SA key isn't provisioned, but the policy default is to provision the key per-project per § Provisioning the Firebase-vault SA key below.
 - Runtime secrets can still use `op://Private/<item>/<field>` references in committed template files and `op inject` into gitignored runtime files when a repo actually needs 1Password-managed application secrets.
 - Never commit resolved secret output, service-account JSON, or ADC credentials.
+
+### Provisioning the Firebase-vault SA key
+
+Run once per Firebase project, after `op-firebase-setup` has created the `firebase-deployer` service account:
+
+```bash
+PROJECT_ID="{project-id}"
+SA_EMAIL="firebase-deployer@${PROJECT_ID}.iam.gserviceaccount.com"
+KEY_PATH="$(mktemp -t firebase-sa-key.json)"
+
+# 1. Generate a JSON key for the deployer SA. Requires the
+#    iam.serviceAccountKeyAdmin role (or roles/owner) on the project.
+gcloud iam service-accounts keys create "$KEY_PATH" \
+  --iam-account="$SA_EMAIL" \
+  --project="$PROJECT_ID"
+
+# 2. Upload to the 1Password Firebase vault as a document with the
+#    canonical title "{project-id} — Firebase Deployer SA Key" (this
+#    is the exact title materialize_firebase_vault_sa_key reads in
+#    op-firebase-deploy).
+op document create "$KEY_PATH" \
+  --vault Firebase \
+  --title "${PROJECT_ID} — Firebase Deployer SA Key"
+
+# 3. Wipe the local copy. The key now lives only in 1Password +
+#    on-disk tempfiles created/destroyed during single deploy runs.
+rm -f "$KEY_PATH"
+
+# 4. Verify: a routine deploy should now log
+#    "[op-firebase-deploy] source credential: project Firebase-vault
+#    SA key (...)" and run without prompting for firebase login --reauth.
+op-firebase-deploy --only hosting   # or whatever target
+```
+
+Rotation (e.g., key compromised, GCP-side key expiry, agent identity change): repeat steps 1–4 with `--key-file-type=json` on `gcloud iam service-accounts keys create`. Old key on the SA can be deleted via `gcloud iam service-accounts keys delete <key-id>` after the new one is verified.
 
 ## Auth Maintenance
 
