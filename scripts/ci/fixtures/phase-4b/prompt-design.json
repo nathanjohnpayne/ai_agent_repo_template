@@ -1,0 +1,9 @@
+{
+  "body": "Adds an `experience-extraction.v3.md` system prompt + extends the few-shot examples for industry-tag normalization.",
+  "files": [
+    {
+      "filename": "src/prompts/experience-extraction.v3.md",
+      "patch": "@@ -0,0 +1,40 @@\n+# Experience Extraction Prompt v3\n+\n+You normalize free-text resume bullets into structured experience records.\n+\n+## Few-shot examples\n+\n+Input: \"Led a 5-person team in launching a new product, AND owned the GTM motion.\"\n+Output: { team_size: 5, scope: [\"product launch\", \"GTM\"] }"
+    }
+  ]
+}

@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Unit-level coverage for scripts/phase-4b-classifier.sh.
+#
+# Runs the classifier against six fixture PRs (one per trigger class
+# plus a no-trigger negative case) and asserts the output triggers
+# array. Fixture inputs live in scripts/ci/fixtures/phase-4b/.
+#
+# Each fixture is a JSON object: {body: string, files: [{filename,
+# patch}, ...]}. The classifier's --fixture flag reads this shape
+# directly (mirroring gh's pulls/{pr}/files response with an optional
+# body field for triggers that scan PR text).
+#
+# Runs from the repo root. Invoked by .github/workflows/repo_lint.yml
+# (alongside the other scripts/ci/check_* scripts).
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+CLASSIFIER="scripts/phase-4b-classifier.sh"
+FIXTURES_DIR="scripts/ci/fixtures/phase-4b"
+
+for f in "$CLASSIFIER" "$FIXTURES_DIR"; do
+  if [ ! -e "$f" ]; then
+    echo "check_phase_4b_classifier: missing required path: $f" >&2
+    exit 1
+  fi
+done
+
+pass=0
+fail=0
+
+# Run the classifier against a fixture and compare the triggers array
+# (sorted, comma-joined) to the expected list. The classifier reads
+# phase_4b_default from cwd's .github/review-policy.yml — to keep
+# fixture tests self-contained (and not depend on whatever the live
+# policy is on the branch where the test runs), set up a per-call
+# scratch dir with phase_4b_default: complex-changes and cd into it.
+SCRATCH_TRIGGERS=$(mktemp -d)
+mkdir -p "$SCRATCH_TRIGGERS/.github"
+echo "phase_4b_default: complex-changes" > "$SCRATCH_TRIGGERS/.github/review-policy.yml"
+
+assert_triggers() {
+  local desc="$1" fixture="$2" expected="$3" expected_exit="$4"
+  local out actual_triggers actual_exit
+
+  set +e
+  out=$(cd "$SCRATCH_TRIGGERS" && bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/$fixture" 2>/dev/null)
+  actual_exit=$?
+  set -e
+
+  actual_triggers=$(echo "$out" | jq -r '.triggers | sort | join(",")')
+
+  if [ "$expected" = "$actual_triggers" ] && [ "$expected_exit" = "$actual_exit" ]; then
+    pass=$((pass + 1))
+    echo "  PASS: $desc"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: $desc" >&2
+    echo "    fixture:        $fixture" >&2
+    echo "    expected (e=$expected_exit): $expected" >&2
+    echo "    actual   (e=$actual_exit): $actual_triggers" >&2
+    echo "    full output:" >&2
+    echo "$out" | sed 's/^/      /' >&2
+  fi
+}
+
+echo "phase-4b-classifier.sh fixture tests"
+
+assert_triggers "state-machine fixture matches state-machine-change" \
+  "state-machine.json" "state-machine-change" "1"
+
+assert_triggers "concurrency fixture matches concurrency (paths + keywords)" \
+  "concurrency.json" "concurrency" "1"
+
+assert_triggers "prompt-design fixture matches prompt-design (path glob)" \
+  "prompt-design.json" "prompt-design" "1"
+
+# Cross-cutting fixture spans 4 distinct top-level dirs (src, src+, tests)
+# AND has both types/ + services/ — either heuristic alone matches.
+assert_triggers "cross-cutting fixture matches cross-cutting-refactor" \
+  "cross-cutting.json" "cross-cutting-refactor" "1"
+
+assert_triggers "invariant fixture matches invariant-enforcement (path + body)" \
+  "invariant.json" "invariant-enforcement" "1"
+
+assert_triggers "no-trigger fixture (README + LICENSE only) matches nothing" \
+  "no-trigger.json" "" "0"
+
+echo
+echo "phase-4b-classifier.sh policy short-circuit tests"
+
+# fallback-only short-circuit: the test harness uses a temp config to
+# avoid mutating the real .github/review-policy.yml. We swap the
+# config in via a temp dir + cd, since the script reads CONFIG=
+# "$.github/review-policy.yml" relative to cwd.
+SCRATCH=$(mktemp -d)
+trap 'rm -rf "$SCRATCH" "$SCRATCH_TRIGGERS"' EXIT
+mkdir -p "$SCRATCH/.github"
+
+# fallback-only short-circuits without inspecting any diff.
+echo "phase_4b_default: fallback-only" > "$SCRATCH/.github/review-policy.yml"
+set +e
+out=$(cd "$SCRATCH" && bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/state-machine.json" 2>/dev/null)
+rc=$?
+set -e
+got_rec=$(echo "$out" | jq -r .recommendation)
+got_files=$(echo "$out" | jq -r .files_inspected)
+if [ "$rc" = "0" ] && [ "$got_rec" = "fallback-only" ] && [ "$got_files" = "0" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: fallback-only short-circuits to recommendation=fallback-only, exit 0, no files inspected"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: fallback-only short-circuit (rc=$rc, rec=$got_rec, files=$got_files)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# always short-circuits to invoke-4b regardless of fixture content.
+echo "phase_4b_default: always" > "$SCRATCH/.github/review-policy.yml"
+set +e
+out=$(cd "$SCRATCH" && bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/no-trigger.json" 2>/dev/null)
+rc=$?
+set -e
+got_rec=$(echo "$out" | jq -r .recommendation)
+if [ "$rc" = "1" ] && [ "$got_rec" = "invoke-4b" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: always short-circuits to recommendation=invoke-4b, exit 1 (even with no-trigger fixture)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: always short-circuit (rc=$rc, rec=$got_rec)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# Unknown phase_4b_default value rejected with exit 2.
+echo "phase_4b_default: bogus-mode" > "$SCRATCH/.github/review-policy.yml"
+set +e
+err=$(cd "$SCRATCH" && bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/no-trigger.json" 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" = "2" ] && echo "$err" | grep -q "phase_4b_default must be one of"; then
+  pass=$((pass + 1))
+  echo "  PASS: unknown phase_4b_default value rejected with exit 2 + clear error"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: unknown phase_4b_default rejection (rc=$rc, stderr: $err)" >&2
+fi
+
+echo
+echo "phase-4b-classifier.sh argument-validation tests"
+
+# Bad PR# (non-integer) → exit 3
+set +e
+err=$(bash "$CLASSIFIER" "abc" 2>&1 >/dev/null); rc=$?
+set -e
+if [ "$rc" = "3" ] && echo "$err" | grep -q "PR# must be a positive integer"; then
+  pass=$((pass + 1))
+  echo "  PASS: non-integer PR# rejected with exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: non-integer PR# rejection (rc=$rc): $err" >&2
+fi
+
+# Bad --repo → exit 3
+set +e
+err=$(bash "$CLASSIFIER" 99999 --repo "not-valid" 2>&1 >/dev/null); rc=$?
+set -e
+if [ "$rc" = "3" ] && echo "$err" | grep -q "invalid --repo value"; then
+  pass=$((pass + 1))
+  echo "  PASS: invalid --repo value rejected with exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: invalid --repo rejection (rc=$rc): $err" >&2
+fi
+
+# Missing --fixture file → exit 3
+set +e
+err=$(bash "$CLASSIFIER" 99999 --fixture /nonexistent/path 2>&1 >/dev/null); rc=$?
+set -e
+if [ "$rc" = "3" ] && echo "$err" | grep -q "fixture file not readable"; then
+  pass=$((pass + 1))
+  echo "  PASS: missing --fixture file rejected with exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: missing fixture rejection (rc=$rc): $err" >&2
+fi
+
+echo
+if [ "$fail" -gt 0 ]; then
+  echo "check_phase_4b_classifier: $fail FAIL / $pass PASS" >&2
+  exit 1
+fi
+echo "check_phase_4b_classifier: PASS ($pass tests)"

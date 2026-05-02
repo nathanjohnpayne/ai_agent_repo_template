@@ -1,0 +1,9 @@
+{
+  "body": "Tightens the owner_uid invariant check on application updates: now also verified inside the transaction body, not just the upfront ownership check.",
+  "files": [
+    {
+      "filename": "src/validation/owner-uid.ts",
+      "patch": "@@ -5,3 +5,8 @@\n+export function assertOwnerUid(snap: DocumentSnapshot, expected: string) {\n+  const actual = snap.data()?.owner_uid;\n+  if (actual !== expected) throw new OwnerMismatchError({ expected, actual });\n+}"
+    }
+  ]
+}
