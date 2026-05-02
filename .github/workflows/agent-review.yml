@@ -92,6 +92,7 @@ jobs:
     needs: [load-config]
     if: >
       github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
       (github.event.action == 'opened' || github.event.action == 'ready_for_review')
     runs-on: ubuntu-latest
     outputs:
@@ -168,6 +169,7 @@ jobs:
     if: >
       always() &&
       github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
       (github.event.action == 'opened' || github.event.action == 'ready_for_review' || github.event.action == 'labeled')
     runs-on: ubuntu-latest
     steps:

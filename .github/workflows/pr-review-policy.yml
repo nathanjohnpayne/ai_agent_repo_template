@@ -11,7 +11,7 @@ permissions:
 jobs:
   self-review-check:
     name: Self-Review Required
-    if: github.actor != 'dependabot[bot]'
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Check for Self-Review section
