@@ -27,8 +27,50 @@ jobs:
           steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
           steps.metadata.outputs.update-type == 'version-update:semver-minor'
         run: |
+          set -euo pipefail
+
+          # Verify GH_TOKEN is set and resolves to a reviewer identity.
+          # The 2026-04-27 weekly PR audit caught 17 of 21 violations
+          # across 6 repos where Dependabot PRs merged without a
+          # reviewer-identity approval recorded — root cause was either
+          # an empty REVIEWER_ASSIGNMENT_TOKEN secret (the approve call
+          # silently no-op'd while the merge proceeded) or the token
+          # resolving to nathanjohnpayne, which GitHub rejects with
+          # "can't approve own pull request". Both modes left the PR
+          # merged with no approval audit trail.
+          # Closes nathanjohnpayne/mergepath#160 from the template side.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::GH_TOKEN is empty. REVIEWER_ASSIGNMENT_TOKEN secret is not set in this repo."
+            echo "::error::Add a reviewer-identity PAT to repo Settings → Secrets and variables → Actions → REVIEWER_ASSIGNMENT_TOKEN."
+            exit 1
+          fi
+
+          ACTING_AS=$(gh api user --jq .login 2>/dev/null || true)
+          if [ -z "$ACTING_AS" ]; then
+            echo "::error::gh api user returned empty — REVIEWER_ASSIGNMENT_TOKEN may be invalid, expired, or lacks the user scope."
+            exit 1
+          fi
+          echo "::notice::Approving $PR_URL as $ACTING_AS"
+
+          if [ "$ACTING_AS" = "nathanjohnpayne" ]; then
+            echo "::error::REVIEWER_ASSIGNMENT_TOKEN resolves to nathanjohnpayne (the author identity)."
+            echo "::error::GitHub blocks self-approval, so the approve call would silently fail and the merge would proceed without an approval recorded."
+            echo "::error::Replace the secret with a reviewer-identity PAT (nathanpayne-claude / -cursor / -codex)."
+            exit 1
+          fi
+
+          # Approve. set -e ensures we abort on failure rather than
+          # continuing to the merge step with no approval on record.
           gh pr review --approve "$PR_URL"
-          gh pr merge --squash --auto "$PR_URL" || gh pr merge --squash "$PR_URL" || true
+
+          # Try GitHub-side auto-merge first (fires when required
+          # checks pass). Falls back to immediate squash if --auto is
+          # rejected (typically: no branch protection on main, so
+          # GitHub doesn't accept --auto). Either path is fine — both
+          # land the merge — but the trailing `|| true` is gone: a
+          # hard failure here means the PR didn't merge, which the
+          # audit needs to see rather than silently succeeding.
+          gh pr merge --squash --auto "$PR_URL" || gh pr merge --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
