@@ -72,7 +72,16 @@ BOT_LOGINS_RE='^(coderabbitai\[bot\]|chatgpt-codex-connector\[bot\]|dependabot\[
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo) REPO="$2"; shift 2 ;;
+    --repo)
+      # Codex r2 on PR #172: bare `shift 2` silently consumed nothing
+      # when --repo was the last arg, leaving REPO empty and falling
+      # through to gh-repo-view auto-detect. Validate the value is
+      # present and non-empty so the user gets a clear error instead.
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "Error: --repo requires a non-empty value (owner/name)" >&2
+        usage
+      fi
+      REPO="$2"; shift 2 ;;
     --list) MODE="list"; shift ;;
     --auto-resolve-bots) MODE="auto-resolve-bots"; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
@@ -212,6 +221,7 @@ fi
 RESOLVED_COUNT=0
 SKIPPED_HUMAN=0
 SKIPPED_STALE=0
+WOULD_RESOLVE_COUNT=0
 FAILED_COUNT=0
 while IFS= read -r thread; do
   AUTHOR=$(echo "$thread" | jq -r .author)
@@ -254,6 +264,7 @@ while IFS= read -r thread; do
   if $DRY_RUN; then
     echo "  WOULD RESOLVE [$AUTHOR] $PATH_"
     echo "    $EXCERPT"
+    WOULD_RESOLVE_COUNT=$((WOULD_RESOLVE_COUNT + 1))
     continue
   fi
 
@@ -274,10 +285,18 @@ done < <(printf '%s\n' "$UNRESOLVED")
 
 echo ""
 if $DRY_RUN; then
-  echo "(dry-run; no threads modified)"
-  # Even in dry-run, surface that the PR is still blocked: callers can
-  # use exit code to gate auto-merge.
-  if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ]; then exit 3; fi
+  echo "(dry-run; no threads modified) — would-resolve: $WOULD_RESOLVE_COUNT, skipped (human): $SKIPPED_HUMAN, skipped (stale-HEAD): $SKIPPED_STALE"
+  # Codex r2 on PR #172: dry-run previously exited 0 when only
+  # current-HEAD bot threads remained (because dry-run does not mutate
+  # them and they didn't increment SKIPPED_*). Callers would treat
+  # the PR as "all clear" and proceed to merge into a still-BLOCKED PR.
+  # Fix: dry-run exits 3 if ANY actionable items remain (would-resolve,
+  # human-skipped, or stale-skipped). The only exit-0 path through
+  # auto-resolve-bots --dry-run is "no unresolved threads at all"
+  # which is already short-circuited above (UNRESOLVED is empty).
+  if [ "$WOULD_RESOLVE_COUNT" -gt 0 ] || [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ]; then
+    exit 3
+  fi
   exit 0
 fi
 echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Failed: $FAILED_COUNT"
