@@ -50,7 +50,23 @@ assert_triggers() {
   actual_exit=$?
   set -e
 
-  actual_triggers=$(echo "$out" | jq -r '.triggers | sort | join(",")')
+  # Guard the jq parse so a malformed classifier output (which would
+  # be a bug we want to SEE in test output, not a script-aborting
+  # surprise) is reported as an assertion failure with the raw output
+  # printed. CodeRabbit Major on PR #190.
+  set +e
+  actual_triggers=$(echo "$out" | jq -r '.triggers | sort | join(",")' 2>/dev/null)
+  jq_rc=$?
+  set -e
+  if [ "$jq_rc" -ne 0 ]; then
+    fail=$((fail + 1))
+    echo "  FAIL: $desc" >&2
+    echo "    fixture:        $fixture" >&2
+    echo "    classifier output is not valid JSON or .triggers is missing" >&2
+    echo "    full output:" >&2
+    echo "$out" | sed 's/^/      /' >&2
+    return
+  fi
 
   if [ "$expected" = "$actual_triggers" ] && [ "$expected_exit" = "$actual_exit" ]; then
     pass=$((pass + 1))
@@ -88,6 +104,13 @@ assert_triggers "invariant fixture matches invariant-enforcement (path + body)" 
 assert_triggers "no-trigger fixture (README + LICENSE only) matches nothing" \
   "no-trigger.json" "" "0"
 
+# Regression: 3 root files (README + LICENSE + CONTRIBUTING) must NOT
+# trigger cross-cutting-refactor. Codex P2 + CR Minor on PR #190 caught
+# the prior `awk -F/ '{print $1}'` over-counting each root filename as
+# a distinct top-level dir, spuriously triggering 4b on docs-only PRs.
+assert_triggers "3 root-only files do not trigger cross-cutting-refactor (regression)" \
+  "root-files-only.json" "" "0"
+
 echo
 echo "phase-4b-classifier.sh policy short-circuit tests"
 
@@ -99,20 +122,31 @@ SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH" "$SCRATCH_TRIGGERS"' EXIT
 mkdir -p "$SCRATCH/.github"
 
+# Helper: extract a single jq field from $out without aborting under
+# `set -e` on a parse error. Sets `got_VAL` and `got_rc`. CodeRabbit
+# Major on PR #190 — jq parse failures shouldn't terminate the harness.
+jq_get() {
+  local field=$1
+  set +e
+  got_VAL=$(echo "$out" | jq -r ".$field" 2>/dev/null)
+  got_rc=$?
+  set -e
+}
+
 # fallback-only short-circuits without inspecting any diff.
 echo "phase_4b_default: fallback-only" > "$SCRATCH/.github/review-policy.yml"
 set +e
 out=$(cd "$SCRATCH" && bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/state-machine.json" 2>/dev/null)
 rc=$?
 set -e
-got_rec=$(echo "$out" | jq -r .recommendation)
-got_files=$(echo "$out" | jq -r .files_inspected)
-if [ "$rc" = "0" ] && [ "$got_rec" = "fallback-only" ] && [ "$got_files" = "0" ]; then
+jq_get recommendation; got_rec=$got_VAL; rec_rc=$got_rc
+jq_get files_inspected; got_files=$got_VAL; files_rc=$got_rc
+if [ "$rec_rc" = 0 ] && [ "$files_rc" = 0 ] && [ "$rc" = "0" ] && [ "$got_rec" = "fallback-only" ] && [ "$got_files" = "0" ]; then
   pass=$((pass + 1))
   echo "  PASS: fallback-only short-circuits to recommendation=fallback-only, exit 0, no files inspected"
 else
   fail=$((fail + 1))
-  echo "  FAIL: fallback-only short-circuit (rc=$rc, rec=$got_rec, files=$got_files)" >&2
+  echo "  FAIL: fallback-only short-circuit (rc=$rc, rec=$got_rec [jq_rc=$rec_rc], files=$got_files [jq_rc=$files_rc])" >&2
   echo "$out" | sed 's/^/      /' >&2
 fi
 
@@ -122,13 +156,13 @@ set +e
 out=$(cd "$SCRATCH" && bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/no-trigger.json" 2>/dev/null)
 rc=$?
 set -e
-got_rec=$(echo "$out" | jq -r .recommendation)
-if [ "$rc" = "1" ] && [ "$got_rec" = "invoke-4b" ]; then
+jq_get recommendation; got_rec=$got_VAL; rec_rc=$got_rc
+if [ "$rec_rc" = 0 ] && [ "$rc" = "1" ] && [ "$got_rec" = "invoke-4b" ]; then
   pass=$((pass + 1))
   echo "  PASS: always short-circuits to recommendation=invoke-4b, exit 1 (even with no-trigger fixture)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: always short-circuit (rc=$rc, rec=$got_rec)" >&2
+  echo "  FAIL: always short-circuit (rc=$rc, rec=$got_rec [jq_rc=$rec_rc])" >&2
   echo "$out" | sed 's/^/      /' >&2
 fi
 

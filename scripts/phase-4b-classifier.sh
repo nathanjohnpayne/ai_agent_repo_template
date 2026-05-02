@@ -160,14 +160,30 @@ fi
 
 if [ -n "$FIXTURE" ]; then
   FILES_JSON=$(cat "$FIXTURE")
+  # Validate JSON shape up-front — jq's native exit codes (e.g., 4 on
+  # parse error, 5 on schema mismatch) would otherwise propagate
+  # through `set -e` and break the script's documented 0/1/2/3 exit
+  # contract. CodeRabbit Major on PR #190.
+  if ! echo "$FILES_JSON" | jq -e . >/dev/null 2>&1; then
+    echo "Error: fixture is not valid JSON: $FIXTURE" >&2
+    exit 2
+  fi
   PR_BODY=""
   # Fixtures may include an optional body field via .body — extract it
   # if present, otherwise empty. The fixture file's top-level shape is
   # either a bare files array (legacy/simple) or a {body, files} object
   # (when body-text triggers need to be exercised).
   if echo "$FILES_JSON" | jq -e 'type == "object" and has("files")' >/dev/null 2>&1; then
-    PR_BODY=$(echo "$FILES_JSON" | jq -r '.body // ""')
-    FILES_JSON=$(echo "$FILES_JSON" | jq '.files')
+    PR_BODY=$(echo "$FILES_JSON" | jq -r '.body // ""' 2>/dev/null) || {
+      echo "Error: failed to read .body from fixture object" >&2; exit 2
+    }
+    FILES_JSON=$(echo "$FILES_JSON" | jq '.files' 2>/dev/null) || {
+      echo "Error: failed to read .files from fixture object" >&2; exit 2
+    }
+  fi
+  if ! echo "$FILES_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    echo "Error: fixture changed-files payload must be an array (got non-array after .files extraction)" >&2
+    exit 2
   fi
 else
   if [ -z "${GH_TOKEN:-}" ]; then
@@ -177,12 +193,17 @@ else
   FILES_JSON=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/files" 2>&1) || {
     echo "Error: failed to fetch PR files: $FILES_JSON" >&2; exit 2
   }
-  # gh --paginate emits a stream of arrays; flatten into one.
-  FILES_JSON=$(echo "$FILES_JSON" | jq -s 'add // []')
+  # gh --paginate emits a stream of arrays; flatten into one. Normalize
+  # any jq failure here to exit 2 per the contract.
+  FILES_JSON=$(echo "$FILES_JSON" | jq -s 'add // []' 2>/dev/null) || {
+    echo "Error: failed to flatten gh pulls/files paginated response" >&2; exit 2
+  }
   PR_BODY=$(gh api "repos/$REPO/pulls/$PR_NUM" --jq '.body // ""' 2>/dev/null || echo "")
 fi
 
-FILES_COUNT=$(echo "$FILES_JSON" | jq 'length')
+FILES_COUNT=$(echo "$FILES_JSON" | jq 'length' 2>/dev/null) || {
+  echo "Error: failed to compute files count (malformed FILES_JSON)" >&2; exit 2
+}
 if [ "$FILES_COUNT" -eq 0 ]; then
   emit_json false '[]' "fallback-only" "no files in PR diff" 0
   exit 0
@@ -246,7 +267,13 @@ detect_cross_cutting_refactor() {
   # If ≥3 distinct dirs OR diff includes BOTH src/types/ AND src/services/
   # (or analogous layer pair), match.
   local distinct_top_dirs has_types has_services
-  distinct_top_dirs=$(echo "$FILE_PATHS" | awk -F/ '{print $1}' | sort -u | wc -l | tr -d ' ')
+  # Count distinct top-level DIRECTORIES, not filenames. A path with no
+  # `/` is a root-level file; collapse all such files to a single
+  # sentinel ("<root>") so a docs-only PR touching N root files counts
+  # as 1 distinct entry, not N. Codex P2 + CR Minor on PR #190 caught
+  # the prior `awk -F/ '{print $1}'` over-counting root files as dirs,
+  # which spuriously triggered cross-cutting on docs-only PRs.
+  distinct_top_dirs=$(echo "$FILE_PATHS" | awk -F/ 'NF>1 {print $1; next} {print "<root>"}' | sort -u | wc -l | tr -d ' ')
   has_types=$(echo "$FILE_PATHS" | grep -cE '(^|/)types/' || true)
   has_services=$(echo "$FILE_PATHS" | grep -cE '(^|/)services/' || true)
   if [ "$distinct_top_dirs" -ge 3 ]; then
