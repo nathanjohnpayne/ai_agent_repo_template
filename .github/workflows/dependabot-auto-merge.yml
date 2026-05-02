@@ -59,6 +59,39 @@ jobs:
             exit 1
           fi
 
+          # Validate ACTING_AS against available_reviewers in
+          # .github/review-policy.yml. Codex r1 (Phase 4b) on PR #179:
+          # without this check, any non-author write-collaborator
+          # token (e.g., a contractor's PAT, github-actions[bot]) could
+          # approve+merge and the workflow would exit 0 — but the next
+          # weekly audit would still flag the PR as "not approved by a
+          # known reviewer identity," same audit trail problem #160 set
+          # out to fix.
+          POLICY=".github/review-policy.yml"
+          if [ ! -f "$POLICY" ]; then
+            echo "::error::$POLICY not found — cannot validate $ACTING_AS against available_reviewers."
+            exit 1
+          fi
+          # Same awk extractor used by scripts/codex-review-check.sh
+          # (in-block list parser; sed strips list-marker + optional
+          # quotes). Outputs one reviewer login per line.
+          ALLOWED=$(awk '
+            /^available_reviewers:/ {in_block=1; next}
+            in_block && /^[^[:space:]#]/ {in_block=0}
+            in_block && /^ *-/ {print}
+          ' "$POLICY" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')
+          if [ -z "$ALLOWED" ]; then
+            echo "::error::$POLICY has no available_reviewers list. Add reviewer identities under available_reviewers: before this workflow can approve."
+            exit 1
+          fi
+          if ! printf '%s\n' "$ALLOWED" | grep -Fxq "$ACTING_AS"; then
+            echo "::error::REVIEWER_ASSIGNMENT_TOKEN resolves to '$ACTING_AS', which is NOT in $POLICY available_reviewers:"
+            printf '%s\n' "$ALLOWED" | sed 's/^/::error::  - /'
+            echo "::error::Even if this identity has write access to the repo, an approval from it would fail the next weekly audit ('approval not from a recognized reviewer identity')."
+            echo "::error::Replace the secret with a PAT for one of the listed reviewers."
+            exit 1
+          fi
+
           # Approve. set -e ensures we abort on failure rather than
           # continuing to the merge step with no approval on record.
           gh pr review --approve "$PR_URL"
