@@ -110,8 +110,22 @@ if ! [[ "$PR_NUM" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+# Resolve the read PAT once + define the wrapper before any `gh`
+# call. CR Major on PR #194 r4 caught that the bare `gh repo view`
+# and `gh api` invocations below this point would still hit the
+# empty-GH_TOKEN keyring-fallback trap. Centralizing the wrapper
+# above all read-path gh calls fixes it.
+READ_GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}"
+gh_read() {
+  if [ -n "$READ_GH_TOKEN" ]; then
+    GH_TOKEN="$READ_GH_TOKEN" gh "$@"
+  else
+    gh "$@"
+  fi
+}
+
 if [ -z "$REPO" ]; then
-  REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
+  REPO=$(gh_read repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
     echo "Could not resolve repo. Pass --repo owner/name." >&2
     exit 2
   }
@@ -134,7 +148,7 @@ NAME="${REPO#*/}"
 # to verify each thread's latest comment is on the current HEAD before
 # resolving. Codex P2 on PR #172 caught that the docstring promised
 # this check but the code didn't enforce it.
-HEAD_OID=$(gh api "repos/$OWNER/$NAME/pulls/$PR_NUM" --jq .head.sha 2>/dev/null) || {
+HEAD_OID=$(gh_read api "repos/$OWNER/$NAME/pulls/$PR_NUM" --jq .head.sha 2>/dev/null) || {
   echo "Could not resolve PR HEAD oid for $REPO#$PR_NUM" >&2
   exit 2
 }
@@ -219,20 +233,6 @@ QUERY='
     }
   }
 '
-# Resolve the read PAT once. CR Major on PR #194 r3 caught that
-# `GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" gh ...`
-# sets GH_TOKEN to an empty string when both env vars are unset, and
-# gh CLI treats an empty GH_TOKEN as "env var present, refuse keyring
-# fallback" — meaning the script silently fails to authenticate at all
-# when run outside a preflight session. Conditional set is required.
-READ_GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}"
-gh_read() {
-  if [ -n "$READ_GH_TOKEN" ]; then
-    GH_TOKEN="$READ_GH_TOKEN" gh "$@"
-  else
-    gh "$@"
-  fi
-}
 while :; do
   # Read-path: pin to preflight reviewer PAT when available; otherwise
   # let gh use its keyring fallback (no empty-GH_TOKEN trap).
