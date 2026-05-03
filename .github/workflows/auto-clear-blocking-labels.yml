@@ -239,11 +239,19 @@ jobs:
           CONFIG=".github/review-policy.yml"
           enabled=true
           if [ -f "$CONFIG" ]; then
+            # CR Major on PR #213: strip trailing YAML comments
+            # before comparing — `false  # opt out` was previously
+            # being parsed as `false#optout`, leaving the sweep
+            # enabled even when the operator explicitly disabled it.
             val=$(awk '
               /^auto_clear_labels:/ {in_block=1; next}
               in_block && /^[^[:space:]]/ {exit}
               in_block && /^[[:space:]]+scheduled_sweep_enabled:/ {
-                gsub(/.*: */, ""); gsub(/[[:space:]]/, ""); print; exit
+                sub(/#.*/, "")
+                gsub(/.*: */, "")
+                gsub(/[[:space:]]/, "")
+                print
+                exit
               }
             ' "$CONFIG")
             [ "$val" = "false" ] && enabled=false
@@ -254,9 +262,16 @@ jobs:
             exit 0
           fi
 
-          # List open PRs carrying the label.
+          # List open PRs carrying the label. CR Major on PR #213:
+          # `--limit 500` overrides gh's default of 30 so the sweep
+          # processes ALL matching PRs in repos with high open-PR
+          # counts. 500 is comfortably above any realistic limit for
+          # a single repo's needs-external-review queue (would imply
+          # ~500 PRs awaiting review — itself an alarm). If we ever
+          # see this hit in practice, paginate via the search API.
           mapfile -t prs < <(gh pr list --repo "$REPO" --state open \
-            --label needs-external-review --json number --jq '.[].number')
+            --label needs-external-review --limit 500 \
+            --json number --jq '.[].number')
           echo "Found ${#prs[@]} PR(s) with needs-external-review on $REPO"
           if [ "${#prs[@]}" -eq 0 ]; then
             echo "prs=" >> "$GITHUB_OUTPUT"

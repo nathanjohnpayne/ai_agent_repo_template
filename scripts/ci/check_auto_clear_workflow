@@ -71,23 +71,55 @@ fi
 
 # Schedule trigger present (#197 sub-C of #191) — catches the
 # 👍-after-last-push case where no event-driven trigger fires.
+# CR Minor on PR #213: anchor to the actual cron entry (not just
+# any `schedule:` / `cron:` text anywhere) so a comment couldn't
+# satisfy the assertion.
 if grep -qE "^[[:space:]]+schedule:" "$WORKFLOW" && \
-   grep -qE "^[[:space:]]+- cron:" "$WORKFLOW"; then
+   grep -qF -- "- cron: '*/15 * * * *'" "$WORKFLOW"; then
   pass=$((pass + 1))
-  echo "  PASS: schedule trigger configured for periodic sweep (#197)"
+  echo "  PASS: schedule trigger configured with 15-min cron (#197)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: missing schedule trigger for periodic sweep (#197 sub-C of #191)" >&2
+  echo "  FAIL: missing schedule trigger or expected cron entry (#197 sub-C of #191)" >&2
 fi
 
 # scheduled-sweep job exists and is gated to schedule-only events.
+# Anchor to the executable `if:` line so a string in a comment
+# couldn't satisfy the assertion. CR Minor on PR #213.
 if grep -qE "^[[:space:]]+scheduled-sweep:" "$WORKFLOW" && \
-   grep -qE "github\.event_name == 'schedule'" "$WORKFLOW"; then
+   grep -qE "^[[:space:]]+if:[[:space:]]+github\.event_name == 'schedule'" "$WORKFLOW"; then
   pass=$((pass + 1))
-  echo "  PASS: scheduled-sweep job gated to schedule events"
+  echo "  PASS: scheduled-sweep job gated by executable 'if: ... schedule' line"
 else
   fail=$((fail + 1))
-  echo "  FAIL: scheduled-sweep job missing or not gated to schedule events" >&2
+  echo "  FAIL: scheduled-sweep job missing or not gated to schedule events (executable line)" >&2
+fi
+
+# CR Major on PR #213: gh pr list defaults to --limit 30. The sweep
+# must use a higher limit so repos with many open needs-external-review
+# PRs get them ALL processed, not just the first 30.
+# `gh pr list` is split across multiple lines via shell continuation,
+# so the assertion is split too: `gh pr list` exists AND `--limit
+# <≥100>` appears within 5 lines after it.
+if grep -qE -- 'gh pr list' "$WORKFLOW" && \
+   awk '/gh pr list/,/[^\\\\]$/' "$WORKFLOW" | grep -qE -- '--limit [1-9][0-9]{2,}'; then
+  pass=$((pass + 1))
+  echo "  PASS: gh pr list uses --limit ≥100 (handles >30-PR repos)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gh pr list must use --limit ≥100 to override default of 30 (CR Major on PR #213)" >&2
+fi
+
+# CR Major on PR #213: opt-out parser must strip trailing YAML
+# comments. `scheduled_sweep_enabled: false  # opt out` was being
+# parsed as `false#optout`. The fix is `sub(/#.*/, "")` before the
+# value extraction.
+if grep -qE 'sub\(/#\.\*/, ""\)' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: opt-out parser strips trailing YAML comments"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: opt-out parser must strip trailing YAML comments (CR Major on PR #213)" >&2
 fi
 
 # workflow_run must listen to the EXACT upstream workflow names. A
