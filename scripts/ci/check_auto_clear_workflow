@@ -123,10 +123,12 @@ fi
 # the job exits non-zero at the end. Without this, gate-evaluation
 # infrastructure failures would silently leave the workflow green.
 # CR Major on PR #202 r2.
-if grep -qF "had_infra_error=1" "$WORKFLOW" && \
-   grep -qE 'exit "?\$had_infra_error"?' "$WORKFLOW"; then
+# CR Major on PR #202 r5: anchored to start-of-line + word boundary
+# so commented-out occurrences don't satisfy the assertion.
+if grep -qE '^[[:space:]]*had_infra_error=1([[:space:]]|$)' "$WORKFLOW" && \
+   grep -qE '^[[:space:]]*exit[[:space:]]+"?\$had_infra_error"?([[:space:]]|$)' "$WORKFLOW"; then
   pass=$((pass + 1))
-  echo "  PASS: rc=3 sets infra-error sentinel + job exits non-zero on it"
+  echo "  PASS: rc=3 sets infra-error sentinel + job exits non-zero on it (executable lines)"
 else
   fail=$((fail + 1))
   echo "  FAIL: rc=3 from codex-review-check.sh must surface as job failure (sentinel + final exit)" >&2
