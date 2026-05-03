@@ -19,6 +19,15 @@
 # This hook is mechanism enforcement — it makes the doctrinal rule
 # unbreakable regardless of whether the agent read the policy doc.
 #
+# Scope: this hook applies ONLY to `Bash` tool calls from interactive
+# agent sessions (claude / cursor / codex). It does NOT and SHOULD NOT
+# apply to `gh` calls executed inside GitHub Actions workflows — those
+# run in the CI runner's environment, not under an agent's PreToolUse
+# surface. Per the REVIEW_POLICY.md § Agent prohibitions sanctioned-
+# automation exception (#191/#195), the `auto-clear-blocking-labels.yml`
+# workflow is the only sanctioned automated path for
+# needs-external-review removal; this hook does not interfere with it.
+#
 # Architecture: same shape as scripts/hooks/gh-pr-guard.sh — read the
 # Bash command from stdin (Claude Code passes JSON via stdin to
 # PreToolUse hooks), tokenize with shlex (quote-aware), walk to find

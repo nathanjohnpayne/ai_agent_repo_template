@@ -339,6 +339,16 @@ keyring active is your agent identity. No switch needed for commits.
      human clears it from any device and auto-merge fires
      immediately. See REVIEW_POLICY.md § Agent prohibitions.
 
+     For `needs-external-review` specifically, the auto-clear workflow
+     (`.github/workflows/auto-clear-blocking-labels.yml`, #191/#195)
+     usually removes the label automatically once `codex-review-check.sh`
+     clears the merge gate on `pull_request_target` /
+     `pull_request_review` / `workflow_run` events. Manual
+     `request-label-removal.sh` is a fallback for the rare case where
+     no event arrived to trigger the workflow (or the gate is
+     genuinely not yet met). `needs-human-review` and
+     `policy-violation` remain manual-only by design.
+
 ## After merging
 
 11. If the reviewer flagged observations or risks while approving, create a
