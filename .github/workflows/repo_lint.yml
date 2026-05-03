@@ -57,6 +57,9 @@ jobs:
       - name: check_resolve_pr_threads
         run: ./scripts/ci/check_resolve_pr_threads
 
+      - name: check_auto_clear_workflow
+        run: ./scripts/ci/check_auto_clear_workflow
+
       - name: check_governance_files
         run: |
           MISSING=0

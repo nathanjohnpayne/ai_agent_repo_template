@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# check_auto_clear_workflow — smoke tests for auto-clear-blocking-labels.yml
+#
+# The workflow itself runs in GitHub Actions; what we test here is the
+# YAML structure (parses, has the right triggers, has the self-fire
+# guard) and the PR-number resolution dispatch logic (which is bash
+# inside the workflow). Mirrors the integration-test gap that #195's
+# implementation plan flagged.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+WORKFLOW="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
+
+pass=0
+fail=0
+
+# ── Test 1: workflow file exists and is valid YAML
+echo "auto-clear-blocking-labels.yml structural tests"
+
+if [ ! -f "$WORKFLOW" ]; then
+  echo "  FAIL: $WORKFLOW does not exist" >&2
+  exit 1
+fi
+
+# Parse via yq (preferred — no extra deps needed in GitHub-hosted
+# runner) → python3+PyYAML → grep fallback. Graceful skip when no
+# YAML parser is available rather than treating absence as failure.
+if command -v yq >/dev/null 2>&1; then
+  if yq eval '.' "$WORKFLOW" >/dev/null 2>&1; then
+    pass=$((pass + 1))
+    echo "  PASS: workflow YAML parses (via yq)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: workflow YAML invalid (per yq)" >&2
+  fi
+elif python3 -c "import yaml" >/dev/null 2>&1; then
+  if python3 -c "import yaml; yaml.safe_load(open('$WORKFLOW'))" 2>/dev/null; then
+    pass=$((pass + 1))
+    echo "  PASS: workflow YAML parses (via python+PyYAML)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: workflow YAML invalid (per python+PyYAML)" >&2
+  fi
+else
+  echo "  SKIP: no YAML parser available (install yq or PyYAML for this check)"
+fi
+
+# ── Test 2: required triggers present
+for trig in 'pull_request_target' 'pull_request_review' 'check_suite'; do
+  if grep -qE "^[[:space:]]+${trig}:" "$WORKFLOW"; then
+    pass=$((pass + 1))
+    echo "  PASS: trigger '$trig' configured"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: missing required trigger '$trig'" >&2
+  fi
+done
+
+# ── Test 3: self-fire loop guard present
+if grep -qE "github\.event\.action == 'unlabeled'" "$WORKFLOW" && \
+   grep -qE "github\.event\.label\.name == 'needs-external-review'" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: self-fire loop guard for unlabeled+needs-external-review present"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: self-fire loop guard missing or malformed" >&2
+fi
+
+# ── Test 4: scope discipline — only needs-external-review is removed
+if grep -qE 'remove-label needs-external-review' "$WORKFLOW" && \
+   ! grep -qE 'remove-label needs-human-review' "$WORKFLOW" && \
+   ! grep -qE 'remove-label policy-violation' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: scope discipline — only needs-external-review is auto-removed"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow either misses the target label or auto-removes a forbidden one" >&2
+fi
+
+# ── Test 5: PR-number resolution dispatch (extracted bash logic)
+# The workflow embeds this dispatch as inline bash. Extract the logic
+# pattern and exercise the three event shapes against canned
+# github.event payloads.
+echo
+echo "auto-clear-blocking-labels.yml PR-number resolution tests"
+
+dispatch() {
+  # Mirrors the workflow's case statement. Args: event_name,
+  # event_json (passed via stdin to jq).
+  local event_name="$1"
+  local event_json="$2"
+  case "$event_name" in
+    pull_request_target|pull_request_review)
+      jq -r '.pull_request.number' <<<"$event_json"
+      ;;
+    check_suite)
+      jq -r '.check_suite.pull_requests[].number' <<<"$event_json"
+      ;;
+    *)
+      echo "Unsupported event: $event_name" >&2
+      return 1
+      ;;
+  esac
+}
+
+# pull_request_target → 1 PR
+out=$(dispatch pull_request_target '{"pull_request":{"number":42}}')
+if [ "$out" = "42" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: pull_request_target resolves to PR number"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pull_request_target dispatch (got: $out)" >&2
+fi
+
+# pull_request_review → 1 PR
+out=$(dispatch pull_request_review '{"pull_request":{"number":99}}')
+if [ "$out" = "99" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: pull_request_review resolves to PR number"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pull_request_review dispatch (got: $out)" >&2
+fi
+
+# check_suite → multiple PRs
+out=$(dispatch check_suite '{"check_suite":{"pull_requests":[{"number":7},{"number":8}]}}')
+expected=$'7\n8'
+if [ "$out" = "$expected" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: check_suite enumerates multiple PRs"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: check_suite dispatch (got: $out)" >&2
+fi
+
+# check_suite with empty pull_requests → empty output (script then
+# skips per the `if [ -z "$prs" ]` guard upstream)
+out=$(dispatch check_suite '{"check_suite":{"pull_requests":[]}}')
+if [ -z "$out" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: check_suite with no PRs produces empty output (will be skipped)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: check_suite empty PRs should yield empty (got: $out)" >&2
+fi
+
+# Unsupported event → error (workflow exit 0 path with stderr message)
+set +e
+out=$(dispatch wat '{}' 2>&1)
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "Unsupported event"; then
+  pass=$((pass + 1))
+  echo "  PASS: unsupported event returns 1 with clear stderr"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: unsupported event handling (rc=$rc, out=$out)" >&2
+fi
+
+echo
+if [ "$fail" -eq 0 ]; then
+  echo "check_auto_clear_workflow: PASS ($pass tests)"
+  exit 0
+else
+  echo "check_auto_clear_workflow: FAIL ($fail of $((pass + fail)) tests)" >&2
+  exit 1
+fi

@@ -1,0 +1,140 @@
+name: Auto-clear blocking labels
+
+# Closes the manual-label-removal toil documented in #191.
+#
+# When the codex-review-check.sh merge gate clears (CI green +
+# reviewer-identity APPROVED + Codex cleared on HEAD), this workflow
+# removes the `needs-external-review` label automatically. Without it,
+# every over-threshold PR requires the human to do
+# `gh pr edit <N> --remove-label needs-external-review` after agents
+# have done all the actual review work.
+#
+# Scope: ONLY removes `needs-external-review`. `needs-human-review`
+# and `policy-violation` remain manual-only by design (see
+# REVIEW_POLICY.md § Agent prohibitions). The doctrine carve-out for
+# this workflow ships in #196.
+
+on:
+  pull_request_target:
+    types: [synchronize, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted]
+  check_suite:
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  contents: read
+  checks: read
+
+jobs:
+  evaluate-and-clear:
+    name: Re-evaluate codex-review-check gate
+    runs-on: ubuntu-latest
+    # Self-fire loop guard: when this workflow's label removal fires
+    # the `unlabeled` event for `needs-external-review`, skip — we
+    # just removed it; nothing to do.
+    if: |
+      !(
+        github.event_name == 'pull_request_target' &&
+        github.event.action == 'unlabeled' &&
+        github.event.label.name == 'needs-external-review'
+      )
+    steps:
+      - name: Checkout repo (for codex-review-check.sh)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Need full history so codex-review-check can inspect the
+          # PR HEAD against base. The script doesn't currently do that
+          # but a future tightening might.
+          fetch-depth: 0
+
+      - name: Resolve PR number from event
+        id: pr
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_JSON: ${{ toJSON(github.event) }}
+        run: |
+          # Each event surfaces PR number(s) differently. Emit a
+          # newline-separated list (most events have exactly one PR).
+          # check_suite.completed can attach to multiple PRs in
+          # principle, so we enumerate.
+          case "$EVENT_NAME" in
+            pull_request_target|pull_request_review)
+              prs=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
+              ;;
+            check_suite)
+              prs=$(jq -r '.check_suite.pull_requests[].number' <<<"$EVENT_JSON")
+              ;;
+            *)
+              echo "Unsupported event: $EVENT_NAME" >&2
+              exit 0  # don't fail; just skip
+              ;;
+          esac
+          if [ -z "$prs" ]; then
+            echo "No PR number resolvable from event; skipping." >&2
+            echo "numbers=" >> "$GITHUB_OUTPUT"
+          else
+            # Multi-line output: use a heredoc per Actions docs.
+            {
+              echo 'numbers<<EOF'
+              echo "$prs"
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Re-evaluate gate per PR + remove label on pass
+        if: steps.pr.outputs.numbers != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          # codex-review-check.sh exits:
+          #   0 = gate passes
+          #   1 = gate fails (one or more of CI/reviewer/codex not met)
+          #   3 = config/arg error (real failure — bubble up)
+          while IFS= read -r PR; do
+            [ -z "$PR" ] && continue
+            echo "::group::Evaluating PR #$PR"
+
+            # Skip if label not present (no-op, common case on
+            # synchronize/check_suite for under-threshold PRs).
+            HAS_LABEL=$(gh pr view "$PR" --repo "$REPO" --json labels \
+              --jq '[.labels[].name] | contains(["needs-external-review"])')
+            if [ "$HAS_LABEL" != "true" ]; then
+              echo "Label needs-external-review not present; nothing to clear."
+              echo "::endgroup::"
+              continue
+            fi
+
+            set +e
+            scripts/codex-review-check.sh "$PR"
+            rc=$?
+            set -e
+
+            case "$rc" in
+              0)
+                echo "Gate passes — removing needs-external-review label."
+                gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review
+                gh pr comment "$PR" --repo "$REPO" --body "$(cat <<'COMMENT'
+                **Automated label removal.** \`scripts/codex-review-check.sh\` cleared the merge gate on this HEAD (CI green + reviewer-identity APPROVED + Codex cleared). Removed \`needs-external-review\` so Label Gate passes and the PR can merge. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#195) for the trigger doctrine.
+                COMMENT
+                )"
+                ;;
+              1)
+                echo "Gate not yet met — leaving label in place."
+                ;;
+              3)
+                echo "::error::codex-review-check.sh config/arg error (rc=3) on PR #$PR"
+                # Don't exit non-zero; one bad PR shouldn't kill the
+                # whole sweep on check_suite events that may have
+                # multiple PRs attached.
+                ;;
+              *)
+                echo "::warning::codex-review-check.sh unexpected rc=$rc on PR #$PR"
+                ;;
+            esac
+            echo "::endgroup::"
+          done <<<"$PR_NUMBERS"
