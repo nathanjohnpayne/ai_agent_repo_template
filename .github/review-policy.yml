@@ -264,3 +264,17 @@ codex:
 # scripts/codex-review-check.sh's parser — no behavior change without
 # explicit opt-in. See REVIEW_POLICY.md § Migration for existing consumers.
 phase_4b_default: complex-changes
+
+# ---------------------------------------------------------------------------
+# Auto-clear blocking labels (#195/#197)
+# ---------------------------------------------------------------------------
+# Knobs for .github/workflows/auto-clear-blocking-labels.yml. The
+# event-driven evaluate-and-clear job ships unconditionally; the
+# periodic scheduled-sweep job below is optional.
+auto_clear_labels:
+  # Periodic sweep catches the 👍-after-last-push case: Codex reacts
+  # on the PR issue with no synchronize / pull_request_review /
+  # workflow_run event to fire the event-driven path. Defaults to
+  # true; set false if the every-15-minute cron is too noisy for a
+  # given repo's PR volume.
+  scheduled_sweep_enabled: true

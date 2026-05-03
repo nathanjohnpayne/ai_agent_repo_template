@@ -35,6 +35,14 @@ on:
       - "Agent Review Pipeline"
       - "repo-lint"
     types: [completed]
+  # Periodic sweep — catches the 👍-after-last-push case (codex
+  # reacts on the PR issue but no synchronize / review / workflow_run
+  # event fires, so the event-driven path stays inert). Runs every
+  # 15 minutes against any open PR carrying needs-external-review.
+  # Idempotent (no-op when label absent or gate not yet met). Sub-C
+  # of #191. See scheduled-sweep job below for the cadence knob.
+  schedule:
+    - cron: '*/15 * * * *'
 
 permissions:
   pull-requests: write
@@ -194,4 +202,103 @@ jobs:
             esac
             echo "::endgroup::"
           done <<<"$PR_NUMBERS"
+          exit "$had_infra_error"
+
+  scheduled-sweep:
+    name: Periodic sweep for stale needs-external-review labels
+    # Catches the 👍-after-last-push case (#197). Only fires on
+    # schedule; the event-driven evaluate-and-clear job above
+    # handles the common path. Idempotent: running twice on the
+    # same PR with no state change is a no-op (label-present check
+    # + read-only gate evaluation).
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (for codex-review-check.sh)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Schedule events have no PR context, so default GITHUB_REF
+          # is the default branch already — pin explicitly for
+          # consistency with the security stance of the event-driven
+          # job above.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Find PRs carrying needs-external-review
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Read the per-repo cadence/enable knob from review-policy.yml.
+          # Defaults: enabled=true. Operators can opt out by setting
+          #   auto_clear_labels:
+          #     scheduled_sweep_enabled: false
+          # in their .github/review-policy.yml.
+          CONFIG=".github/review-policy.yml"
+          enabled=true
+          if [ -f "$CONFIG" ]; then
+            val=$(awk '
+              /^auto_clear_labels:/ {in_block=1; next}
+              in_block && /^[^[:space:]]/ {exit}
+              in_block && /^[[:space:]]+scheduled_sweep_enabled:/ {
+                gsub(/.*: */, ""); gsub(/[[:space:]]/, ""); print; exit
+              }
+            ' "$CONFIG")
+            [ "$val" = "false" ] && enabled=false
+          fi
+          if [ "$enabled" = "false" ]; then
+            echo "Scheduled sweep disabled for $REPO via review-policy.yml; skipping."
+            echo "prs=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # List open PRs carrying the label.
+          mapfile -t prs < <(gh pr list --repo "$REPO" --state open \
+            --label needs-external-review --json number --jq '.[].number')
+          echo "Found ${#prs[@]} PR(s) with needs-external-review on $REPO"
+          if [ "${#prs[@]}" -eq 0 ]; then
+            echo "prs=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo 'prs<<EOF'
+            printf '%s\n' "${prs[@]}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Re-evaluate gate per PR
+        if: steps.find.outputs.prs != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRS: ${{ steps.find.outputs.prs }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          had_infra_error=0
+          while IFS= read -r PR; do
+            [ -z "$PR" ] && continue
+            echo "::group::Sweep PR #$PR"
+            set +e
+            scripts/codex-review-check.sh "$PR"
+            rc=$?
+            set -e
+            case "$rc" in
+              0)
+                echo "Gate passes — removing needs-external-review label."
+                if gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review; then
+                  comment_body='**Automated label removal (scheduled sweep).** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD between event triggers (typical: Codex 👍 after the last push, with no synchronize / review / workflow_run event to fire the event-driven path). Removed `needs-external-review`. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#197) for the sweep doctrine.'
+                  gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
+                    || echo "::warning::Failed to post attribution comment for PR #$PR"
+                else
+                  echo "::warning::Failed to remove needs-external-review on PR #$PR"
+                fi
+                ;;
+              1) echo "Gate not yet met — leaving label in place." ;;
+              3) echo "::error::codex-review-check.sh rc=3 on PR #$PR"; had_infra_error=1 ;;
+              *) echo "::error::unexpected rc=$rc on PR #$PR"; had_infra_error=1 ;;
+            esac
+            echo "::endgroup::"
+          done <<<"$PRS"
           exit "$had_infra_error"

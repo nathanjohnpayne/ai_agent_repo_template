@@ -69,6 +69,27 @@ else
   echo "  PASS: check_suite trigger absent (regression closed for codex P1 on #202)"
 fi
 
+# Schedule trigger present (#197 sub-C of #191) — catches the
+# 👍-after-last-push case where no event-driven trigger fires.
+if grep -qE "^[[:space:]]+schedule:" "$WORKFLOW" && \
+   grep -qE "^[[:space:]]+- cron:" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: schedule trigger configured for periodic sweep (#197)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: missing schedule trigger for periodic sweep (#197 sub-C of #191)" >&2
+fi
+
+# scheduled-sweep job exists and is gated to schedule-only events.
+if grep -qE "^[[:space:]]+scheduled-sweep:" "$WORKFLOW" && \
+   grep -qE "github\.event_name == 'schedule'" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: scheduled-sweep job gated to schedule events"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: scheduled-sweep job missing or not gated to schedule events" >&2
+fi
+
 # workflow_run must listen to the EXACT upstream workflow names. A
 # rename or typo on either side would silently break the auto-clear
 # without this test catching it. CR Trivial on PR #202 r2.
@@ -170,6 +191,11 @@ echo "auto-clear-blocking-labels.yml bash syntax test"
 
 block_dir=$(mktemp -d)
 # awk extracts each `run: |` block to a separate file in $block_dir.
+# Exit a run block when ANY non-empty line drops to indent <= base
+# (the `run:` line's own indent), not just column-0. This catches
+# job/step transitions like `  scheduled-sweep:` (under `jobs:`) and
+# `      - name: Foo` (under steps:) which would otherwise be
+# treated as continuations of the prior bash block.
 awk -v outdir="$block_dir" '
   /^[[:space:]]+run:[[:space:]]+\|[[:space:]]*$/ {
     if (in_run) { close(outfile) }
@@ -177,10 +203,12 @@ awk -v outdir="$block_dir" '
     match($0, /^[[:space:]]+/); base_indent = RLENGTH
     in_run = 1; next
   }
-  in_run && /^[^[:space:]]/ {
-    close(outfile); in_run = 0; next
-  }
+  in_run && NF == 0 { print > outfile; next }
   in_run {
+    match($0, /^[[:space:]]*/); cur_indent = RLENGTH
+    if (cur_indent <= base_indent) {
+      close(outfile); in_run = 0; next
+    }
     # Strip the YAML run-block indentation (base_indent + 2 spaces).
     sub("^[[:space:]]{" (base_indent + 2) "}", "")
     print > outfile
