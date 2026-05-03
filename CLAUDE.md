@@ -238,10 +238,13 @@ keyring active is your agent identity. No switch needed for commits.
    g. **Phase 4b checkpoint (do not skip).** Before the merge call,
       apply step 8.5: if `phase_4b_default` is `complex-changes`, run
       `scripts/phase-4b-classifier.sh <PR#>` and act on its exit code
-      (1 → post 4b handoff and wait for external CLI review, then
-      come back here; 0 → proceed to merge; 2 → stop and investigate;
-      3 → fix the invocation). If `phase_4b_default` is `always`, post
-      the 4b handoff unconditionally. If `fallback-only`, skip
+      (1 → post 4b handoff and wait for the external reviewer identity
+      to post an `APPROVED` review on the current HEAD with no
+      unaddressed P0/P1, then come back here; 0 → proceed to merge;
+      2 → stop and investigate; 3 → fix the invocation). If
+      `phase_4b_default` is `always`, post the 4b handoff
+      unconditionally and wait for the same external `APPROVED`
+      condition before coming back to merge. If `fallback-only`, skip
       directly to merge.
    h. With the gate passing AND the 4b checkpoint cleared, merge as
       nathanjohnpayne with the switch-around per the active-account
