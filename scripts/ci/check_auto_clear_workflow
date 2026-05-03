@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# check_auto_clear_workflow — smoke tests for auto-clear-blocking-labels.yml
+#
+# The workflow itself runs in GitHub Actions; what we test here is the
+# YAML structure (parses, has the right triggers, has the self-fire
+# guard) and the PR-number resolution dispatch logic (which is bash
+# inside the workflow). Mirrors the integration-test gap that #195's
+# implementation plan flagged.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+WORKFLOW="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
+
+pass=0
+fail=0
+
+# ── Test 1: workflow file exists and is valid YAML
+echo "auto-clear-blocking-labels.yml structural tests"
+
+if [ ! -f "$WORKFLOW" ]; then
+  echo "  FAIL: $WORKFLOW does not exist" >&2
+  exit 1
+fi
+
+# Parse via yq (preferred — no extra deps needed in GitHub-hosted
+# runner) → python3+PyYAML → grep fallback. Graceful skip when no
+# YAML parser is available rather than treating absence as failure.
+if command -v yq >/dev/null 2>&1; then
+  if yq eval '.' "$WORKFLOW" >/dev/null 2>&1; then
+    pass=$((pass + 1))
+    echo "  PASS: workflow YAML parses (via yq)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: workflow YAML invalid (per yq)" >&2
+  fi
+elif python3 -c "import yaml" >/dev/null 2>&1; then
+  if python3 -c "import yaml; yaml.safe_load(open('$WORKFLOW'))" 2>/dev/null; then
+    pass=$((pass + 1))
+    echo "  PASS: workflow YAML parses (via python+PyYAML)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: workflow YAML invalid (per python+PyYAML)" >&2
+  fi
+else
+  echo "  SKIP: no YAML parser available (install yq or PyYAML for this check)"
+fi
+
+# ── Test 2: required triggers present
+# Codex P1 on PR #202 r1: workflow_run replaces check_suite (which
+# doesn't fire for Actions-created suites).
+for trig in 'pull_request_target' 'pull_request_review' 'workflow_run'; do
+  if grep -qE "^[[:space:]]+${trig}:" "$WORKFLOW"; then
+    pass=$((pass + 1))
+    echo "  PASS: trigger '$trig' configured"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: missing required trigger '$trig'" >&2
+  fi
+done
+
+# Negative: workflow_run is the canonical post-CI signal. check_suite
+# would silently fail to fire for GitHub-Actions-created suites.
+if grep -qE "^[[:space:]]+check_suite:" "$WORKFLOW"; then
+  fail=$((fail + 1))
+  echo "  FAIL: check_suite trigger should NOT be present (codex P1 on #202 — doesn't fire for Actions suites)" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: check_suite trigger absent (regression closed for codex P1 on #202)"
+fi
+
+# workflow_run must listen to the EXACT upstream workflow names. A
+# rename or typo on either side would silently break the auto-clear
+# without this test catching it. CR Trivial on PR #202 r2.
+for wf in 'PR Review Policy' 'Agent Review Pipeline' 'repo-lint'; do
+  if grep -qF -- "- \"$wf\"" "$WORKFLOW"; then
+    pass=$((pass + 1))
+    echo "  PASS: workflow_run listens to '$wf'"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: workflow_run missing '$wf'" >&2
+  fi
+done
+
+# SECURITY: checkout MUST pin to default branch ref for
+# pull_request_review safety. CR Critical on PR #202 r2 — without
+# the explicit ref, a malicious PR could supply its own version of
+# scripts/codex-review-check.sh and have it run with this workflow's
+# pull-requests:write permissions.
+if grep -qF "ref: \${{ github.event.repository.default_branch }}" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: checkout pinned to default_branch (security: blocks PR-controlled gate-script execution)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: checkout MUST pin ref to default_branch (CR Critical on #202 r2)" >&2
+fi
+
+# Least-privilege permissions: parse the permissions block and
+# compare against the EXACT expected set, not a denylist. Codifies
+# the expected permission shape so any drift (added scope, changed
+# read↔write) is surfaced as a CI failure. CR Major on PR #202 r4
+# (denylist approach was incomplete — missed artifact-metadata,
+# repository-projects, vulnerability-alerts).
+perm_block=$(
+  awk '
+    /^permissions:/ {in_block=1; next}
+    in_block && /^[^[:space:]]/ {exit}
+    in_block && NF { sub(/^[[:space:]]+/, "", $0); print }
+  ' "$WORKFLOW" | sort
+)
+expected_perms=$'checks: read\ncontents: read\npull-requests: write'
+if [ "$perm_block" = "$expected_perms" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: workflow permissions exactly match the least-privilege set"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow permissions drifted from expected least-privilege set" >&2
+  echo "      expected:" >&2; echo "$expected_perms" | sed 's/^/        /' >&2
+  echo "      got:" >&2; echo "$perm_block" | sed 's/^/        /' >&2
+fi
+
+# Sentinel: rc=3 from codex-review-check.sh sets had_infra_error and
+# the job exits non-zero at the end. Without this, gate-evaluation
+# infrastructure failures would silently leave the workflow green.
+# CR Major on PR #202 r2.
+# CR Major on PR #202 r5: anchored to start-of-line + word boundary
+# so commented-out occurrences don't satisfy the assertion.
+if grep -qE '^[[:space:]]*had_infra_error=1([[:space:]]|$)' "$WORKFLOW" && \
+   grep -qE '^[[:space:]]*exit[[:space:]]+"?\$had_infra_error"?([[:space:]]|$)' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: rc=3 sets infra-error sentinel + job exits non-zero on it (executable lines)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: rc=3 from codex-review-check.sh must surface as job failure (sentinel + final exit)" >&2
+fi
+
+# ── Test 3: self-fire loop guard present
+if grep -qE "github\.event\.action == 'unlabeled'" "$WORKFLOW" && \
+   grep -qE "github\.event\.label\.name == 'needs-external-review'" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: self-fire loop guard for unlabeled+needs-external-review present"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: self-fire loop guard missing or malformed" >&2
+fi
+
+# ── Test 4: scope discipline — only needs-external-review is removed
+# CR Major on PR #202 r3: tighten the positive grep to the actual
+# `gh pr edit ... --remove-label` executable line, not anywhere in
+# the file (header comments/attribution-message would otherwise
+# satisfy the match even if the executable line regressed).
+if grep -qE 'gh pr edit .+--remove-label needs-external-review' "$WORKFLOW" && \
+   ! grep -qE 'gh pr edit .+--remove-label needs-human-review' "$WORKFLOW" && \
+   ! grep -qE 'gh pr edit .+--remove-label policy-violation' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: scope discipline — only needs-external-review is auto-removed (executable line)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow either misses the target label or auto-removes a forbidden one" >&2
+fi
+
+# ── Test 4c: bash syntax check on every `run:` block
+# Extract each `run: |` block to a temp file and feed to `bash -n`.
+# Catches heredoc/subshell errors that only surface at runtime.
+# Real bug from PR #202 r5: `gh pr comment ... --body "$(cat <<'COMMENT'
+# ... COMMENT )"` had the closing `COMMENT` indented, which is
+# invalid heredoc syntax — this test would have caught it pre-merge.
+echo
+echo "auto-clear-blocking-labels.yml bash syntax test"
+
+block_dir=$(mktemp -d)
+# awk extracts each `run: |` block to a separate file in $block_dir.
+awk -v outdir="$block_dir" '
+  /^[[:space:]]+run:[[:space:]]+\|[[:space:]]*$/ {
+    if (in_run) { close(outfile) }
+    n++; outfile = outdir "/block-" n ".sh"
+    match($0, /^[[:space:]]+/); base_indent = RLENGTH
+    in_run = 1; next
+  }
+  in_run && /^[^[:space:]]/ {
+    close(outfile); in_run = 0; next
+  }
+  in_run {
+    # Strip the YAML run-block indentation (base_indent + 2 spaces).
+    sub("^[[:space:]]{" (base_indent + 2) "}", "")
+    print > outfile
+  }
+  END { if (in_run) close(outfile) }
+' "$WORKFLOW"
+
+extracted_count=$(ls -1 "$block_dir" 2>/dev/null | wc -l | tr -d ' ')
+syntax_errors=0
+for f in "$block_dir"/block-*.sh; do
+  [ -f "$f" ] || continue
+  if ! err=$(bash -n "$f" 2>&1); then
+    fail=$((fail + 1))
+    syntax_errors=$((syntax_errors + 1))
+    echo "  FAIL: bash syntax error in $(basename "$f")" >&2
+    echo "$err" | sed 's/^/    /' >&2
+  fi
+done
+rm -rf "$block_dir"
+
+if [ "$syntax_errors" -eq 0 ] && [ "$extracted_count" -gt 0 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: all $extracted_count run blocks have valid bash syntax"
+elif [ "$extracted_count" = "0" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: extracted 0 run blocks (extraction logic broken?)" >&2
+fi
+
+# ── Test 5: PR-number resolution dispatch (extracted bash logic)
+# The workflow embeds this dispatch as inline bash. Extract the logic
+# pattern and exercise the three event shapes against canned
+# github.event payloads.
+echo
+echo "auto-clear-blocking-labels.yml PR-number resolution tests"
+
+dispatch() {
+  # Mirrors the workflow's case statement. Args: event_name,
+  # event_json. Unsupported events return 0 (matching the workflow's
+  # `exit 0  # don't fail; just skip` semantics — CR Minor on PR #202).
+  local event_name="$1"
+  local event_json="$2"
+  case "$event_name" in
+    pull_request_target|pull_request_review)
+      jq -r '.pull_request.number' <<<"$event_json"
+      ;;
+    workflow_run)
+      local conclusion
+      conclusion=$(jq -r '.workflow_run.conclusion' <<<"$event_json")
+      if [ "$conclusion" != "success" ]; then
+        return 0  # workflow's "skip on non-success" path
+      fi
+      jq -r '.workflow_run.pull_requests[].number' <<<"$event_json"
+      ;;
+    *)
+      echo "Unsupported event: $event_name" >&2
+      return 0  # workflow exit 0 on unsupported (don't fail; just skip)
+      ;;
+  esac
+}
+
+# pull_request_target → 1 PR
+out=$(dispatch pull_request_target '{"pull_request":{"number":42}}')
+if [ "$out" = "42" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: pull_request_target resolves to PR number"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pull_request_target dispatch (got: $out)" >&2
+fi
+
+# pull_request_review → 1 PR
+out=$(dispatch pull_request_review '{"pull_request":{"number":99}}')
+if [ "$out" = "99" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: pull_request_review resolves to PR number"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pull_request_review dispatch (got: $out)" >&2
+fi
+
+# workflow_run success → multiple PRs
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"success","pull_requests":[{"number":7},{"number":8}]}}')
+expected=$'7\n8'
+if [ "$out" = "$expected" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: workflow_run (success) enumerates multiple PRs"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow_run (success) dispatch (got: $out)" >&2
+fi
+
+# workflow_run failure → empty (don't bother re-evaluating gate when
+# the upstream workflow itself failed)
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"failure","pull_requests":[{"number":7}]}}')
+if [ -z "$out" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: workflow_run (failure conclusion) skips re-evaluation"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow_run failure should produce empty (got: $out)" >&2
+fi
+
+# workflow_run with empty pull_requests → empty (script then skips
+# per the `if [ -z "$prs" ]` guard upstream)
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"success","pull_requests":[]}}')
+if [ -z "$out" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: workflow_run with no PRs produces empty output (will be skipped)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow_run empty PRs should yield empty (got: $out)" >&2
+fi
+
+# Unsupported event → exit 0 with stderr message (matches workflow
+# behavior; CR Minor on PR #202 r1 fixed the prior return-1 mismatch)
+set +e
+out=$(dispatch wat '{}' 2>&1)
+rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "Unsupported event"; then
+  pass=$((pass + 1))
+  echo "  PASS: unsupported event returns 0 with clear stderr (matches workflow)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: unsupported event handling (rc=$rc, out=$out)" >&2
+fi
+
+echo
+if [ "$fail" -eq 0 ]; then
+  echo "check_auto_clear_workflow: PASS ($pass tests)"
+  exit 0
+else
+  echo "check_auto_clear_workflow: FAIL ($fail of $((pass + fail)) tests)" >&2
+  exit 1
+fi

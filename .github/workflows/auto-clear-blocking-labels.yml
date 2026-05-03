@@ -1,0 +1,197 @@
+name: Auto-clear blocking labels
+
+# Closes the manual-label-removal toil documented in #191.
+#
+# When the codex-review-check.sh merge gate clears (CI green +
+# reviewer-identity APPROVED + Codex cleared on HEAD), this workflow
+# removes the `needs-external-review` label automatically. Without it,
+# every over-threshold PR requires the human to do
+# `gh pr edit <N> --remove-label needs-external-review` after agents
+# have done all the actual review work.
+#
+# Scope: ONLY removes `needs-external-review`. `needs-human-review`
+# and `policy-violation` remain manual-only by design (see
+# REVIEW_POLICY.md § Agent prohibitions). The doctrine carve-out for
+# this workflow ships in #196.
+
+on:
+  pull_request_target:
+    types: [synchronize, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted]
+  # workflow_run fires on completion of OTHER workflows. We target
+  # the three that produce the required-check signals codex-review-
+  # check.sh inspects: PR Review Policy (Label Gate, Self-Review,
+  # External Review Check), Agent Review Pipeline (auto-merge-on-
+  # approval, detect-disagreement, etc.), and repo-lint (lint).
+  # This replaces the prior `check_suite` trigger, which (per codex
+  # P1 on PR #202) does NOT fire for suites created by GitHub
+  # Actions — only for external CI providers. Without workflow_run,
+  # the common path of "reviewer approves → Actions CI catches up →
+  # gate now passes" produced no event and the label stayed stuck.
+  workflow_run:
+    workflows:
+      - "PR Review Policy"
+      - "Agent Review Pipeline"
+      - "repo-lint"
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  contents: read
+  checks: read
+
+jobs:
+  evaluate-and-clear:
+    name: Re-evaluate codex-review-check gate
+    runs-on: ubuntu-latest
+    # Self-fire loop guard: when this workflow's label removal fires
+    # the `unlabeled` event for `needs-external-review`, skip — we
+    # just removed it; nothing to do.
+    if: |
+      !(
+        github.event_name == 'pull_request_target' &&
+        github.event.action == 'unlabeled' &&
+        github.event.label.name == 'needs-external-review'
+      )
+    steps:
+      - name: Checkout repo (for codex-review-check.sh)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # SECURITY: pin to the default branch so we always run the
+          # TRUSTED copy of scripts/codex-review-check.sh — never the
+          # PR's own version. Without this, on pull_request_review
+          # events GITHUB_REF defaults to refs/pull/<N>/merge and
+          # actions/checkout pulls the PR's HEAD; combined with this
+          # workflow's `pull-requests: write` permission, a malicious
+          # PR could modify the gate script to remove arbitrary labels
+          # or post arbitrary comments. CR Critical on PR #202 r2.
+          ref: ${{ github.event.repository.default_branch }}
+          # Need full history so codex-review-check can inspect the
+          # PR HEAD against base. The script doesn't currently do that
+          # but a future tightening might.
+          fetch-depth: 0
+
+      - name: Resolve PR number from event
+        id: pr
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_JSON: ${{ toJSON(github.event) }}
+        run: |
+          # Each event surfaces PR number(s) differently. Emit a
+          # newline-separated list (most events have exactly one PR).
+          # workflow_run.completed can attach to multiple PRs in
+          # principle, so we enumerate.
+          case "$EVENT_NAME" in
+            pull_request_target|pull_request_review)
+              prs=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
+              ;;
+            workflow_run)
+              # Only act on successful runs of the listened workflows;
+              # a failed lint or PR Review Policy run won't have
+              # changed the gate state, so don't bother re-evaluating.
+              conclusion=$(jq -r '.workflow_run.conclusion' <<<"$EVENT_JSON")
+              if [ "$conclusion" != "success" ]; then
+                echo "workflow_run conclusion=$conclusion (not success); skipping." >&2
+                echo "numbers=" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              prs=$(jq -r '.workflow_run.pull_requests[].number' <<<"$EVENT_JSON")
+              ;;
+            *)
+              echo "Unsupported event: $EVENT_NAME" >&2
+              exit 0  # don't fail; just skip
+              ;;
+          esac
+          if [ -z "$prs" ]; then
+            echo "No PR number resolvable from event; skipping." >&2
+            echo "numbers=" >> "$GITHUB_OUTPUT"
+          else
+            # Multi-line output: use a heredoc per Actions docs.
+            {
+              echo 'numbers<<EOF'
+              echo "$prs"
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Re-evaluate gate per PR + remove label on pass
+        if: steps.pr.outputs.numbers != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # codex-review-check.sh exits:
+          #   0 = gate passes
+          #   1 = gate fails (one or more of CI/reviewer/codex not met)
+          #   3 = config/arg error (real infrastructure failure)
+          # CR Major on PR #202 r1: every gh call gets explicit error
+          # handling so a transient failure (rate limit, 5xx) on one
+          # PR doesn't abort the sweep, AND no early gh failure is
+          # silently swallowed by an asymmetric set -e/+e dance.
+          # CR Major on PR #202 r2: rc=3 (infrastructure error) sets a
+          # sentinel; after the sweep finishes we exit non-zero if any
+          # PR hit it, so the workflow doesn't go green when gate
+          # evaluation was actually impossible.
+          had_infra_error=0
+          while IFS= read -r PR; do
+            [ -z "$PR" ] && continue
+            echo "::group::Evaluating PR #$PR"
+
+            # Skip if label not present (no-op, common case on
+            # synchronize/workflow_run for under-threshold PRs).
+            if ! HAS_LABEL=$(gh pr view "$PR" --repo "$REPO" --json labels \
+              --jq '[.labels[].name] | contains(["needs-external-review"])'); then
+              echo "::warning::Failed to query labels for PR #$PR; skipping."
+              echo "::endgroup::"
+              continue
+            fi
+            if [ "$HAS_LABEL" != "true" ]; then
+              echo "Label needs-external-review not present; nothing to clear."
+              echo "::endgroup::"
+              continue
+            fi
+
+            set +e
+            scripts/codex-review-check.sh "$PR"
+            rc=$?
+            set -e
+
+            case "$rc" in
+              0)
+                echo "Gate passes — removing needs-external-review label."
+                if ! gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review; then
+                  echo "::warning::Failed to remove needs-external-review on PR #$PR"
+                  echo "::endgroup::"
+                  continue
+                fi
+                # Direct string body (NOT a heredoc — heredoc closing
+                # delimiter must be column-0 unless using `<<-` with
+                # tabs; YAML run blocks make that brittle).
+                comment_body='**Automated label removal.** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD (CI green + reviewer-identity APPROVED + Codex cleared). Removed `needs-external-review` so Label Gate passes and the PR can merge. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#195) for the trigger doctrine.'
+                gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
+                  || echo "::warning::Failed to post attribution comment for PR #$PR"
+                ;;
+              1)
+                echo "Gate not yet met — leaving label in place."
+                ;;
+              3)
+                echo "::error::codex-review-check.sh config/arg error (rc=3) on PR #$PR"
+                # Don't exit non-zero mid-loop — keep sweeping other
+                # PRs on a multi-PR workflow_run trigger. But set
+                # the sentinel so the job exits non-zero at the end.
+                had_infra_error=1
+                ;;
+              *)
+                echo "::error::codex-review-check.sh unexpected rc=$rc on PR #$PR (contract drift — failing job)"
+                # Fail-closed: any rc outside 0/1/3 is contract drift.
+                # Better to fail loudly than leave the label stuck
+                # behind a silently-broken gate. CR Major on PR #202 r3.
+                had_infra_error=1
+                ;;
+            esac
+            echo "::endgroup::"
+          done <<<"$PR_NUMBERS"
+          exit "$had_infra_error"
