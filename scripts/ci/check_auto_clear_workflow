@@ -122,6 +122,31 @@ else
   echo "  FAIL: opt-out parser must strip trailing YAML comments (CR Major on PR #213)" >&2
 fi
 
+# CR Major on PR #213 r2: evaluate-and-clear must skip on cron runs.
+# Without this guard, every 15-min sweep paid for a checkout-only
+# no-op job before the event resolver decided 'schedule' was
+# unsupported.
+if grep -qE -- "github\.event_name != 'schedule'" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: evaluate-and-clear skips schedule events (cron runs only the sweep job)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: evaluate-and-clear must skip schedule events (CR Major on PR #213 r2)" >&2
+fi
+
+# CR Major on PR #213 r2: sweep must capture `gh pr list` exit
+# status separately, not via process substitution into mapfile (which
+# swallows the producer's exit code, silently turning a gh failure
+# into "0 PRs found").
+if grep -qE -- 'if ! prs_raw=\$\(gh pr list' "$WORKFLOW" && \
+   grep -qE -- 'echo "::error::Failed to list open PRs' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: sweep captures gh pr list exit status (no silent failure on gh error)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: sweep must capture gh pr list status separately, not via mapfile <(...) (CR Major on PR #213 r2)" >&2
+fi
+
 # workflow_run must listen to the EXACT upstream workflow names. A
 # rename or typo on either side would silently break the auto-clear
 # without this test catching it. CR Trivial on PR #202 r2.

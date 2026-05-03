@@ -56,7 +56,12 @@ jobs:
     # Self-fire loop guard: when this workflow's label removal fires
     # the `unlabeled` event for `needs-external-review`, skip — we
     # just removed it; nothing to do.
+    # Schedule guard: cron runs the scheduled-sweep job below; the
+    # event-driven path is moot for scheduled invocations. CR Major
+    # on PR #213 r2 — without this, every 15-min cron paid for an
+    # extra checkout-only no-op job.
     if: |
+      github.event_name != 'schedule' &&
       !(
         github.event_name == 'pull_request_target' &&
         github.event.action == 'unlabeled' &&
@@ -267,11 +272,23 @@ jobs:
           # processes ALL matching PRs in repos with high open-PR
           # counts. 500 is comfortably above any realistic limit for
           # a single repo's needs-external-review queue (would imply
-          # ~500 PRs awaiting review — itself an alarm). If we ever
-          # see this hit in practice, paginate via the search API.
-          mapfile -t prs < <(gh pr list --repo "$REPO" --state open \
+          # ~500 PRs awaiting review — itself an alarm).
+          # CR Major on PR #213 r2: capture gh output + exit status
+          # separately. The prior `mapfile -t prs < <(gh ...)` form
+          # swallowed gh's exit code via process substitution, so a
+          # gh failure (auth, rate limit, network) silently became
+          # "0 PRs found" and the sweep no-op'd instead of failing
+          # loudly.
+          if ! prs_raw=$(gh pr list --repo "$REPO" --state open \
             --label needs-external-review --limit 500 \
-            --json number --jq '.[].number')
+            --json number --jq '.[].number'); then
+            echo "::error::Failed to list open PRs with needs-external-review on $REPO"
+            exit 1
+          fi
+          prs=()
+          if [ -n "$prs_raw" ]; then
+            mapfile -t prs <<<"$prs_raw"
+          fi
           echo "Found ${#prs[@]} PR(s) with needs-external-review on $REPO"
           if [ "${#prs[@]}" -eq 0 ]; then
             echo "prs=" >> "$GITHUB_OUTPUT"
