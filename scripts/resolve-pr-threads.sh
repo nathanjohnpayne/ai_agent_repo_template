@@ -219,21 +219,31 @@ QUERY='
     }
   }
 '
+# Resolve the read PAT once. CR Major on PR #194 r3 caught that
+# `GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" gh ...`
+# sets GH_TOKEN to an empty string when both env vars are unset, and
+# gh CLI treats an empty GH_TOKEN as "env var present, refuse keyring
+# fallback" — meaning the script silently fails to authenticate at all
+# when run outside a preflight session. Conditional set is required.
+READ_GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}"
+gh_read() {
+  if [ -n "$READ_GH_TOKEN" ]; then
+    GH_TOKEN="$READ_GH_TOKEN" gh "$@"
+  else
+    gh "$@"
+  fi
+}
 while :; do
-  # Read-path: pin to preflight reviewer PAT per the auth split
-  # documented in the repo's machine-level CLAUDE.md. Falls through
-  # to the active keyring account only when preflight wasn't run
-  # (env var unset / empty).
+  # Read-path: pin to preflight reviewer PAT when available; otherwise
+  # let gh use its keyring fallback (no empty-GH_TOKEN trap).
   if [ -z "$CURSOR" ]; then
-    PAGE=$(GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" \
-      gh api graphql -f query="$QUERY" \
+    PAGE=$(gh_read api graphql -f query="$QUERY" \
       -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -F cursor=null 2>&1) || {
       echo "GraphQL query failed: $PAGE" >&2
       exit 2
     }
   else
-    PAGE=$(GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" \
-      gh api graphql -f query="$QUERY" \
+    PAGE=$(gh_read api graphql -f query="$QUERY" \
       -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -f cursor="$CURSOR" 2>&1) || {
       echo "GraphQL query failed: $PAGE" >&2
       exit 2

@@ -181,11 +181,13 @@ keyring active is your agent identity. No switch needed for commits.
      ```
 
      For each unresolved bot-authored thread where the finding is
-     addressed on the current HEAD, resolve via:
+     addressed on the current HEAD, resolve via (same PAT pinning
+     as the read above — the mutation is reviewer-attributed):
 
      ```bash
-     gh api graphql -f query='mutation { resolveReviewThread(input:
-       {threadId: "THREAD_ID"}) { thread { isResolved } } }'
+     GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api graphql -f query='
+       mutation { resolveReviewThread(input:
+         {threadId: "THREAD_ID"}) { thread { isResolved } } }'
      ```
 
      Same agent-prohibitions apply: do not resolve human-authored

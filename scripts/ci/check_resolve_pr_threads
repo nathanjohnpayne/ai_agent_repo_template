@@ -324,6 +324,127 @@ else
   echo "$out" | sed 's/^/      /' >&2
 fi
 
+# ── Test 6: two-page pagination + cursor accumulation
+# CR Major on PR #194 r3 — without exercising the multi-page path,
+# a paginator regression on the happy path stays green. Stub returns
+# page 1 with hasNextPage=true + endCursor="CURSOR1", page 2 with
+# hasNextPage=false. Final state: 2 nodes accumulated, totalCount=2,
+# script exits 0. Also asserts the 2nd call's argv contains
+# `-f cursor=CURSOR1` (the post-first-call branch is exercised).
+echo
+echo "resolve-pr-threads.sh two-page pagination test (CR Major on #194)"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+echo "$@" >> "$GH_ARGV_LOG"
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        # Determine page from whether `cursor=CURSOR1` is in argv.
+        if [[ " $* " == *" cursor=CURSOR1 "* ]]; then
+          # Page 2: remaining node, no next page.
+          cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T2","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"b","body":"y","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}}
+]}}}}}
+JSON
+        else
+          # Page 1: first node, hasNextPage=true.
+          cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"pageInfo":{"hasNextPage":true,"endCursor":"CURSOR1"},"nodes":[
+  {"id":"T1","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}}
+]}}}}}
+JSON
+        fi
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "abc123def"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+GH_ARGV_LOG="$SCRATCH/gh-argv-page.log"
+: > "$GH_ARGV_LOG"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+# Must (a) exit 0 with "no unresolved threads" (both nodes are
+# isResolved=true and totalCount=2 matches accumulated), (b) include
+# `-f cursor=CURSOR1` in the second-page call argv.
+if [ "$rc" = "0" ] && echo "$out" | grep -q "No unresolved threads" && grep -qE -- '-f cursor=CURSOR1' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: page 2 fetched with -f cursor=CURSOR1; accumulated count matches totalCount"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pagination regression (rc=$rc)" >&2
+  echo "      output:" >&2; echo "$out" | sed 's/^/        /' >&2
+  echo "      argv log:" >&2; sed 's/^/        /' "$GH_ARGV_LOG" >&2
+fi
+
+# ── Test 7: keyring fallback when neither preflight nor GH_TOKEN set
+# CR Major on PR #194 r3 — the prior `GH_TOKEN="${VAR:-${OTHER:-}}"`
+# pattern set GH_TOKEN to empty when both unset, blocking gh's
+# keyring fallback. The conditional gh_read wrapper must NOT pass
+# GH_TOKEN= (empty) when no PAT is available.
+echo
+echo "resolve-pr-threads.sh keyring fallback (no empty GH_TOKEN trap)"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+echo "ENV_GH_TOKEN_PRESENT=${GH_TOKEN+yes}" >> "$GH_ARGV_LOG"
+echo "ENV_GH_TOKEN_VALUE=${GH_TOKEN:-<unset>}" >> "$GH_ARGV_LOG"
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "abc123def"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+GH_ARGV_LOG="$SCRATCH/gh-argv-keyring.log"
+: > "$GH_ARGV_LOG"
+
+# Crucially: unset both PAT vars in the subshell environment.
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+# Stub captured env state. Assert GH_TOKEN was NOT set (or NOT empty).
+# An empty GH_TOKEN would show ENV_GH_TOKEN_PRESENT=yes + ENV_GH_TOKEN_VALUE=<unset>
+# (which renders as just the unset placeholder). Need to confirm absence
+# of the "ENV_GH_TOKEN_PRESENT=yes" line on graphql calls.
+if [ "$rc" = "0" ] && ! grep -q "^ENV_GH_TOKEN_PRESENT=yes$" "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: GH_TOKEN unset (not empty) when no PAT available — keyring fallback engaged"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: GH_TOKEN was set (possibly empty) — keyring fallback would be blocked (rc=$rc)" >&2
+  echo "      env capture:" >&2; sed 's/^/        /' "$GH_ARGV_LOG" >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "check_resolve_pr_threads: PASS ($pass tests)"
