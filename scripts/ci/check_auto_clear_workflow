@@ -47,7 +47,9 @@ else
 fi
 
 # ── Test 2: required triggers present
-for trig in 'pull_request_target' 'pull_request_review' 'check_suite'; do
+# Codex P1 on PR #202 r1: workflow_run replaces check_suite (which
+# doesn't fire for Actions-created suites).
+for trig in 'pull_request_target' 'pull_request_review' 'workflow_run'; do
   if grep -qE "^[[:space:]]+${trig}:" "$WORKFLOW"; then
     pass=$((pass + 1))
     echo "  PASS: trigger '$trig' configured"
@@ -56,6 +58,16 @@ for trig in 'pull_request_target' 'pull_request_review' 'check_suite'; do
     echo "  FAIL: missing required trigger '$trig'" >&2
   fi
 done
+
+# Negative: workflow_run is the canonical post-CI signal. check_suite
+# would silently fail to fire for GitHub-Actions-created suites.
+if grep -qE "^[[:space:]]+check_suite:" "$WORKFLOW"; then
+  fail=$((fail + 1))
+  echo "  FAIL: check_suite trigger should NOT be present (codex P1 on #202 — doesn't fire for Actions suites)" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: check_suite trigger absent (regression closed for codex P1 on #202)"
+fi
 
 # ── Test 3: self-fire loop guard present
 if grep -qE "github\.event\.action == 'unlabeled'" "$WORKFLOW" && \
@@ -87,19 +99,25 @@ echo "auto-clear-blocking-labels.yml PR-number resolution tests"
 
 dispatch() {
   # Mirrors the workflow's case statement. Args: event_name,
-  # event_json (passed via stdin to jq).
+  # event_json. Unsupported events return 0 (matching the workflow's
+  # `exit 0  # don't fail; just skip` semantics — CR Minor on PR #202).
   local event_name="$1"
   local event_json="$2"
   case "$event_name" in
     pull_request_target|pull_request_review)
       jq -r '.pull_request.number' <<<"$event_json"
       ;;
-    check_suite)
-      jq -r '.check_suite.pull_requests[].number' <<<"$event_json"
+    workflow_run)
+      local conclusion
+      conclusion=$(jq -r '.workflow_run.conclusion' <<<"$event_json")
+      if [ "$conclusion" != "success" ]; then
+        return 0  # workflow's "skip on non-success" path
+      fi
+      jq -r '.workflow_run.pull_requests[].number' <<<"$event_json"
       ;;
     *)
       echo "Unsupported event: $event_name" >&2
-      return 1
+      return 0  # workflow exit 0 on unsupported (don't fail; just skip)
       ;;
   esac
 }
@@ -124,36 +142,48 @@ else
   echo "  FAIL: pull_request_review dispatch (got: $out)" >&2
 fi
 
-# check_suite → multiple PRs
-out=$(dispatch check_suite '{"check_suite":{"pull_requests":[{"number":7},{"number":8}]}}')
+# workflow_run success → multiple PRs
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"success","pull_requests":[{"number":7},{"number":8}]}}')
 expected=$'7\n8'
 if [ "$out" = "$expected" ]; then
   pass=$((pass + 1))
-  echo "  PASS: check_suite enumerates multiple PRs"
+  echo "  PASS: workflow_run (success) enumerates multiple PRs"
 else
   fail=$((fail + 1))
-  echo "  FAIL: check_suite dispatch (got: $out)" >&2
+  echo "  FAIL: workflow_run (success) dispatch (got: $out)" >&2
 fi
 
-# check_suite with empty pull_requests → empty output (script then
-# skips per the `if [ -z "$prs" ]` guard upstream)
-out=$(dispatch check_suite '{"check_suite":{"pull_requests":[]}}')
+# workflow_run failure → empty (don't bother re-evaluating gate when
+# the upstream workflow itself failed)
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"failure","pull_requests":[{"number":7}]}}')
 if [ -z "$out" ]; then
   pass=$((pass + 1))
-  echo "  PASS: check_suite with no PRs produces empty output (will be skipped)"
+  echo "  PASS: workflow_run (failure conclusion) skips re-evaluation"
 else
   fail=$((fail + 1))
-  echo "  FAIL: check_suite empty PRs should yield empty (got: $out)" >&2
+  echo "  FAIL: workflow_run failure should produce empty (got: $out)" >&2
 fi
 
-# Unsupported event → error (workflow exit 0 path with stderr message)
+# workflow_run with empty pull_requests → empty (script then skips
+# per the `if [ -z "$prs" ]` guard upstream)
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"success","pull_requests":[]}}')
+if [ -z "$out" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: workflow_run with no PRs produces empty output (will be skipped)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow_run empty PRs should yield empty (got: $out)" >&2
+fi
+
+# Unsupported event → exit 0 with stderr message (matches workflow
+# behavior; CR Minor on PR #202 r1 fixed the prior return-1 mismatch)
 set +e
 out=$(dispatch wat '{}' 2>&1)
 rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "Unsupported event"; then
+if [ "$rc" = "0" ] && echo "$out" | grep -q "Unsupported event"; then
   pass=$((pass + 1))
-  echo "  PASS: unsupported event returns 1 with clear stderr"
+  echo "  PASS: unsupported event returns 0 with clear stderr (matches workflow)"
 else
   fail=$((fail + 1))
   echo "  FAIL: unsupported event handling (rc=$rc, out=$out)" >&2
