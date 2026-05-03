@@ -343,9 +343,14 @@ keyring active is your agent identity. No switch needed for commits.
        (`.github/workflows/auto-clear-blocking-labels.yml`, #191/#195)
        usually removes the label automatically once `codex-review-check.sh`
        clears the merge gate on `pull_request_target` /
-       `pull_request_review` / `workflow_run` events.
+       `pull_request_review` / `workflow_run` events. A 15-min `schedule`
+       sweep (#197) catches the 👍-after-last-push case where no
+       event-driven trigger fires; opt-out via
+       `auto_clear_labels.scheduled_sweep_enabled: false` in
+       `.github/review-policy.yml`.
      - `request-label-removal.sh` is the fallback when no triggering
-       event arrived (or the gate is genuinely not yet met).
+       event arrived AND the sweep hasn't yet fired (or the gate is
+       genuinely not yet met).
      - `needs-human-review` and `policy-violation` remain manual-only
        by design.
 

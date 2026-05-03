@@ -10,12 +10,14 @@
 #
 # Note for `needs-external-review`: the `auto-clear-blocking-labels.yml`
 # workflow (#191/#195) usually removes that label automatically once
-# `scripts/codex-review-check.sh` clears the merge gate. Use this script
-# for `needs-external-review` only when the auto-clear hasn't fired (no
-# pull_request_target / pull_request_review / workflow_run event arrived
-# in a reasonable window) — typically rare. For `needs-human-review`
-# and `policy-violation`, this script is the only path; both remain
-# manual-only by design.
+# `scripts/codex-review-check.sh` clears the merge gate. The workflow
+# fires on pull_request_target / pull_request_review / workflow_run
+# events (event-driven path) and on a 15-minute `schedule` cron
+# (#197 — catches the 👍-after-last-push case). Use this script for
+# `needs-external-review` only when neither the event-driven path
+# nor the sweep has fired in a reasonable window — typically rare.
+# For `needs-human-review` and `policy-violation`, this script is
+# the only path; both remain manual-only by design.
 #
 # Usage:
 #   scripts/request-label-removal.sh <PR#> <label>
@@ -107,7 +109,7 @@ fi
 # message so the human knows the manual ask is a fallback path.
 AUTOCLEAR_NOTE=""
 if [ "$LABEL" = "needs-external-review" ]; then
-  AUTOCLEAR_NOTE=$'\n\n_Note: `auto-clear-blocking-labels.yml` normally removes this label automatically once `codex-review-check.sh` clears the merge gate. If you\'re seeing this ask, the workflow either didn\'t fire (no `pull_request_target` / `pull_request_review` / `workflow_run` event) or the gate is genuinely not yet met. Manual removal is the fallback._'
+  AUTOCLEAR_NOTE=$'\n\n_Note: `auto-clear-blocking-labels.yml` normally removes this label automatically once `codex-review-check.sh` clears the merge gate (event-driven on `pull_request_target` / `pull_request_review` / `workflow_run`, plus a 15-min `schedule` sweep). If you\'re seeing this ask, none of those triggers fired AND the sweep hasn\'t yet caught it (or the gate is genuinely not yet met). Manual removal is the fallback._'
 fi
 
 BODY="@nathanjohnpayne — this PR is blocked only on the \`$LABEL\` label.
