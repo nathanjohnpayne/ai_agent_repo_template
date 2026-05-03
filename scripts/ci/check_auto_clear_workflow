@@ -95,21 +95,28 @@ else
   echo "  FAIL: checkout MUST pin ref to default_branch (CR Critical on #202 r2)" >&2
 fi
 
-# Least-privilege permissions: only the expected scopes should be
-# present. The security pin above guards checkout but doesn't catch
-# the case where the workflow later gains broader write scopes
-# (e.g., `actions: write`, `issues: write`, etc.). CR Major on PR
-# #202 r3 — codify the expected permission set so any future
-# scope expansion is surfaced as a CI failure.
-if grep -qE '^[[:space:]]+pull-requests:[[:space:]]+write$' "$WORKFLOW" && \
-   grep -qE '^[[:space:]]+contents:[[:space:]]+read$' "$WORKFLOW" && \
-   grep -qE '^[[:space:]]+checks:[[:space:]]+read$' "$WORKFLOW" && \
-   ! grep -qE '^[[:space:]]+(actions|attestations|deployments|discussions|id-token|issues|models|packages|pages|security-events|statuses):[[:space:]]+write$' "$WORKFLOW"; then
+# Least-privilege permissions: parse the permissions block and
+# compare against the EXACT expected set, not a denylist. Codifies
+# the expected permission shape so any drift (added scope, changed
+# read↔write) is surfaced as a CI failure. CR Major on PR #202 r4
+# (denylist approach was incomplete — missed artifact-metadata,
+# repository-projects, vulnerability-alerts).
+perm_block=$(
+  awk '
+    /^permissions:/ {in_block=1; next}
+    in_block && /^[^[:space:]]/ {exit}
+    in_block && NF { sub(/^[[:space:]]+/, "", $0); print }
+  ' "$WORKFLOW" | sort
+)
+expected_perms=$'checks: read\ncontents: read\npull-requests: write'
+if [ "$perm_block" = "$expected_perms" ]; then
   pass=$((pass + 1))
-  echo "  PASS: workflow permissions stay least-privilege (only pull-requests:write + contents/checks:read)"
+  echo "  PASS: workflow permissions exactly match the least-privilege set"
 else
   fail=$((fail + 1))
-  echo "  FAIL: workflow permissions drifted from the expected least-privilege set" >&2
+  echo "  FAIL: workflow permissions drifted from expected least-privilege set" >&2
+  echo "      expected:" >&2; echo "$expected_perms" | sed 's/^/        /' >&2
+  echo "      got:" >&2; echo "$perm_block" | sed 's/^/        /' >&2
 fi
 
 # Sentinel: rc=3 from codex-review-check.sh sets had_infra_error and
