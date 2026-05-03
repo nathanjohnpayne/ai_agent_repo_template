@@ -1,0 +1,9 @@
+{
+  "body": "Renames `Application.status` to `Application.lifecycle_state` across types + service layer + UI.",
+  "files": [
+    {"filename": "src/types/application.ts", "patch": "@@ -1,3 +1,3 @@\n-export type Application = { id: string, status: string };\n+export type Application = { id: string, lifecycle_state: string };"},
+    {"filename": "src/services/applications/get.ts", "patch": "@@ -3,3 +3,3 @@\n-  return { id, status };\n+  return { id, lifecycle_state };"},
+    {"filename": "src/components/ApplicationCard.tsx", "patch": "@@ -2,3 +2,3 @@\n-  <span>{app.status}</span>\n+  <span>{app.lifecycle_state}</span>"},
+    {"filename": "tests/applications.test.ts", "patch": "@@ -1,3 +1,3 @@\n-expect(app.status).toBe(\"draft\");\n+expect(app.lifecycle_state).toBe(\"draft\");"}
+  ]
+}

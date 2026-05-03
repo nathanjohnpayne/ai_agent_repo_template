@@ -1,0 +1,13 @@
+{
+  "body": "Wraps the application-claim flow in a Firestore transaction with a tombstone re-check.",
+  "files": [
+    {
+      "filename": "src/services/applications/claim.ts",
+      "patch": "@@ -10,5 +10,15 @@\n export async function claim(id: string, owner: string) {\n-  const ref = db.doc(`applications/${id}`);\n-  await ref.update({ owner });\n+  const ref = db.doc(`applications/${id}`);\n+  return runTransaction(db, async (tx) => {\n+    const snap = await tx.get(ref);\n+    if (!snap.exists()) throw new Error(\"gone\");\n+    if (snap.data().owner_uid !== owner) throw new Error(\"already claimed\");\n+    tx.update(ref, { owner, claimedAt: Date.now() });\n+  });\n }"
+    },
+    {
+      "filename": "src/transactions/index.ts",
+      "patch": "@@ -1 +1,2 @@\n+export { claim } from \"../services/applications/claim\";"
+    }
+  ]
+}
