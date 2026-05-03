@@ -69,6 +69,45 @@ else
   echo "  PASS: check_suite trigger absent (regression closed for codex P1 on #202)"
 fi
 
+# workflow_run must listen to the EXACT upstream workflow names. A
+# rename or typo on either side would silently break the auto-clear
+# without this test catching it. CR Trivial on PR #202 r2.
+for wf in 'PR Review Policy' 'Agent Review Pipeline' 'repo-lint'; do
+  if grep -qF -- "- \"$wf\"" "$WORKFLOW"; then
+    pass=$((pass + 1))
+    echo "  PASS: workflow_run listens to '$wf'"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: workflow_run missing '$wf'" >&2
+  fi
+done
+
+# SECURITY: checkout MUST pin to default branch ref for
+# pull_request_review safety. CR Critical on PR #202 r2 — without
+# the explicit ref, a malicious PR could supply its own version of
+# scripts/codex-review-check.sh and have it run with this workflow's
+# pull-requests:write permissions.
+if grep -qF "ref: \${{ github.event.repository.default_branch }}" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: checkout pinned to default_branch (security: blocks PR-controlled gate-script execution)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: checkout MUST pin ref to default_branch (CR Critical on #202 r2)" >&2
+fi
+
+# Sentinel: rc=3 from codex-review-check.sh sets had_infra_error and
+# the job exits non-zero at the end. Without this, gate-evaluation
+# infrastructure failures would silently leave the workflow green.
+# CR Major on PR #202 r2.
+if grep -qF "had_infra_error=1" "$WORKFLOW" && \
+   grep -qE 'exit "?\$had_infra_error"?' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: rc=3 sets infra-error sentinel + job exits non-zero on it"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: rc=3 from codex-review-check.sh must surface as job failure (sentinel + final exit)" >&2
+fi
+
 # ── Test 3: self-fire loop guard present
 if grep -qE "github\.event\.action == 'unlabeled'" "$WORKFLOW" && \
    grep -qE "github\.event\.label\.name == 'needs-external-review'" "$WORKFLOW"; then

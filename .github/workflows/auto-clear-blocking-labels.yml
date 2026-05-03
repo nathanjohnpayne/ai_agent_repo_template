@@ -58,6 +58,15 @@ jobs:
       - name: Checkout repo (for codex-review-check.sh)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          # SECURITY: pin to the default branch so we always run the
+          # TRUSTED copy of scripts/codex-review-check.sh — never the
+          # PR's own version. Without this, on pull_request_review
+          # events GITHUB_REF defaults to refs/pull/<N>/merge and
+          # actions/checkout pulls the PR's HEAD; combined with this
+          # workflow's `pull-requests: write` permission, a malicious
+          # PR could modify the gate script to remove arbitrary labels
+          # or post arbitrary comments. CR Critical on PR #202 r2.
+          ref: ${{ github.event.repository.default_branch }}
           # Need full history so codex-review-check can inspect the
           # PR HEAD against base. The script doesn't currently do that
           # but a future tightening might.
@@ -117,11 +126,16 @@ jobs:
           # codex-review-check.sh exits:
           #   0 = gate passes
           #   1 = gate fails (one or more of CI/reviewer/codex not met)
-          #   3 = config/arg error (real failure — bubble up)
+          #   3 = config/arg error (real infrastructure failure)
           # CR Major on PR #202 r1: every gh call gets explicit error
           # handling so a transient failure (rate limit, 5xx) on one
           # PR doesn't abort the sweep, AND no early gh failure is
           # silently swallowed by an asymmetric set -e/+e dance.
+          # CR Major on PR #202 r2: rc=3 (infrastructure error) sets a
+          # sentinel; after the sweep finishes we exit non-zero if any
+          # PR hit it, so the workflow doesn't go green when gate
+          # evaluation was actually impossible.
+          had_infra_error=0
           while IFS= read -r PR; do
             [ -z "$PR" ] && continue
             echo "::group::Evaluating PR #$PR"
@@ -163,9 +177,10 @@ jobs:
                 ;;
               3)
                 echo "::error::codex-review-check.sh config/arg error (rc=3) on PR #$PR"
-                # Don't exit non-zero; one bad PR shouldn't kill the
-                # whole sweep on workflow_run events that may have
-                # multiple PRs attached.
+                # Don't exit non-zero mid-loop — keep sweeping other
+                # PRs on a multi-PR workflow_run trigger. But set
+                # the sentinel so the job exits non-zero at the end.
+                had_infra_error=1
                 ;;
               *)
                 echo "::warning::codex-review-check.sh unexpected rc=$rc on PR #$PR"
@@ -173,3 +188,4 @@ jobs:
             esac
             echo "::endgroup::"
           done <<<"$PR_NUMBERS"
+          exit "$had_infra_error"
