@@ -167,10 +167,12 @@ jobs:
                   echo "::endgroup::"
                   continue
                 fi
-                gh pr comment "$PR" --repo "$REPO" --body "$(cat <<'COMMENT'
-                **Automated label removal.** \`scripts/codex-review-check.sh\` cleared the merge gate on this HEAD (CI green + reviewer-identity APPROVED + Codex cleared). Removed \`needs-external-review\` so Label Gate passes and the PR can merge. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#195) for the trigger doctrine.
-                COMMENT
-                )" || echo "::warning::Failed to post attribution comment for PR #$PR"
+                # Direct string body (NOT a heredoc — heredoc closing
+                # delimiter must be column-0 unless using `<<-` with
+                # tabs; YAML run blocks make that brittle).
+                comment_body='**Automated label removal.** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD (CI green + reviewer-identity APPROVED + Codex cleared). Removed `needs-external-review` so Label Gate passes and the PR can merge. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#195) for the trigger doctrine.'
+                gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
+                  || echo "::warning::Failed to post attribution comment for PR #$PR"
                 ;;
               1)
                 echo "Gate not yet met — leaving label in place."

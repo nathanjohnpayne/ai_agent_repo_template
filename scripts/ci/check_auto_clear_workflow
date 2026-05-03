@@ -159,6 +159,56 @@ else
   echo "  FAIL: workflow either misses the target label or auto-removes a forbidden one" >&2
 fi
 
+# ── Test 4c: bash syntax check on every `run:` block
+# Extract each `run: |` block to a temp file and feed to `bash -n`.
+# Catches heredoc/subshell errors that only surface at runtime.
+# Real bug from PR #202 r5: `gh pr comment ... --body "$(cat <<'COMMENT'
+# ... COMMENT )"` had the closing `COMMENT` indented, which is
+# invalid heredoc syntax — this test would have caught it pre-merge.
+echo
+echo "auto-clear-blocking-labels.yml bash syntax test"
+
+block_dir=$(mktemp -d)
+# awk extracts each `run: |` block to a separate file in $block_dir.
+awk -v outdir="$block_dir" '
+  /^[[:space:]]+run:[[:space:]]+\|[[:space:]]*$/ {
+    if (in_run) { close(outfile) }
+    n++; outfile = outdir "/block-" n ".sh"
+    match($0, /^[[:space:]]+/); base_indent = RLENGTH
+    in_run = 1; next
+  }
+  in_run && /^[^[:space:]]/ {
+    close(outfile); in_run = 0; next
+  }
+  in_run {
+    # Strip the YAML run-block indentation (base_indent + 2 spaces).
+    sub("^[[:space:]]{" (base_indent + 2) "}", "")
+    print > outfile
+  }
+  END { if (in_run) close(outfile) }
+' "$WORKFLOW"
+
+extracted_count=$(ls -1 "$block_dir" 2>/dev/null | wc -l | tr -d ' ')
+syntax_errors=0
+for f in "$block_dir"/block-*.sh; do
+  [ -f "$f" ] || continue
+  if ! err=$(bash -n "$f" 2>&1); then
+    fail=$((fail + 1))
+    syntax_errors=$((syntax_errors + 1))
+    echo "  FAIL: bash syntax error in $(basename "$f")" >&2
+    echo "$err" | sed 's/^/    /' >&2
+  fi
+done
+rm -rf "$block_dir"
+
+if [ "$syntax_errors" -eq 0 ] && [ "$extracted_count" -gt 0 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: all $extracted_count run blocks have valid bash syntax"
+elif [ "$extracted_count" = "0" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: extracted 0 run blocks (extraction logic broken?)" >&2
+fi
+
 # ── Test 5: PR-number resolution dispatch (extracted bash logic)
 # The workflow embeds this dispatch as inline bash. Extract the logic
 # pattern and exercise the three event shapes against canned
