@@ -95,6 +95,23 @@ else
   echo "  FAIL: checkout MUST pin ref to default_branch (CR Critical on #202 r2)" >&2
 fi
 
+# Least-privilege permissions: only the expected scopes should be
+# present. The security pin above guards checkout but doesn't catch
+# the case where the workflow later gains broader write scopes
+# (e.g., `actions: write`, `issues: write`, etc.). CR Major on PR
+# #202 r3 — codify the expected permission set so any future
+# scope expansion is surfaced as a CI failure.
+if grep -qE '^[[:space:]]+pull-requests:[[:space:]]+write$' "$WORKFLOW" && \
+   grep -qE '^[[:space:]]+contents:[[:space:]]+read$' "$WORKFLOW" && \
+   grep -qE '^[[:space:]]+checks:[[:space:]]+read$' "$WORKFLOW" && \
+   ! grep -qE '^[[:space:]]+(actions|attestations|deployments|discussions|id-token|issues|models|packages|pages|security-events|statuses):[[:space:]]+write$' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: workflow permissions stay least-privilege (only pull-requests:write + contents/checks:read)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow permissions drifted from the expected least-privilege set" >&2
+fi
+
 # Sentinel: rc=3 from codex-review-check.sh sets had_infra_error and
 # the job exits non-zero at the end. Without this, gate-evaluation
 # infrastructure failures would silently leave the workflow green.
@@ -119,11 +136,15 @@ else
 fi
 
 # ── Test 4: scope discipline — only needs-external-review is removed
-if grep -qE 'remove-label needs-external-review' "$WORKFLOW" && \
-   ! grep -qE 'remove-label needs-human-review' "$WORKFLOW" && \
-   ! grep -qE 'remove-label policy-violation' "$WORKFLOW"; then
+# CR Major on PR #202 r3: tighten the positive grep to the actual
+# `gh pr edit ... --remove-label` executable line, not anywhere in
+# the file (header comments/attribution-message would otherwise
+# satisfy the match even if the executable line regressed).
+if grep -qE 'gh pr edit .+--remove-label needs-external-review' "$WORKFLOW" && \
+   ! grep -qE 'gh pr edit .+--remove-label needs-human-review' "$WORKFLOW" && \
+   ! grep -qE 'gh pr edit .+--remove-label policy-violation' "$WORKFLOW"; then
   pass=$((pass + 1))
-  echo "  PASS: scope discipline — only needs-external-review is auto-removed"
+  echo "  PASS: scope discipline — only needs-external-review is auto-removed (executable line)"
 else
   fail=$((fail + 1))
   echo "  FAIL: workflow either misses the target label or auto-removes a forbidden one" >&2

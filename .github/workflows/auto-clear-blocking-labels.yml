@@ -183,7 +183,11 @@ jobs:
                 had_infra_error=1
                 ;;
               *)
-                echo "::warning::codex-review-check.sh unexpected rc=$rc on PR #$PR"
+                echo "::error::codex-review-check.sh unexpected rc=$rc on PR #$PR (contract drift — failing job)"
+                # Fail-closed: any rc outside 0/1/3 is contract drift.
+                # Better to fail loudly than leave the label stuck
+                # behind a silently-broken gate. CR Major on PR #202 r3.
+                had_infra_error=1
                 ;;
             esac
             echo "::endgroup::"
