@@ -69,6 +69,84 @@ else
   echo "  PASS: check_suite trigger absent (regression closed for codex P1 on #202)"
 fi
 
+# Schedule trigger present (#197 sub-C of #191) — catches the
+# 👍-after-last-push case where no event-driven trigger fires.
+# CR Minor on PR #213: anchor to the actual cron entry (not just
+# any `schedule:` / `cron:` text anywhere) so a comment couldn't
+# satisfy the assertion.
+if grep -qE "^[[:space:]]+schedule:" "$WORKFLOW" && \
+   grep -qF -- "- cron: '*/15 * * * *'" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: schedule trigger configured with 15-min cron (#197)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: missing schedule trigger or expected cron entry (#197 sub-C of #191)" >&2
+fi
+
+# scheduled-sweep job exists and is gated to schedule-only events.
+# Anchor to the executable `if:` line so a string in a comment
+# couldn't satisfy the assertion. CR Minor on PR #213.
+if grep -qE "^[[:space:]]+scheduled-sweep:" "$WORKFLOW" && \
+   grep -qE "^[[:space:]]+if:[[:space:]]+github\.event_name == 'schedule'" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: scheduled-sweep job gated by executable 'if: ... schedule' line"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: scheduled-sweep job missing or not gated to schedule events (executable line)" >&2
+fi
+
+# CR Major on PR #213: gh pr list defaults to --limit 30. The sweep
+# must use a higher limit so repos with many open needs-external-review
+# PRs get them ALL processed, not just the first 30.
+# `gh pr list` is split across multiple lines via shell continuation,
+# so the assertion is split too: `gh pr list` exists AND `--limit
+# <≥100>` appears within 5 lines after it.
+if grep -qE -- 'gh pr list' "$WORKFLOW" && \
+   awk '/gh pr list/,/[^\\\\]$/' "$WORKFLOW" | grep -qE -- '--limit [1-9][0-9]{2,}'; then
+  pass=$((pass + 1))
+  echo "  PASS: gh pr list uses --limit ≥100 (handles >30-PR repos)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gh pr list must use --limit ≥100 to override default of 30 (CR Major on PR #213)" >&2
+fi
+
+# CR Major on PR #213: opt-out parser must strip trailing YAML
+# comments. `scheduled_sweep_enabled: false  # opt out` was being
+# parsed as `false#optout`. The fix is `sub(/#.*/, "")` before the
+# value extraction.
+if grep -qE 'sub\(/#\.\*/, ""\)' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: opt-out parser strips trailing YAML comments"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: opt-out parser must strip trailing YAML comments (CR Major on PR #213)" >&2
+fi
+
+# CR Major on PR #213 r2: evaluate-and-clear must skip on cron runs.
+# Without this guard, every 15-min sweep paid for a checkout-only
+# no-op job before the event resolver decided 'schedule' was
+# unsupported.
+if grep -qE -- "github\.event_name != 'schedule'" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: evaluate-and-clear skips schedule events (cron runs only the sweep job)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: evaluate-and-clear must skip schedule events (CR Major on PR #213 r2)" >&2
+fi
+
+# CR Major on PR #213 r2: sweep must capture `gh pr list` exit
+# status separately, not via process substitution into mapfile (which
+# swallows the producer's exit code, silently turning a gh failure
+# into "0 PRs found").
+if grep -qE -- 'if ! prs_raw=\$\(gh pr list' "$WORKFLOW" && \
+   grep -qE -- 'echo "::error::Failed to list open PRs' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: sweep captures gh pr list exit status (no silent failure on gh error)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: sweep must capture gh pr list status separately, not via mapfile <(...) (CR Major on PR #213 r2)" >&2
+fi
+
 # workflow_run must listen to the EXACT upstream workflow names. A
 # rename or typo on either side would silently break the auto-clear
 # without this test catching it. CR Trivial on PR #202 r2.
@@ -170,6 +248,11 @@ echo "auto-clear-blocking-labels.yml bash syntax test"
 
 block_dir=$(mktemp -d)
 # awk extracts each `run: |` block to a separate file in $block_dir.
+# Exit a run block when ANY non-empty line drops to indent <= base
+# (the `run:` line's own indent), not just column-0. This catches
+# job/step transitions like `  scheduled-sweep:` (under `jobs:`) and
+# `      - name: Foo` (under steps:) which would otherwise be
+# treated as continuations of the prior bash block.
 awk -v outdir="$block_dir" '
   /^[[:space:]]+run:[[:space:]]+\|[[:space:]]*$/ {
     if (in_run) { close(outfile) }
@@ -177,10 +260,12 @@ awk -v outdir="$block_dir" '
     match($0, /^[[:space:]]+/); base_indent = RLENGTH
     in_run = 1; next
   }
-  in_run && /^[^[:space:]]/ {
-    close(outfile); in_run = 0; next
-  }
+  in_run && NF == 0 { print > outfile; next }
   in_run {
+    match($0, /^[[:space:]]*/); cur_indent = RLENGTH
+    if (cur_indent <= base_indent) {
+      close(outfile); in_run = 0; next
+    }
     # Strip the YAML run-block indentation (base_indent + 2 spaces).
     sub("^[[:space:]]{" (base_indent + 2) "}", "")
     print > outfile
