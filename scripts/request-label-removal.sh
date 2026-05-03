@@ -8,6 +8,15 @@
 # posts a templated PR comment and (optionally) pings the human via
 # iMessage so they can clear the label without opening a chat window.
 #
+# Note for `needs-external-review`: the `auto-clear-blocking-labels.yml`
+# workflow (#191/#195) usually removes that label automatically once
+# `scripts/codex-review-check.sh` clears the merge gate. Use this script
+# for `needs-external-review` only when the auto-clear hasn't fired (no
+# pull_request_target / pull_request_review / workflow_run event arrived
+# in a reasonable window) — typically rare. For `needs-human-review`
+# and `policy-violation`, this script is the only path; both remain
+# manual-only by design.
+#
 # Usage:
 #   scripts/request-label-removal.sh <PR#> <label>
 #   scripts/request-label-removal.sh <PR#> <label> --reason "<short reason>"
@@ -93,6 +102,14 @@ if [ -n "$REASON" ]; then
   REASON_BLOCK=$'\n\n**Context:** '"$REASON"
 fi
 
+# For needs-external-review specifically, the auto-clear workflow
+# (#191/#195) usually handles removal. Surface that fact in the
+# message so the human knows the manual ask is a fallback path.
+AUTOCLEAR_NOTE=""
+if [ "$LABEL" = "needs-external-review" ]; then
+  AUTOCLEAR_NOTE=$'\n\n_Note: `auto-clear-blocking-labels.yml` normally removes this label automatically once `codex-review-check.sh` clears the merge gate. If you\'re seeing this ask, the workflow either didn\'t fire (no `pull_request_target` / `pull_request_review` / `workflow_run` event) or the gate is genuinely not yet met. Manual removal is the fallback._'
+fi
+
 BODY="@nathanjohnpayne — this PR is blocked only on the \`$LABEL\` label.
 
 Per [REVIEW_POLICY.md § Agent prohibitions](https://github.com/nathanjohnpayne/mergepath/blob/main/REVIEW_POLICY.md), agents do not remove this label. When you're ready, clear it from any device:
@@ -100,7 +117,7 @@ Per [REVIEW_POLICY.md § Agent prohibitions](https://github.com/nathanjohnpayne/
 - GitHub UI: Labels sidebar → click \`x\` on \`$LABEL\`
 - CLI: \`gh pr edit $PR_NUM --remove-label $LABEL\` $([ -n "$REPO" ] && echo "--repo $REPO")
 
-Auto-merge will fire as soon as the label is gone.${REASON_BLOCK}
+Auto-merge will fire as soon as the label is gone.${REASON_BLOCK}${AUTOCLEAR_NOTE}
 
 — posted by \`scripts/request-label-removal.sh\`"
 
