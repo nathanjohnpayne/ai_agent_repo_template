@@ -109,7 +109,7 @@ fi
 # message so the human knows the manual ask is a fallback path.
 AUTOCLEAR_NOTE=""
 if [ "$LABEL" = "needs-external-review" ]; then
-  AUTOCLEAR_NOTE=$'\n\n_Note: `auto-clear-blocking-labels.yml` normally removes this label automatically once `codex-review-check.sh` clears the merge gate (event-driven on `pull_request_target` / `pull_request_review` / `workflow_run`, plus a 15-min `schedule` sweep). If you\'re seeing this ask, none of those triggers fired AND the sweep hasn\'t yet caught it (or the gate is genuinely not yet met). Manual removal is the fallback._'
+  AUTOCLEAR_NOTE=$'\n\n_Note: `auto-clear-blocking-labels.yml` normally removes this label automatically once `codex-review-check.sh` clears the merge gate (event-driven on `pull_request_target` / `pull_request_review` / `workflow_run`, plus a 15-min `schedule` sweep — the sweep can be intentionally disabled via `auto_clear_labels.scheduled_sweep_enabled: false`). If you\'re seeing this ask, none of those triggers fired AND the sweep hasn\'t caught it yet (or is disabled, or the gate is genuinely not yet met). Manual removal is the fallback._'
 fi
 
 BODY="@nathanjohnpayne — this PR is blocked only on the \`$LABEL\` label.
