@@ -198,7 +198,16 @@ else
   FILES_JSON=$(echo "$FILES_JSON" | jq -s 'add // []' 2>/dev/null) || {
     echo "Error: failed to flatten gh pulls/files paginated response" >&2; exit 2
   }
-  PR_BODY=$(gh api "repos/$REPO/pulls/$PR_NUM" --jq '.body // ""' 2>/dev/null || echo "")
+  # PR body fetch failure must NOT silently mask body-only triggers
+  # (state-machine via "state machine" body mention, invariant via
+  # "invariant" body mention). Hard-fail with exit 2 instead of
+  # falling through with PR_BODY="" — codex r1 Phase 4b on PR #190
+  # caught the prior `|| echo ""` swallow + reproduced with stubbed gh.
+  PR_BODY=$(gh api "repos/$REPO/pulls/$PR_NUM" --jq '.body // ""' 2>&1) || {
+    echo "Error: failed to fetch PR body for $REPO#$PR_NUM: $PR_BODY" >&2
+    echo "       Body-only triggers (state-machine / invariant body mention) require this fetch to succeed." >&2
+    exit 2
+  }
 fi
 
 FILES_COUNT=$(echo "$FILES_JSON" | jq 'length' 2>/dev/null) || {

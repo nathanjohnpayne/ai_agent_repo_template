@@ -181,6 +181,47 @@ else
 fi
 
 echo
+echo "phase-4b-classifier.sh PR-body fetch failure tests (codex r1 Phase 4b on #190)"
+
+# Regression: when gh PR body fetch fails (network, missing PR, auth),
+# the classifier must hard-fail with exit 2 — NOT silently fall through
+# to PR_BODY="" and run trigger detectors with body-only signals
+# missing. Stub `gh` via PATH-prepended fake that exits non-zero on the
+# `gh api repos/.../pulls/{n}` call.
+SCRATCH_GH=$(mktemp -d)
+cat > "$SCRATCH_GH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+# Fake gh that fails on the PR-body fetch. The classifier calls
+# `gh api repos/$REPO/pulls/$PR_NUM --jq '.body // ""'` for the body;
+# return non-zero so the classifier's || guard fires.
+echo "Error: stubbed gh failure" >&2
+exit 1
+GH_STUB
+chmod +x "$SCRATCH_GH/gh"
+
+# Use a scratch policy to force complex-changes (so the script doesn't
+# short-circuit before reaching the body fetch).
+mkdir -p "$SCRATCH_GH/.github"
+echo "phase_4b_default: complex-changes" > "$SCRATCH_GH/.github/review-policy.yml"
+
+set +e
+# Drop --fixture so the script actually goes through the live API path
+# (which is what hits the PR body fetch). Set GH_TOKEN so the script
+# passes its empty-token guard before reaching the body fetch.
+out=$(cd "$SCRATCH_GH" && PATH="$SCRATCH_GH:$PATH" GH_TOKEN=stub-token bash "$ROOT/$CLASSIFIER" 99999 --repo nathanjohnpayne/mergepath 2>&1)
+rc=$?
+set -e
+if [ "$rc" = "2" ] && echo "$out" | grep -qE "failed to (fetch PR (files|body)|flatten gh)"; then
+  pass=$((pass + 1))
+  echo "  PASS: PR fetch failure → exit 2 with explicit error (no silent body-mask)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: PR fetch failure should exit 2 with clear error (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+rm -rf "$SCRATCH_GH"
+
+echo
 echo "phase-4b-classifier.sh argument-validation tests"
 
 # Bad PR# (non-integer) → exit 3
