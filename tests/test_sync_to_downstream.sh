@@ -130,6 +130,48 @@ echo "$filtered" | grep -q "scripts/keep-in-sync.sh" \
   && fail "--paths filter should have excluded scripts/keep-in-sync.sh"
 
 # ---------------------------------------------------------------------------
+# Missing-arg validation (CodeRabbit P-Minor on PR #215). Without the
+# guard, --repos / --paths with no value crashes under set -u.
+# ---------------------------------------------------------------------------
+set +e
+"$SCRIPT" --audit --repos 2>/dev/null
+arg_exit=$?
+set -e
+[[ "$arg_exit" -eq 2 ]] || fail "--repos with no arg should exit 2; got $arg_exit"
+
+set +e
+"$SCRIPT" --audit --paths 2>/dev/null
+arg_exit=$?
+set -e
+[[ "$arg_exit" -eq 2 ]] || fail "--paths with no arg should exit 2; got $arg_exit"
+
+# ---------------------------------------------------------------------------
+# .git-as-file (worktree) detection (Codex P2 on PR #215). The script
+# must accept consumer worktrees whose .git is a file, not a directory.
+# ---------------------------------------------------------------------------
+worktree_siblings="$WORKDIR/worktree-siblings"
+mkdir -p "$worktree_siblings/clean-consumer/scripts/hooks" \
+         "$worktree_siblings/clean-consumer/scripts/ci"
+cp "$MP/scripts/keep-in-sync.sh"   "$worktree_siblings/clean-consumer/scripts/keep-in-sync.sh"
+cp "$MP/scripts/hooks/the-hook.sh" "$worktree_siblings/clean-consumer/scripts/hooks/the-hook.sh"
+cp "$MP/scripts/ci/check_one"      "$worktree_siblings/clean-consumer/scripts/ci/check_one"
+cp "$MP/scripts/ci/check_two"      "$worktree_siblings/clean-consumer/scripts/ci/check_two"
+# Real worktrees write a `gitdir: <path>` line into a `.git` file.
+# A regular file with any content is enough for the existence-test;
+# we don't need git's actual worktree machinery for this assertion.
+echo "gitdir: $WORKDIR/fake.git" >"$worktree_siblings/clean-consumer/.git"
+
+set +e
+output=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$worktree_siblings" \
+  "$SCRIPT" --audit --no-clone --repos clean-consumer 2>&1)
+worktree_exit=$?
+set -e
+[[ "$worktree_exit" -eq 0 ]] \
+  || fail "worktree (.git as file) should be accepted as a sibling; got exit $worktree_exit, output: $output"
+echo "$output" | grep -q "no local worktree" \
+  && fail "worktree (.git as file) misclassified as missing"
+
+# ---------------------------------------------------------------------------
 # --version / --help smoke
 # ---------------------------------------------------------------------------
 "$SCRIPT" --version | grep -q "sync-to-downstream.sh" || fail "--version output unexpected"

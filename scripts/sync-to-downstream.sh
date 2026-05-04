@@ -33,22 +33,32 @@
 #                      "scripts/*", ".github/workflows/agent-review.yml").
 #   --no-clone         Don't clone-on-demand; only audit consumers with a
 #                      local sibling worktree under MERGEPATH_SIBLINGS_DIR.
+#   --no-refresh       Don't `git fetch` cached consumer clones before
+#                      comparing. Useful for offline/sandboxed audits;
+#                      may report stale results if the cache is old.
 #   --help, -h         Show this help.
 #   --version          Print version info.
 #
 # Environment:
-#   MERGEPATH_SIBLINGS_DIR  Default: $HOME/GitHub. If a directory at
+#   MERGEPATH_SIBLINGS_DIR  Default: $HOME/GitHub. If a `.git` entry at
 #                           $MERGEPATH_SIBLINGS_DIR/<consumer-name>/.git
-#                           exists, the audit reads from that local clone
-#                           (using the working tree as-is — drift against
-#                           your uncommitted edits is intentional behavior;
-#                           run `git stash` first if you want main only).
-#                           If the local clone is missing, the script falls
-#                           back to a cache clone under
+#                           exists (directory OR file — git worktrees use
+#                           a `.git` file), the audit reads from that
+#                           local clone (using the working tree as-is —
+#                           drift against your uncommitted edits is
+#                           intentional behavior; run `git stash` first
+#                           if you want main only). Sibling clones are
+#                           never auto-fetched/reset; that's the user's
+#                           working tree.
+#                           If the local clone is missing, the script
+#                           falls back to a cache clone under
 #                           MERGEPATH_SYNC_CACHE.
 #   MERGEPATH_SYNC_CACHE    Default: $HOME/.cache/mergepath-sync. Cache dir
 #                           for clone-on-demand. Per-consumer subdir holds
-#                           a depth=1 fetch of the consumer's default branch.
+#                           a depth=1 fetch of the consumer's default
+#                           branch. Cached clones are refreshed via
+#                           `git fetch && git reset --hard origin/HEAD`
+#                           before each audit (suppress with --no-refresh).
 #
 # Prerequisites:
 #   yq (mikefarah/yq, v4+)  brew install yq
@@ -131,21 +141,49 @@ require_manifest() {
 # --- consumer worktree resolution -------------------------------------------
 
 # Echo the path on disk where we should read the consumer's working tree.
-# Returns 0 if found, 1 if not. Caller chooses whether to clone-on-demand.
+# Returns 0 if found, 1 if not. Sets $RESOLVED_FROM to "siblings" or "cache"
+# so the caller knows whether to refresh-fetch (caches drift; siblings are
+# the user's authoritative working tree and must not be touched).
+#
+# Accepts both `.git` directory (regular clone) and `.git` file (git
+# worktree). Codex P2 on PR #215 caught the worktree case — the original
+# `-d` test misclassified worktrees as missing.
 resolve_consumer_worktree() {
   local consumer_name=$1
   local siblings_dir=${MERGEPATH_SIBLINGS_DIR:-$HOME/GitHub}
   local cache_dir=${MERGEPATH_SYNC_CACHE:-$HOME/.cache/mergepath-sync}
 
-  if [ -d "$siblings_dir/$consumer_name/.git" ]; then
+  if [ -e "$siblings_dir/$consumer_name/.git" ]; then
+    RESOLVED_FROM="siblings"
     echo "$siblings_dir/$consumer_name"
     return 0
   fi
-  if [ -d "$cache_dir/$consumer_name/.git" ]; then
+  if [ -e "$cache_dir/$consumer_name/.git" ]; then
+    RESOLVED_FROM="cache"
     echo "$cache_dir/$consumer_name"
     return 0
   fi
   return 1
+}
+
+# Bring a cached clone up to date with the consumer's default branch.
+# Skipped silently if the path was resolved from a sibling worktree —
+# refreshing a user's working tree would clobber uncommitted edits.
+# Codex P1 on PR #215 caught the stale-cache hazard.
+refresh_cached_clone() {
+  local cache_path=$1
+  log "refreshing cached clone at $cache_path"
+  # `origin/HEAD` is set by `gh repo clone`'s underlying `git clone` to
+  # the consumer's default branch. Resetting hard is safe here: this
+  # directory is the script's cache, not the user's worktree.
+  if ! git -C "$cache_path" fetch --depth=1 --quiet origin >&2; then
+    err "git fetch failed for cached clone $cache_path"
+    return 3
+  fi
+  if ! git -C "$cache_path" reset --hard --quiet origin/HEAD >&2; then
+    err "git reset --hard origin/HEAD failed for $cache_path"
+    return 3
+  fi
 }
 
 # Clone-on-demand into the cache. Depth=1 is fine for audit; we only
@@ -301,6 +339,7 @@ run_audit() {
     echo "$consumer_name ($consumer_repo)"
 
     local consumer_root
+    RESOLVED_FROM=""
     if ! consumer_root=$(resolve_consumer_worktree "$consumer_name"); then
       if [ "${AUDIT_NO_CLONE:-0}" = "1" ]; then
         echo "  ! no local worktree for $consumer_name (set MERGEPATH_SIBLINGS_DIR or drop --no-clone)"
@@ -309,6 +348,19 @@ run_audit() {
       fi
       if ! consumer_root=$(clone_consumer_to_cache "$consumer_name" "$consumer_repo"); then
         echo "  ! could not fetch $consumer_repo"
+        AUDIT_FETCH_ERROR=1
+        continue
+      fi
+      RESOLVED_FROM="cache"
+    fi
+    # If we're reading from a stale cache (resolved on the second branch
+    # of resolve_consumer_worktree), pull the latest default branch
+    # before comparing. Skip for sibling worktrees; that's the user's
+    # working tree and must not be auto-reset. Honors --no-refresh for
+    # offline / sandboxed runs.
+    if [ "$RESOLVED_FROM" = "cache" ] && [ "${AUDIT_NO_REFRESH:-0}" != "1" ]; then
+      if ! refresh_cached_clone "$consumer_root"; then
+        echo "  ! could not refresh cached clone for $consumer_name"
         AUDIT_FETCH_ERROR=1
         continue
       fi
@@ -384,15 +436,21 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --repos)
+      [ -z "${2:-}" ] && { err "missing argument for --repos"; usage; exit 2; }
       FILTER_REPOS="$2"
       shift 2
       ;;
     --paths)
+      [ -z "${2:-}" ] && { err "missing argument for --paths"; usage; exit 2; }
       FILTER_PATHS="$2"
       shift 2
       ;;
     --no-clone)
       AUDIT_NO_CLONE=1
+      shift
+      ;;
+    --no-refresh)
+      AUDIT_NO_REFRESH=1
       shift
       ;;
     --help|-h)
