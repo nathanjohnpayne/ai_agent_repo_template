@@ -318,6 +318,92 @@ set -e
 [[ "$unknown_exit" -eq 2 ]] || fail "unknown commit-ish should exit 2; got $unknown_exit"
 
 # ---------------------------------------------------------------------------
+# Live-mode active-account guard (cursor CHANGES_REQUESTED on PR #217).
+# Without the guard, a careless live invocation under a reviewer-identity
+# `gh` keyring would create downstream PRs under that identity, violating
+# the author/reviewer separation. The guard refuses to proceed unless the
+# active gh account matches author_identity. Tested by overriding the
+# expected actor to a value the live `gh config get` will not match.
+# ---------------------------------------------------------------------------
+guard_workdir="$WORKDIR/guard"
+GUARD_MP="$guard_workdir/mergepath"
+mkdir -p "$GUARD_MP/scripts" "$GUARD_MP/.github"
+cat >"$GUARD_MP/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - {name: alpha, repo: example-bogus/alpha}
+paths:
+  - {path: scripts/the-script.sh, type: canonical, consumers: all}
+YAML
+cat >"$GUARD_MP/.github/review-policy.yml" <<'YAML'
+author_identity: definitely-not-a-real-user-9999
+YAML
+echo "v1" >"$GUARD_MP/scripts/the-script.sh"
+git -C "$GUARD_MP" init -q
+git -C "$GUARD_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$GUARD_MP" -c user.email=t@t -c user.name=t commit -q -m initial
+echo "v2" >"$GUARD_MP/scripts/the-script.sh"
+git -C "$GUARD_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$GUARD_MP" -c user.email=t@t -c user.name=t commit -q -m bump
+guard_sha=$(git -C "$GUARD_MP" rev-parse HEAD)
+
+# Live mode (no --dry-run) with the wrong active account should refuse.
+# We don't have access to consumer repos in tests anyway; the guard
+# fires BEFORE any clone, so the failure is the guard's, not the
+# clone's.
+set +e
+guard_out=$(MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" "$SCRIPT" "$guard_sha" --repos alpha 2>&1)
+guard_exit=$?
+set -e
+echo "$guard_out" | grep -q "refusing to run live sync" \
+  || fail "active-account guard did not fire; got: $guard_out"
+echo "$guard_out" | grep -q "definitely-not-a-real-user-9999" \
+  || fail "active-account guard did not name the expected actor"
+[[ "$guard_exit" -ne 0 ]] \
+  || fail "active-account guard should exit non-zero; got $guard_exit"
+
+# Dry-run with the same wrong active account should still PASS — the
+# guard only applies to live mode.
+set +e
+dr_out=$(MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" "$SCRIPT" "$guard_sha" --dry-run --repos alpha 2>&1)
+dr_exit=$?
+set -e
+[[ "$dr_exit" -eq 0 ]] \
+  || fail "dry-run should not be blocked by active-account guard; got exit $dr_exit, output: $dr_out"
+echo "$dr_out" | grep -q "would open PR" \
+  || fail "dry-run should still plan a PR; got: $dr_out"
+
+# MERGEPATH_SYNC_ACTOR_OVERRIDE escape hatch: setting it to the current
+# active actor makes the guard pass. We can't actually run live mode
+# (no real consumer repo), but we can assert the guard accepts the
+# override and the failure mode shifts to "could not clone" rather than
+# "refusing to run live sync."
+current_actor=$(gh config get -h github.com user 2>/dev/null || echo "")
+if [ -n "$current_actor" ]; then
+  set +e
+  override_out=$(MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" \
+    MERGEPATH_SYNC_ACTOR_OVERRIDE="$current_actor" \
+    "$SCRIPT" "$guard_sha" --repos alpha 2>&1)
+  set -e
+  echo "$override_out" | grep -q "refusing to run live sync" \
+    && fail "actor override should bypass the guard; got: $override_out"
+fi
+
+# ---------------------------------------------------------------------------
+# Mode-mirror correctness (cursor CHANGES_REQUESTED on PR #217).
+# Live copy should NOT only add +x; it must also CLEAR +x when the
+# Mergepath source is 100644. We can't easily exercise sync_open_pr's
+# full path here without stubbing gh, but we can unit-check the mode
+# logic by sourcing the script with a guard and calling the relevant
+# git commands directly. Simpler: assert the script source contains
+# both `chmod +x` and `chmod -x` branches.
+# ---------------------------------------------------------------------------
+grep -q 'chmod -x "$consumer_target"' "$SCRIPT" \
+  || fail "sync_open_pr is missing the 'chmod -x' branch — mode drift would persist on 100644 sources"
+grep -q 'chmod +x "$consumer_target"' "$SCRIPT" \
+  || fail "sync_open_pr is missing the 'chmod +x' branch"
+
+# ---------------------------------------------------------------------------
 # --version / --help smoke
 # ---------------------------------------------------------------------------
 "$SCRIPT" --version | grep -q "sync-to-downstream.sh" || fail "--version output unexpected"

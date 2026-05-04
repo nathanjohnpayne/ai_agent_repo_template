@@ -760,12 +760,23 @@ sync_open_pr() {
       err "$consumer_name: could not read $target from mergepath@$short_sha"
       return 1
     fi
-    # Preserve executable bit if the source has it.
+    # Mirror the executable bit from the source. Both directions matter:
+    # if the source is 100755 the target must be +x (so a hook stays
+    # runnable in the consumer); if the source is 100644 the target
+    # must NOT be +x (otherwise mode drift accumulates whenever a
+    # consumer historically had +x set on a file Mergepath later
+    # decided should be plain). cursor's CHANGES_REQUESTED on PR #217
+    # caught the one-way version that only added +x.
     local src_mode
     src_mode=$(git -C "$MERGEPATH_ROOT" ls-tree "$sha" "$target" | awk '{print $1}')
-    if [ "$src_mode" = "100755" ]; then
-      chmod +x "$consumer_target"
-    fi
+    case "$src_mode" in
+      100755) chmod +x "$consumer_target" ;;
+      100644) chmod -x "$consumer_target" ;;
+      *)
+        err "$consumer_name: unexpected git mode '$src_mode' for $target at $short_sha"
+        return 1
+        ;;
+    esac
   done <<< "$targets"
 
   # Sanity: did the copy actually change anything? If the consumer was
@@ -891,6 +902,35 @@ run_sync() {
   if [ -z "$changed_files" ]; then
     err "no files changed at mergepath@${short_sha} — nothing to propagate"
     exit 0
+  fi
+
+  # Active-account guard for LIVE mode (skipped in --dry-run since
+  # dry-run is meant to be safe to run from any identity). Refuses to
+  # proceed unless the gh keyring's active account matches the
+  # manifest's author_identity. Without this guard, downstream PRs
+  # would be created under whatever reviewer identity happens to be
+  # active, violating the author/reviewer separation in
+  # REVIEW_POLICY.md.
+  #
+  # Read via `gh config get -h github.com user` (NOT `gh auth status`,
+  # which is GH_TOKEN-poisonable per CLAUDE.md "Active-account
+  # convention"). Author identity is read from .github/review-policy.yml's
+  # `author_identity` field; falls back to "nathanjohnpayne" if missing.
+  # Override with MERGEPATH_SYNC_ACTOR_OVERRIDE for tests / break-glass.
+  # cursor's CHANGES_REQUESTED on PR #217 caught the missing guard.
+  if [ "$dry_run" != "1" ]; then
+    local expected_actor active_actor
+    expected_actor=$(awk '/^author_identity:/ {sub(/^[^:]+:[[:space:]]*/, ""); gsub(/[[:space:]"#].*$/, ""); print; exit}' \
+      "$MERGEPATH_ROOT/.github/review-policy.yml" 2>/dev/null || echo "")
+    expected_actor=${expected_actor:-nathanjohnpayne}
+    expected_actor=${MERGEPATH_SYNC_ACTOR_OVERRIDE:-$expected_actor}
+    active_actor=$(gh config get -h github.com user 2>/dev/null || echo "")
+    if [ "$active_actor" != "$expected_actor" ]; then
+      err "refusing to run live sync — active gh account is '$active_actor', expected '$expected_actor'"
+      err "       Switch first: gh auth switch -u $expected_actor"
+      err "       Then re-run. (Set MERGEPATH_SYNC_ACTOR_OVERRIDE for tests.)"
+      exit 2
+    fi
   fi
 
   echo "Sync from mergepath@${short_sha}: ${subject}"
