@@ -208,6 +208,225 @@ echo "$hostile_output" | grep -qE "it is a symbolic link|resolves outside MERGEP
   || fail "symlink-guarded cache path was reset, clobbering the user's working tree"
 
 # ---------------------------------------------------------------------------
+# Sync mode (Layer 3 first slice): dry-run end-to-end.
+#
+# Build a fresh Mergepath fixture with two canonical paths, one kit
+# path, one templated path, three consumers. Make a commit at HEAD~1
+# that touches one canonical and one kit and one templated path; HEAD
+# touches the other canonical only. Then exercise --dry-run modes to
+# assert the planning logic is sane.
+# ---------------------------------------------------------------------------
+sync_workdir="$WORKDIR/sync"
+SYNC_MP="$sync_workdir/mergepath"
+mkdir -p "$SYNC_MP/scripts/hooks" "$SYNC_MP/scripts/ci" "$SYNC_MP/.github"
+cat >"$SYNC_MP/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - {name: alpha, repo: example/alpha}
+  - {name: beta,  repo: example/beta}
+  - {name: gamma, repo: example/gamma}
+paths:
+  - {path: scripts/hooks/the-hook.sh,  type: canonical, consumers: all}
+  - {path: scripts/coderabbit-wait.sh, type: canonical, consumers: all}
+  - {path: scripts/ci/,                type: kit,       consumers: all}
+  - {path: AGENTS.md,                  type: templated, consumers: all}
+YAML
+echo "v1" >"$SYNC_MP/scripts/hooks/the-hook.sh"
+echo "v1" >"$SYNC_MP/scripts/coderabbit-wait.sh"
+echo "v1" >"$SYNC_MP/scripts/ci/check_one"
+echo "v1" >"$SYNC_MP/AGENTS.md"
+git -C "$SYNC_MP" init -q
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "initial"
+
+# Commit A — multi-type touch (canonical + kit + templated)
+echo "v2" >"$SYNC_MP/scripts/hooks/the-hook.sh"
+echo "v2" >"$SYNC_MP/scripts/ci/check_one"
+echo "v2" >"$SYNC_MP/AGENTS.md"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "multi-type-touch"
+sha_A=$(git -C "$SYNC_MP" rev-parse HEAD)
+
+# Commit B — single canonical touch
+echo "v3" >"$SYNC_MP/scripts/coderabbit-wait.sh"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "single-canonical-touch"
+sha_B=$(git -C "$SYNC_MP" rev-parse HEAD)
+
+# Commit C — only an unrelated file (no manifest path touched)
+echo "noise" >"$SYNC_MP/.github/UNRELATED"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "unrelated-only"
+sha_C=$(git -C "$SYNC_MP" rev-parse HEAD)
+
+# 1) Multi-type touch: canonical lands, kit + templated are deferred with
+#    a per-consumer note. All 3 consumers get a planned PR.
+sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run 2>&1)
+echo "$sync_out" | grep -q "would open PR on branch mergepath-sync/${sha_A:0:7}" \
+  || fail "multi-type sync did not produce planned PRs; output: $sync_out"
+[[ "$(echo "$sync_out" | grep -c 'would open PR')" -eq 3 ]] \
+  || fail "expected 3 planned PRs (one per consumer); got: $sync_out"
+echo "$sync_out" | grep -q "+ scripts/hooks/the-hook.sh" \
+  || fail "canonical target scripts/hooks/the-hook.sh missing from plan"
+echo "$sync_out" | grep -q "deferred this slice: kit=scripts/ci/" \
+  || fail "kit deferred-note missing from plan"
+echo "$sync_out" | grep -q "templated=AGENTS.md" \
+  || fail "templated deferred-note missing from plan"
+
+# 2) --repos filter restricts consumer set.
+sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_B" --dry-run --repos beta 2>&1)
+[[ "$(echo "$sync_out" | grep -c 'would open PR')" -eq 1 ]] \
+  || fail "--repos filter did not restrict to one consumer; got: $sync_out"
+echo "$sync_out" | grep -q "beta — would open PR" \
+  || fail "expected beta in --repos filter output; got: $sync_out"
+echo "$sync_out" | grep -q "alpha\|gamma" \
+  && fail "non-filtered consumer leaked into output: $sync_out"
+
+# 3) --paths filter restricts target set within the planned PR.
+sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run --paths "scripts/hooks/the-hook.sh" 2>&1)
+echo "$sync_out" | grep -q "+ scripts/hooks/the-hook.sh" \
+  || fail "--paths filter excluded the requested path"
+echo "$sync_out" | grep -q "+ scripts/coderabbit-wait.sh" \
+  && fail "--paths filter did not exclude scripts/coderabbit-wait.sh"
+
+# 4) Commit that only touches kit + templated → no canonical targets,
+#    summary marks each consumer as ⊘ (skipped, deferred-only).
+deferred_only_sha=$(git -C "$SYNC_MP" rev-list HEAD --reverse | sed -n '2p')  # commit A
+# Re-derive: we want a commit that is kit-only or templated-only, not
+# the multi-type one. Make a fresh commit just for this case.
+echo "v4" >"$SYNC_MP/scripts/ci/check_one"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "kit-only"
+sha_D=$(git -C "$SYNC_MP" rev-parse HEAD)
+
+sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_D" --dry-run 2>&1)
+echo "$sync_out" | grep -q "no canonical targets" \
+  || fail "kit-only commit should report 'no canonical targets' per consumer; got: $sync_out"
+echo "$sync_out" | grep -q "would open PR" \
+  && fail "kit-only commit should not plan any PRs (canonical-only slice)"
+
+# 5) Commit that touches no manifest path at all → "no manifest paths touched".
+sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_C" --dry-run 2>&1)
+echo "$sync_out" | grep -q "no manifest paths touched" \
+  || fail "unrelated-only commit should report 'no manifest paths touched'; got: $sync_out"
+
+# 6) Resolution of an unknown commit-ish exits 2 cleanly.
+set +e
+"$SCRIPT" deadbeefdeadbeefdeadbeef --dry-run 2>/dev/null
+unknown_exit=$?
+set -e
+[[ "$unknown_exit" -eq 2 ]] || fail "unknown commit-ish should exit 2; got $unknown_exit"
+
+# ---------------------------------------------------------------------------
+# Live-mode active-account guard (cursor CHANGES_REQUESTED on PR #217).
+# Without the guard, a careless live invocation under a reviewer-identity
+# `gh` keyring would create downstream PRs under that identity, violating
+# the author/reviewer separation. The guard refuses to proceed unless the
+# active gh account matches author_identity. Tested by overriding the
+# expected actor to a value the live `gh config get` will not match.
+# ---------------------------------------------------------------------------
+guard_workdir="$WORKDIR/guard"
+GUARD_MP="$guard_workdir/mergepath"
+mkdir -p "$GUARD_MP/scripts" "$GUARD_MP/.github"
+cat >"$GUARD_MP/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - {name: alpha, repo: example-bogus/alpha}
+paths:
+  - {path: scripts/the-script.sh, type: canonical, consumers: all}
+YAML
+cat >"$GUARD_MP/.github/review-policy.yml" <<'YAML'
+author_identity: definitely-not-a-real-user-9999
+YAML
+echo "v1" >"$GUARD_MP/scripts/the-script.sh"
+git -C "$GUARD_MP" init -q
+git -C "$GUARD_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$GUARD_MP" -c user.email=t@t -c user.name=t commit -q -m initial
+echo "v2" >"$GUARD_MP/scripts/the-script.sh"
+git -C "$GUARD_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$GUARD_MP" -c user.email=t@t -c user.name=t commit -q -m bump
+guard_sha=$(git -C "$GUARD_MP" rev-parse HEAD)
+
+# Live mode (no --dry-run) with the wrong active account should refuse.
+# We don't have access to consumer repos in tests anyway; the guard
+# fires BEFORE any clone, so the failure is the guard's, not the
+# clone's.
+set +e
+guard_out=$(MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" "$SCRIPT" "$guard_sha" --repos alpha 2>&1)
+guard_exit=$?
+set -e
+echo "$guard_out" | grep -q "refusing to run live sync" \
+  || fail "active-account guard did not fire; got: $guard_out"
+echo "$guard_out" | grep -q "definitely-not-a-real-user-9999" \
+  || fail "active-account guard did not name the expected actor"
+[[ "$guard_exit" -ne 0 ]] \
+  || fail "active-account guard should exit non-zero; got $guard_exit"
+
+# Dry-run with the same wrong active account should still PASS — the
+# guard only applies to live mode.
+set +e
+dr_out=$(MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" "$SCRIPT" "$guard_sha" --dry-run --repos alpha 2>&1)
+dr_exit=$?
+set -e
+[[ "$dr_exit" -eq 0 ]] \
+  || fail "dry-run should not be blocked by active-account guard; got exit $dr_exit, output: $dr_out"
+echo "$dr_out" | grep -q "would open PR" \
+  || fail "dry-run should still plan a PR; got: $dr_out"
+
+# MERGEPATH_SYNC_ACTOR_OVERRIDE escape hatch: setting it to the current
+# active actor makes the guard pass. We can't actually run live mode
+# (no real consumer repo), but we can assert the guard accepts the
+# override and the failure mode shifts to "could not clone" rather than
+# "refusing to run live sync."
+current_actor=$(gh config get -h github.com user 2>/dev/null || echo "")
+if [ -n "$current_actor" ]; then
+  set +e
+  override_out=$(MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" \
+    MERGEPATH_SYNC_ACTOR_OVERRIDE="$current_actor" \
+    "$SCRIPT" "$guard_sha" --repos alpha 2>&1)
+  set -e
+  echo "$override_out" | grep -q "refusing to run live sync" \
+    && fail "actor override should bypass the guard; got: $override_out"
+fi
+
+# ---------------------------------------------------------------------------
+# Mode-mirror correctness (cursor CHANGES_REQUESTED on PR #217).
+# Live copy should NOT only add +x; it must also CLEAR +x when the
+# Mergepath source is 100644. We can't easily exercise sync_open_pr's
+# full path here without stubbing gh, but we can unit-check the mode
+# logic by sourcing the script with a guard and calling the relevant
+# git commands directly. Simpler: assert the script source contains
+# both `chmod +x` and `chmod -x` branches.
+# ---------------------------------------------------------------------------
+grep -q 'chmod -x "$consumer_target"' "$SCRIPT" \
+  || fail "sync_open_pr is missing the 'chmod -x' branch — mode drift would persist on 100644 sources"
+grep -q 'chmod +x "$consumer_target"' "$SCRIPT" \
+  || fail "sync_open_pr is missing the 'chmod +x' branch"
+
+# ---------------------------------------------------------------------------
+# Deletion propagation + tmpdir portability (cursor CHANGES_REQUESTED on
+# PR #217). Two source-grep assertions because the live cycle isn't
+# unit-testable without stubbing gh:
+#
+# 1. The materialization loop must check `git ls-tree` for a path
+#    BEFORE trying `git show`, and if the path is absent at the sha,
+#    rm the consumer copy instead of failing on a missing blob.
+# 2. The mktemp invocation must use the explicit `$TMPDIR/<X-pattern>`
+#    form (portable across BSD/macOS and GNU/Linux), not `mktemp -d -t
+#    "literal-prefix"` (BSD-specific behavior).
+# ---------------------------------------------------------------------------
+grep -q 'ls-tree "$sha" -- "$target"' "$SCRIPT" \
+  || fail "materialization loop is missing the ls-tree pre-check; deletes would fail on git show"
+grep -q '\[ -z "\$src_mode" \]' "$SCRIPT" \
+  || fail "materialization loop is missing the absent-at-sha branch (rm consumer copy on delete propagation)"
+grep -q 'rm -f "\$consumer_target"' "$SCRIPT" \
+  || fail "materialization loop is missing 'rm -f \$consumer_target' for delete propagation"
+grep -q 'mktemp -d "\$tmp_root/mergepath-sync-' "$SCRIPT" \
+  || fail "mktemp invocation is missing the portable \$TMPDIR/<prefix>.XXXXXX form"
+grep -q 'mktemp -d -t "mergepath-sync' "$SCRIPT" \
+  && fail "mktemp invocation still uses the BSD-specific '-t literal-prefix' form (not GNU portable)"
+
+# ---------------------------------------------------------------------------
 # --version / --help smoke
 # ---------------------------------------------------------------------------
 "$SCRIPT" --version | grep -q "sync-to-downstream.sh" || fail "--version output unexpected"
