@@ -60,6 +60,24 @@ jobs:
       - name: check_auto_clear_workflow
         run: ./scripts/ci/check_auto_clear_workflow
 
+      - name: install_yq_for_sync_manifest
+        # mikefarah/yq is needed by check_sync_manifest. Pin a recent v4
+        # release; bumped opportunistically. The official ubuntu-latest
+        # runner ships yq 4.x preinstalled today, but pinning makes the
+        # check resilient to runner image changes.
+        run: |
+          if command -v yq >/dev/null 2>&1 && yq --version 2>&1 | grep -q "mikefarah/yq"; then
+            echo "yq already present: $(yq --version)"
+          else
+            sudo wget -q -O /usr/local/bin/yq \
+              https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+            yq --version
+          fi
+
+      - name: check_sync_manifest
+        run: ./scripts/ci/check_sync_manifest
+
       - name: check_governance_files
         run: |
           MISSING=0

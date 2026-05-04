@@ -1,0 +1,118 @@
+# .mergepath-sync.yml — propagation manifest for sync-to-downstream.sh
+#
+# Single source of truth for which Mergepath paths are canonical
+# (mirrored verbatim) or templated (mirrored with substitutions),
+# and which downstream consumers opt in to each. Read by
+# scripts/sync-to-downstream.sh — see #168 for the full design.
+#
+# Schema is deliberately small for v1 (Layer 1 + Layer 2 of the issue
+# plan): manifest + audit. Additional path types and per-path knobs
+# (kit-with-allowlist, three-way-merge for review-policy.yml,
+# substitution rules for templated docs) land in later layers.
+
+# Schema version. Bumped on incompatible changes; the script refuses
+# to run against an unknown version so old scripts can't silently
+# misinterpret a newer manifest.
+version: 1
+
+consumers:
+  - name: matchline
+    repo: nathanjohnpayne/matchline
+    visibility: private
+  - name: nathanpaynedotcom
+    repo: nathanjohnpayne/nathanpaynedotcom
+    visibility: private
+  - name: overridebroadway
+    repo: nathanjohnpayne/overridebroadway
+    visibility: private
+  - name: device-source-of-truth
+    repo: nathanjohnpayne/device-source-of-truth
+    visibility: public
+  - name: friends-and-family-billing
+    repo: nathanjohnpayne/friends-and-family-billing
+    visibility: public
+  - name: device-platform-reporting
+    repo: nathanjohnpayne/device-platform-reporting
+    visibility: public
+  - name: swipewatch
+    repo: nathanjohnpayne/swipewatch
+    visibility: public
+
+# Path types:
+#   canonical  — byte-for-byte mirror. Any difference is drift.
+#   kit        — directory mirror with allow-extras semantics: every
+#                file under Mergepath's path must exist (byte-identical)
+#                in the consumer; consumer-only files in the same dir
+#                are ignored. This matches scripts/ci/, where each
+#                consumer adds repo-specific check_* scripts alongside
+#                the canonical ones.
+#   templated  — RESERVED for Layer 5 (#168). Not yet supported by
+#                --audit; scripts/sync-to-downstream.sh refuses to
+#                process templated entries until the substitution
+#                lib lands.
+#
+# `consumers: all` means every entry in the consumers list above.
+# Per-consumer exclusions live under the `exclusions:` block at the
+# bottom of the file.
+
+paths:
+  # Canonical scripts — Phase 4 review tooling, hooks, helpers.
+  - path: scripts/op-preflight.sh
+    type: canonical
+    consumers: all
+  - path: scripts/coderabbit-wait.sh
+    type: canonical
+    consumers: all
+  - path: scripts/codex-review-request.sh
+    type: canonical
+    consumers: all
+  - path: scripts/codex-review-check.sh
+    type: canonical
+    consumers: all
+  - path: scripts/phase-4b-classifier.sh
+    type: canonical
+    consumers: all
+  - path: scripts/resolve-pr-threads.sh
+    type: canonical
+    consumers: all
+  - path: scripts/request-label-removal.sh
+    type: canonical
+    consumers: all
+  - path: scripts/hooks/gh-pr-guard.sh
+    type: canonical
+    consumers: all
+  - path: scripts/hooks/label-removal-guard.sh
+    type: canonical
+    consumers: all
+
+  # Canonical workflows — review policy + automation surfaces that
+  # should be lockstep across all consumers.
+  - path: .github/workflows/agent-review.yml
+    type: canonical
+    consumers: all
+  - path: .github/workflows/pr-review-policy.yml
+    type: canonical
+    consumers: all
+  - path: .github/workflows/dependabot-auto-merge.yml
+    type: canonical
+    consumers: all
+  - path: .github/workflows/auto-clear-blocking-labels.yml
+    type: canonical
+    consumers: all
+  - path: .github/workflows/pr-audit.yml
+    type: canonical
+    consumers: all
+
+  # Kit directories — Mergepath-canonical files are required;
+  # consumer-only additions in the same directory are allowed.
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+  - path: scripts/gh-projects/
+    type: kit
+    consumers: all
+
+# Per-consumer exclusions. Use sparingly — drift exceptions become
+# audit noise over time. Each entry must list a `reason:` so future
+# readers know whether the exclusion is still load-bearing.
+exclusions: []
