@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# check_sync_manifest
+#
+# Validates .mergepath-sync.yml — the propagation manifest read by
+# scripts/sync-to-downstream.sh. See #168 for the design.
+#
+# Checks (CI must run on a runner with yq installed; the workflow
+# step installs it via Homebrew/apt before invoking this script):
+#
+#   1. Manifest file exists and parses as YAML.
+#   2. Schema version matches what sync-to-downstream.sh supports.
+#   3. Every consumer has a non-empty name and repo.
+#   4. Every path entry's `path` field exists on disk in this repo
+#      (catches typos and removed files before they cause silent
+#      audit misses on every consumer).
+#   5. Every path entry's `type` is one of: canonical, kit, templated.
+#   6. Every path's `consumers` is either the literal "all" or a list
+#      of consumer names that exist in the consumers block.
+#
+# This check is read-only and does NOT contact downstream repos —
+# that's the audit script's job and is too slow for CI.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MANIFEST="$REPO_ROOT/.mergepath-sync.yml"
+SUPPORTED_VERSION=1
+
+if ! command -v yq >/dev/null 2>&1; then
+  echo "FAIL: yq is required (mikefarah/yq v4+). Install via 'brew install yq' or apt."
+  exit 2
+fi
+
+if [ ! -f "$MANIFEST" ]; then
+  echo "FAIL: .mergepath-sync.yml is missing at repo root"
+  exit 1
+fi
+
+# Parse-check: yq exits non-zero on a malformed YAML.
+if ! yq '.' "$MANIFEST" >/dev/null 2>&1; then
+  echo "FAIL: .mergepath-sync.yml does not parse as YAML"
+  yq '.' "$MANIFEST" || true
+  exit 1
+fi
+
+FAILED=0
+
+# 2. version
+version=$(yq '.version' "$MANIFEST")
+if [ "$version" != "$SUPPORTED_VERSION" ]; then
+  echo "FAIL: manifest version is '$version', expected $SUPPORTED_VERSION"
+  FAILED=1
+fi
+
+# 3. consumers shape
+consumer_count=$(yq '.consumers | length' "$MANIFEST")
+if [ "$consumer_count" -lt 1 ]; then
+  echo "FAIL: consumers list is empty"
+  FAILED=1
+fi
+
+while IFS=$'\t' read -r name repo; do
+  if [ -z "$name" ] || [ "$name" = "null" ]; then
+    echo "FAIL: a consumer entry has no name (repo=$repo)"
+    FAILED=1
+  fi
+  if [ -z "$repo" ] || [ "$repo" = "null" ]; then
+    echo "FAIL: consumer '$name' has no repo"
+    FAILED=1
+  fi
+done < <(yq -r '.consumers[] | (.name + "\t" + .repo)' "$MANIFEST")
+
+# Build a set of valid consumer names for cross-check
+valid_consumers=$(yq -r '.consumers[].name' "$MANIFEST" | tr '\n' ',')
+
+# 4-6. path entries
+while IFS=$'\t' read -r path type consumers; do
+  [ -z "$path" ] && continue
+
+  # 4: path exists on disk
+  case "$type" in
+    kit)
+      target="$REPO_ROOT/${path%/}"
+      if [ ! -d "$target" ]; then
+        echo "FAIL: kit path '$path' is not a directory in this repo"
+        FAILED=1
+      fi
+      ;;
+    canonical|templated)
+      target="$REPO_ROOT/$path"
+      if [ ! -f "$target" ]; then
+        echo "FAIL: $type path '$path' does not exist as a file in this repo"
+        FAILED=1
+      fi
+      ;;
+    *)
+      echo "FAIL: path '$path' has unknown type '$type' (must be canonical, kit, or templated)"
+      FAILED=1
+      ;;
+  esac
+
+  # 6: consumers field
+  if [ "$consumers" = "all" ]; then
+    :
+  else
+    IFS=',' read -ra consumer_arr <<< "$consumers"
+    for c in "${consumer_arr[@]}"; do
+      if [[ ",$valid_consumers," != *",$c,"* ]]; then
+        echo "FAIL: path '$path' references unknown consumer '$c'"
+        FAILED=1
+      fi
+    done
+  fi
+done < <(yq -r '
+  .paths[]
+  | (.path + "\t" + .type + "\t"
+     + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
+' "$MANIFEST")
+
+if [ "$FAILED" -eq 1 ]; then
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
+
+echo "check_sync_manifest: PASS ($consumer_count consumer(s), $(yq '.paths | length' "$MANIFEST") path entry/entries)"
+exit 0
