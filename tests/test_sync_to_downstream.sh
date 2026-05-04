@@ -208,6 +208,116 @@ echo "$hostile_output" | grep -qE "it is a symbolic link|resolves outside MERGEP
   || fail "symlink-guarded cache path was reset, clobbering the user's working tree"
 
 # ---------------------------------------------------------------------------
+# Sync mode (Layer 3 first slice): dry-run end-to-end.
+#
+# Build a fresh Mergepath fixture with two canonical paths, one kit
+# path, one templated path, three consumers. Make a commit at HEAD~1
+# that touches one canonical and one kit and one templated path; HEAD
+# touches the other canonical only. Then exercise --dry-run modes to
+# assert the planning logic is sane.
+# ---------------------------------------------------------------------------
+sync_workdir="$WORKDIR/sync"
+SYNC_MP="$sync_workdir/mergepath"
+mkdir -p "$SYNC_MP/scripts/hooks" "$SYNC_MP/scripts/ci" "$SYNC_MP/.github"
+cat >"$SYNC_MP/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - {name: alpha, repo: example/alpha}
+  - {name: beta,  repo: example/beta}
+  - {name: gamma, repo: example/gamma}
+paths:
+  - {path: scripts/hooks/the-hook.sh,  type: canonical, consumers: all}
+  - {path: scripts/coderabbit-wait.sh, type: canonical, consumers: all}
+  - {path: scripts/ci/,                type: kit,       consumers: all}
+  - {path: AGENTS.md,                  type: templated, consumers: all}
+YAML
+echo "v1" >"$SYNC_MP/scripts/hooks/the-hook.sh"
+echo "v1" >"$SYNC_MP/scripts/coderabbit-wait.sh"
+echo "v1" >"$SYNC_MP/scripts/ci/check_one"
+echo "v1" >"$SYNC_MP/AGENTS.md"
+git -C "$SYNC_MP" init -q
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "initial"
+
+# Commit A — multi-type touch (canonical + kit + templated)
+echo "v2" >"$SYNC_MP/scripts/hooks/the-hook.sh"
+echo "v2" >"$SYNC_MP/scripts/ci/check_one"
+echo "v2" >"$SYNC_MP/AGENTS.md"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "multi-type-touch"
+sha_A=$(git -C "$SYNC_MP" rev-parse HEAD)
+
+# Commit B — single canonical touch
+echo "v3" >"$SYNC_MP/scripts/coderabbit-wait.sh"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "single-canonical-touch"
+sha_B=$(git -C "$SYNC_MP" rev-parse HEAD)
+
+# Commit C — only an unrelated file (no manifest path touched)
+echo "noise" >"$SYNC_MP/.github/UNRELATED"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "unrelated-only"
+sha_C=$(git -C "$SYNC_MP" rev-parse HEAD)
+
+# 1) Multi-type touch: canonical lands, kit + templated are deferred with
+#    a per-consumer note. All 3 consumers get a planned PR.
+sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run 2>&1)
+echo "$sync_out" | grep -q "would open PR on branch mergepath-sync/${sha_A:0:7}" \
+  || fail "multi-type sync did not produce planned PRs; output: $sync_out"
+[[ "$(echo "$sync_out" | grep -c 'would open PR')" -eq 3 ]] \
+  || fail "expected 3 planned PRs (one per consumer); got: $sync_out"
+echo "$sync_out" | grep -q "+ scripts/hooks/the-hook.sh" \
+  || fail "canonical target scripts/hooks/the-hook.sh missing from plan"
+echo "$sync_out" | grep -q "deferred this slice: kit=scripts/ci/" \
+  || fail "kit deferred-note missing from plan"
+echo "$sync_out" | grep -q "templated=AGENTS.md" \
+  || fail "templated deferred-note missing from plan"
+
+# 2) --repos filter restricts consumer set.
+sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_B" --dry-run --repos beta 2>&1)
+[[ "$(echo "$sync_out" | grep -c 'would open PR')" -eq 1 ]] \
+  || fail "--repos filter did not restrict to one consumer; got: $sync_out"
+echo "$sync_out" | grep -q "beta — would open PR" \
+  || fail "expected beta in --repos filter output; got: $sync_out"
+echo "$sync_out" | grep -q "alpha\|gamma" \
+  && fail "non-filtered consumer leaked into output: $sync_out"
+
+# 3) --paths filter restricts target set within the planned PR.
+sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run --paths "scripts/hooks/the-hook.sh" 2>&1)
+echo "$sync_out" | grep -q "+ scripts/hooks/the-hook.sh" \
+  || fail "--paths filter excluded the requested path"
+echo "$sync_out" | grep -q "+ scripts/coderabbit-wait.sh" \
+  && fail "--paths filter did not exclude scripts/coderabbit-wait.sh"
+
+# 4) Commit that only touches kit + templated → no canonical targets,
+#    summary marks each consumer as ⊘ (skipped, deferred-only).
+deferred_only_sha=$(git -C "$SYNC_MP" rev-list HEAD --reverse | sed -n '2p')  # commit A
+# Re-derive: we want a commit that is kit-only or templated-only, not
+# the multi-type one. Make a fresh commit just for this case.
+echo "v4" >"$SYNC_MP/scripts/ci/check_one"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "kit-only"
+sha_D=$(git -C "$SYNC_MP" rev-parse HEAD)
+
+sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_D" --dry-run 2>&1)
+echo "$sync_out" | grep -q "no canonical targets" \
+  || fail "kit-only commit should report 'no canonical targets' per consumer; got: $sync_out"
+echo "$sync_out" | grep -q "would open PR" \
+  && fail "kit-only commit should not plan any PRs (canonical-only slice)"
+
+# 5) Commit that touches no manifest path at all → "no manifest paths touched".
+sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_C" --dry-run 2>&1)
+echo "$sync_out" | grep -q "no manifest paths touched" \
+  || fail "unrelated-only commit should report 'no manifest paths touched'; got: $sync_out"
+
+# 6) Resolution of an unknown commit-ish exits 2 cleanly.
+set +e
+"$SCRIPT" deadbeefdeadbeefdeadbeef --dry-run 2>/dev/null
+unknown_exit=$?
+set -e
+[[ "$unknown_exit" -eq 2 ]] || fail "unknown commit-ish should exit 2; got $unknown_exit"
+
+# ---------------------------------------------------------------------------
 # --version / --help smoke
 # ---------------------------------------------------------------------------
 "$SCRIPT" --version | grep -q "sync-to-downstream.sh" || fail "--version output unexpected"

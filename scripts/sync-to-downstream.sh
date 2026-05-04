@@ -4,16 +4,22 @@
 #
 # This script is shipping in layers (per the issue's implementation plan):
 #
-#   v1 (this PR):
+#   v1 (PR #215):
 #     --audit            Read-only drift detector across all consumers.
-#     --help             Print this header.
-#     --version          Print script + manifest schema version.
+#
+#   v2 (this PR — Layer 3 first slice):
+#     <commit-ish>       Open propagation PRs for canonical files changed
+#                        at the given commit. Kit and templated paths are
+#                        skipped with a warning (deferred to slice 2/3).
 #
 #   future:
-#     <commit-ish>       Open propagation PRs for files changed at the
-#                        given commit (Layer 3).
 #     --from-pr <N>      Resolve PR N's merge commit and propagate
 #                        (Layer 4).
+#     templated paths    Three-way merge for review-policy.yml; substitution
+#                        rules for AGENTS.md / CLAUDE.md (Layer 5, shared
+#                        with bootstrap-new-repo.sh #156).
+#     kit paths          Directory mirror with allow-extras semantics in
+#                        sync mode (slice 2 — already supported in audit).
 #
 # The manifest at .mergepath-sync.yml declares which paths are canonical
 # (byte-identical) or kit (directory mirror with allow-extras), and which
@@ -22,20 +28,29 @@
 #
 # Usage:
 #   scripts/sync-to-downstream.sh --audit [--repos r1,r2] [--paths glob]
+#   scripts/sync-to-downstream.sh <commit-ish> [--dry-run] [--repos r1,r2] [--paths glob]
 #   scripts/sync-to-downstream.sh --help
 #   scripts/sync-to-downstream.sh --version
 #
 # Flags:
 #   --audit            Read-only drift detection. Exit 0 (clean), 1 (drift),
 #                      2 (script/usage error), 3 (consumer fetch error).
+#   --dry-run          Sync mode only. Print the per-consumer plan
+#                      (branch name, files) without cloning, committing,
+#                      pushing, or creating PRs. Idempotency check is
+#                      skipped because it probes the consumer repo via
+#                      `gh api`; a dry-run plan may show "would open PR"
+#                      even when a PR already exists, but the live run
+#                      will catch and skip it.
 #   --repos r1,r2      Restrict to a comma-separated subset of consumer names.
 #   --paths glob       Restrict to manifest paths matching the glob (e.g.
 #                      "scripts/*", ".github/workflows/agent-review.yml").
-#   --no-clone         Don't clone-on-demand; only audit consumers with a
-#                      local sibling worktree under MERGEPATH_SIBLINGS_DIR.
-#   --no-refresh       Don't `git fetch` cached consumer clones before
-#                      comparing. Useful for offline/sandboxed audits;
-#                      may report stale results if the cache is old.
+#   --no-clone         Audit only: don't clone-on-demand; only audit
+#                      consumers with a local sibling worktree under
+#                      MERGEPATH_SIBLINGS_DIR.
+#   --no-refresh       Audit only: don't `git fetch` cached consumer clones
+#                      before comparing. Useful for offline/sandboxed
+#                      audits; may report stale results if the cache is old.
 #   --help, -h         Show this help.
 #   --version          Print version info.
 #
@@ -74,9 +89,10 @@ set -euo pipefail
 
 # --- constants --------------------------------------------------------------
 
-SCRIPT_VERSION="0.1.0-layer1+2"
+SCRIPT_VERSION="0.2.0-layer3-canonical"
 SUPPORTED_MANIFEST_VERSION=1
 MANIFEST_PATH=".mergepath-sync.yml"
+SYNC_BRANCH_PREFIX="mergepath-sync"
 
 # Resolve the Mergepath worktree root from the script's location (works
 # regardless of cwd). Two `dirname`s: scripts/sync-to-downstream.sh →
@@ -474,9 +490,438 @@ run_audit() {
   done <<< "$consumers"
 }
 
+# --- sync mode --------------------------------------------------------------
+
+# Resolve a Mergepath commit-ish to a full SHA. Errors out if the commit
+# isn't reachable. Output: full SHA on stdout.
+sync_resolve_commit() {
+  local commit_ish=$1
+  local sha
+  sha=$(git -C "$MERGEPATH_ROOT" rev-parse --verify "$commit_ish^{commit}" 2>/dev/null) || {
+    err "could not resolve commit-ish '$commit_ish' in Mergepath worktree"
+    return 2
+  }
+  echo "$sha"
+}
+
+# List files that changed at the given commit. Output: one path per line,
+# relative to the Mergepath repo root.
+sync_changed_files() {
+  local sha=$1
+  git -C "$MERGEPATH_ROOT" show --name-only --pretty=format: "$sha" \
+    | grep -v '^$' || true
+}
+
+# Intersect changed files with manifest canonical paths for one consumer.
+# Echoes one canonical path per line that (a) exists in the changed-set
+# AND (b) the consumer opts in to.
+#
+# Kit and templated paths are intentionally skipped in this slice. The
+# audit mode already reports drift for those; sync mode for them lands in
+# slice 2 (kit) and slice 5 (templated). Skipping here is silent per
+# manifest path; the per-consumer summary calls out the deferral.
+sync_consumer_canonical_targets() {
+  local consumer_name=$1
+  local changed_files=$2  # newline-separated
+  local manifest=$3
+
+  yq -r '
+    .paths[]
+    | select(.type == "canonical")
+    | (.path + "\t"
+       + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
+  ' "$manifest" | while IFS=$'\t' read -r mp_path mp_consumers; do
+    # Path filter
+    if ! in_path_filter "$mp_path"; then continue; fi
+    # Consumer opt-in
+    if [ "$mp_consumers" != "all" ]; then
+      local re=",$mp_consumers,"
+      [[ "$re" != *",$consumer_name,"* ]] && continue
+    fi
+    # Changed at the commit?
+    if grep -Fxq "$mp_path" <<< "$changed_files"; then
+      echo "$mp_path"
+    fi
+  done
+}
+
+# Count manifest paths skipped (kit + templated) so the summary can name
+# them. Echoes "kit_count\ttemplated_count\tkit_paths\ttemplated_paths".
+sync_consumer_skipped_targets() {
+  local consumer_name=$1
+  local changed_files=$2
+  local manifest=$3
+
+  local kit_paths=()
+  local templated_paths=()
+  while IFS=$'\t' read -r mp_path mp_type mp_consumers; do
+    [ -z "$mp_path" ] && continue
+    if ! in_path_filter "$mp_path"; then continue; fi
+    if [ "$mp_consumers" != "all" ]; then
+      local re=",$mp_consumers,"
+      [[ "$re" != *",$consumer_name,"* ]] && continue
+    fi
+    # Did the change touch this path / its directory?
+    case "$mp_type" in
+      kit)
+        local mp_dir="${mp_path%/}"
+        if grep -E "^${mp_dir}/" <<< "$changed_files" >/dev/null; then
+          kit_paths+=("$mp_path")
+        fi
+        ;;
+      templated)
+        if grep -Fxq "$mp_path" <<< "$changed_files"; then
+          templated_paths+=("$mp_path")
+        fi
+        ;;
+    esac
+  done < <(yq -r '
+    .paths[]
+    | (.path + "\t" + .type + "\t"
+       + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
+  ' "$manifest")
+
+  local kp tp
+  kp=$(IFS=,; echo "${kit_paths[*]:-}")
+  tp=$(IFS=,; echo "${templated_paths[*]:-}")
+  echo -e "${#kit_paths[@]}\t${#templated_paths[@]}\t${kp}\t${tp}"
+}
+
+# Compute the deterministic branch name. Same commit-ish always produces
+# the same branch — that's how we get idempotency on re-runs.
+sync_branch_name() {
+  local sha=$1
+  echo "${SYNC_BRANCH_PREFIX}/${sha:0:7}"
+}
+
+# Idempotency check: does a PR already exist on this consumer's repo from
+# the deterministic sync branch? Echoes one of:
+#   "open:<pr_number>"     PR is open — skip, "already in flight"
+#   "closed:<pr_number>"   PR exists but closed (merged or abandoned)
+#   "none"                 No prior PR; safe to open
+# On API error, echoes "error" and returns non-zero.
+sync_check_existing_pr() {
+  local consumer_repo=$1
+  local branch=$2
+  local prs
+  prs=$(gh api "repos/$consumer_repo/pulls?state=all&head=$(echo "$consumer_repo" | cut -d/ -f1):$branch" \
+    --jq '.[] | "\(.state)\t\(.number)"' 2>/dev/null) || {
+    echo "error"
+    return 1
+  }
+  if [ -z "$prs" ]; then
+    echo "none"
+    return 0
+  fi
+  # Take the most recent (last) — gh api returns newest first by default.
+  local first
+  first=$(echo "$prs" | head -1)
+  local state num
+  state=$(echo "$first" | cut -f1)
+  num=$(echo "$first" | cut -f2)
+  if [ "$state" = "open" ]; then
+    echo "open:$num"
+  else
+    echo "closed:$num"
+  fi
+}
+
+# Per-consumer sync. Echoes a summary line on stdout. Sets
+# SYNC_PR_OPENED, SYNC_SKIPPED, SYNC_FAILED counters in the parent.
+sync_one_consumer() {
+  local consumer_name=$1
+  local consumer_repo=$2
+  local sha=$3
+  local short_sha=${sha:0:7}
+  local commit_subject=$4
+  local changed_files=$5
+  local dry_run=${6:-0}
+  local manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
+
+  local branch
+  branch=$(sync_branch_name "$sha")
+
+  local targets
+  targets=$(sync_consumer_canonical_targets "$consumer_name" "$changed_files" "$manifest")
+
+  local skipped
+  skipped=$(sync_consumer_skipped_targets "$consumer_name" "$changed_files" "$manifest")
+  local kit_count=$(echo "$skipped" | cut -f1)
+  local templated_count=$(echo "$skipped" | cut -f2)
+  local kit_list=$(echo "$skipped" | cut -f3)
+  local templated_list=$(echo "$skipped" | cut -f4)
+
+  if [ -z "$targets" ]; then
+    if [ "$kit_count" -gt 0 ] || [ "$templated_count" -gt 0 ]; then
+      printf "  ⊘ %s (no canonical targets; deferred: kit=%s templated=%s)\n" \
+        "$consumer_name" "${kit_list:-none}" "${templated_list:-none}"
+    else
+      printf "  · %s (no manifest paths touched by %s)\n" "$consumer_name" "$short_sha"
+    fi
+    SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+    return 0
+  fi
+
+  # Idempotency check before any write. Skipped in dry-run mode: the
+  # check probes the consumer repo via `gh api` and dry-run is meant to
+  # have zero side effects + zero network dependency. The trade-off:
+  # a dry-run plan may show a "would open PR" line even when a PR
+  # already exists; the live run will catch and skip it.
+  if [ "$dry_run" != "1" ]; then
+    local pr_state
+    pr_state=$(sync_check_existing_pr "$consumer_repo" "$branch") || {
+      printf "  ✗ %s — could not query existing PRs from %s\n" "$consumer_name" "$consumer_repo"
+      SYNC_FAILED=$((SYNC_FAILED + 1))
+      return 0
+    }
+    case "$pr_state" in
+      open:*)
+        printf "  · %s already in flight (PR #%s on branch %s)\n" \
+          "$consumer_name" "${pr_state#open:}" "$branch"
+        SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+        return 0
+        ;;
+      closed:*)
+        printf "  · %s already done (PR #%s closed/merged on branch %s)\n" \
+          "$consumer_name" "${pr_state#closed:}" "$branch"
+        SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+        return 0
+        ;;
+    esac
+  fi
+
+  local target_count
+  target_count=$(echo "$targets" | wc -l | tr -d ' ')
+
+  if [ "$dry_run" = "1" ]; then
+    printf "  ⤷ %s — would open PR on branch %s (%d canonical file(s))\n" \
+      "$consumer_name" "$branch" "$target_count"
+    while IFS= read -r p; do
+      [ -z "$p" ] && continue
+      printf "      + %s\n" "$p"
+    done <<< "$targets"
+    if [ "$kit_count" -gt 0 ] || [ "$templated_count" -gt 0 ]; then
+      printf "      (deferred this slice: kit=%s templated=%s)\n" \
+        "${kit_list:-none}" "${templated_list:-none}"
+    fi
+    SYNC_PR_OPENED=$((SYNC_PR_OPENED + 1))
+    return 0
+  fi
+
+  # Live mode: clone, branch, commit, push, PR.
+  if ! sync_open_pr "$consumer_name" "$consumer_repo" "$sha" "$commit_subject" \
+                    "$branch" "$targets" "$kit_list" "$templated_list"; then
+    SYNC_FAILED=$((SYNC_FAILED + 1))
+    return 0
+  fi
+  SYNC_PR_OPENED=$((SYNC_PR_OPENED + 1))
+}
+
+# Live PR-open. Clones the consumer repo into a tmpdir (writeable
+# workspace, never reuses the cache or sibling worktree), copies canonical
+# files from the Mergepath worktree at $sha, commits with the standard
+# self-review body, pushes the branch, and creates a PR.
+#
+# Returns 0 on success, non-zero on failure (caller increments
+# SYNC_FAILED). Stdout: human-readable progress lines.
+sync_open_pr() {
+  local consumer_name=$1
+  local consumer_repo=$2
+  local sha=$3
+  local commit_subject=$4
+  local branch=$5
+  local targets=$6  # newline-separated paths
+  local kit_list=$7
+  local templated_list=$8
+  local short_sha=${sha:0:7}
+
+  local workspace
+  workspace=$(mktemp -d -t "mergepath-sync-$consumer_name") || {
+    err "could not create workspace tmpdir"
+    return 1
+  }
+  trap "rm -rf '$workspace'" RETURN
+
+  printf "  ⤷ %s — cloning %s\n" "$consumer_name" "$consumer_repo"
+  if ! gh repo clone "$consumer_repo" "$workspace/repo" -- --depth=10 --quiet >&2; then
+    err "$consumer_name: gh repo clone failed for $consumer_repo"
+    return 1
+  fi
+
+  # Materialize Mergepath's $sha worktree state for the target files.
+  # Using `git show $sha:<path>` is robust against the working tree
+  # having other uncommitted edits.
+  local target
+  while IFS= read -r target; do
+    [ -z "$target" ] && continue
+    local consumer_target="$workspace/repo/$target"
+    mkdir -p "$(dirname "$consumer_target")"
+    if ! git -C "$MERGEPATH_ROOT" show "$sha:$target" >"$consumer_target" 2>/dev/null; then
+      err "$consumer_name: could not read $target from mergepath@$short_sha"
+      return 1
+    fi
+    # Preserve executable bit if the source has it.
+    local src_mode
+    src_mode=$(git -C "$MERGEPATH_ROOT" ls-tree "$sha" "$target" | awk '{print $1}')
+    if [ "$src_mode" = "100755" ]; then
+      chmod +x "$consumer_target"
+    fi
+  done <<< "$targets"
+
+  # Sanity: did the copy actually change anything? If the consumer was
+  # already in sync (someone hand-propagated it before us, or a prior
+  # sync ran but the PR was never opened), don't push an empty commit.
+  if ! git -C "$workspace/repo" diff --quiet HEAD --; then
+    :
+  else
+    printf "  · %s already in sync at HEAD (no diff after copy)\n" "$consumer_name"
+    SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+    SYNC_PR_OPENED=$((SYNC_PR_OPENED - 1))  # caller incremented eagerly
+    return 0
+  fi
+
+  # Branch + commit. Use git config from the consumer clone (or
+  # mergepath's, since `gh repo clone` inherits the user's local
+  # git identity).
+  if ! git -C "$workspace/repo" checkout -q -b "$branch"; then
+    err "$consumer_name: git checkout -b $branch failed"
+    return 1
+  fi
+  git -C "$workspace/repo" add -A
+  local target_lines
+  target_lines=$(while IFS= read -r p; do [ -z "$p" ] && continue; echo "  - $p"; done <<< "$targets")
+  local deferred_note=""
+  if [ -n "$kit_list" ] || [ -n "$templated_list" ]; then
+    deferred_note="
+Deferred this propagation (sync-to-downstream.sh ${SCRIPT_VERSION}
+only handles canonical paths; kit + templated land in slices 2 and 5):
+  kit:       ${kit_list:-none}
+  templated: ${templated_list:-none}
+"
+  fi
+  if ! git -C "$workspace/repo" commit -q -m "$(cat <<EOF
+sync from mergepath@${short_sha}: ${commit_subject}
+
+Source: https://github.com/nathanjohnpayne/mergepath/commit/${sha}
+Files:
+${target_lines}
+${deferred_note}
+Authoring-Agent: claude
+
+## Self-Review
+- Correctness: mirrors mergepath@${short_sha} verbatim per .mergepath-sync.yml
+- Regression risk: low; same change has been reviewed in the upstream PR
+- Style: N/A (verbatim mirror)
+- Test coverage: relies on the consumer repo CI
+- Security: no new attack surface
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+EOF
+)"; then
+    err "$consumer_name: git commit failed"
+    return 1
+  fi
+
+  # Push. The active gh keyring account ('gh config get -h github.com user')
+  # is what gh uses for write operations. The author identity is what
+  # commits and PR creation should attribute to. Per the active-account
+  # convention (CLAUDE.md), agents wrap author-identity writes in a
+  # switch-around. Here we let the caller pre-arrange that — sync_open_pr
+  # is invoked under the agent's normal active account, so PR creation
+  # bylines as that account. To get nathanjohnpayne attribution on the
+  # PR (matching the standard policy), the caller must switch first.
+  printf "  ⤷ %s — pushing branch %s\n" "$consumer_name" "$branch"
+  if ! git -C "$workspace/repo" push -q -u origin "$branch" 2>&1; then
+    err "$consumer_name: git push failed"
+    return 1
+  fi
+
+  # Open the PR.
+  printf "  ⤷ %s — opening PR\n" "$consumer_name"
+  local pr_url
+  pr_url=$(gh pr create --repo "$consumer_repo" --base main --head "$branch" \
+    --title "sync: ${commit_subject} (mergepath@${short_sha})" \
+    --body "$(cat <<EOF
+Auto-propagated from [mergepath@${short_sha}](https://github.com/nathanjohnpayne/mergepath/commit/${sha}) by \`scripts/sync-to-downstream.sh\` (v${SCRIPT_VERSION}, see [#168](https://github.com/nathanjohnpayne/mergepath/issues/168)).
+
+## Files synced
+${target_lines}
+${deferred_note}
+## Source
+
+${commit_subject}
+
+https://github.com/nathanjohnpayne/mergepath/commit/${sha}
+
+Authoring-Agent: claude
+
+## Self-Review
+- Correctness: mirrors mergepath@${short_sha} verbatim per the upstream manifest. The change has already been reviewed in the upstream Mergepath PR.
+- Regression risk: low. Verbatim mirror of an already-reviewed upstream change.
+- Style: N/A (mirror).
+- Test coverage: relies on the consumer repo CI. No test changes shipped.
+- Security: no new attack surface; the sync script never ran with elevated privileges in this consumer.
+EOF
+)" 2>&1) || {
+    err "$consumer_name: gh pr create failed: $pr_url"
+    return 1
+  }
+  printf "  ✓ %s — opened %s\n" "$consumer_name" "$pr_url"
+}
+
+# Run the sync driver against a single Mergepath commit-ish.
+run_sync() {
+  local commit_ish=$1
+  local dry_run=${2:-0}
+  local manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
+
+  SYNC_PR_OPENED=0
+  SYNC_SKIPPED=0
+  SYNC_FAILED=0
+
+  local sha
+  sha=$(sync_resolve_commit "$commit_ish") || exit 2
+  local short_sha=${sha:0:7}
+  local subject
+  subject=$(git -C "$MERGEPATH_ROOT" show -s --format=%s "$sha")
+
+  local changed_files
+  changed_files=$(sync_changed_files "$sha")
+
+  if [ -z "$changed_files" ]; then
+    err "no files changed at mergepath@${short_sha} — nothing to propagate"
+    exit 0
+  fi
+
+  echo "Sync from mergepath@${short_sha}: ${subject}"
+  echo "Changed files at this commit:"
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    echo "  $f"
+  done <<< "$changed_files"
+  echo
+
+  # Per-consumer
+  local consumers
+  consumers=$(yq -r '.consumers[] | (.name + "\t" + .repo)' "$manifest")
+  while IFS=$'\t' read -r consumer_name consumer_repo; do
+    [ -z "$consumer_name" ] && continue
+    if ! in_repo_filter "$consumer_name"; then continue; fi
+    sync_one_consumer "$consumer_name" "$consumer_repo" "$sha" "$subject" \
+                      "$changed_files" "$dry_run"
+  done <<< "$consumers"
+
+  echo
+  echo "Summary: PRs opened/planned: $SYNC_PR_OPENED  skipped: $SYNC_SKIPPED  failed: $SYNC_FAILED"
+  if [ "$SYNC_FAILED" -gt 0 ]; then return 1; fi
+  return 0
+}
+
 # --- arg parsing ------------------------------------------------------------
 
 MODE=""
+SYNC_COMMIT_ISH=""
+SYNC_DRY_RUN=0
 FILTER_REPOS=""
 FILTER_PATHS=""
 
@@ -504,6 +949,10 @@ while [ $# -gt 0 ]; do
       AUDIT_NO_REFRESH=1
       shift
       ;;
+    --dry-run)
+      SYNC_DRY_RUN=1
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -521,9 +970,14 @@ while [ $# -gt 0 ]; do
       exit 2
       ;;
     *)
-      err "Layer 3 sync mode (positional <commit-ish>) not yet implemented — see #168."
-      err "Currently supported modes: --audit, --help, --version."
-      exit 2
+      # Positional argument = commit-ish. Sync mode.
+      if [ -n "$SYNC_COMMIT_ISH" ]; then
+        err "multiple positional commit-ish args not supported (got '$SYNC_COMMIT_ISH' and '$1')"
+        exit 2
+      fi
+      SYNC_COMMIT_ISH="$1"
+      MODE="sync"
+      shift
       ;;
   esac
 done
@@ -546,6 +1000,12 @@ case "$MODE" in
     else
       exit 0
     fi
+    ;;
+  sync)
+    if ! run_sync "$SYNC_COMMIT_ISH" "$SYNC_DRY_RUN"; then
+      exit 1
+    fi
+    exit 0
     ;;
   *)
     err "internal error: unknown MODE=$MODE"
