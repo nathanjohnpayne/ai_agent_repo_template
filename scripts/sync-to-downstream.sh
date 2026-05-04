@@ -254,7 +254,10 @@ compare_kit() {
   # Walk every file under the Mergepath kit. Ignore symlinks and
   # special files — kits are plain script directories.
   while IFS= read -r -d '' f; do
-    local rel="${f#$mp_full/}"
+    # Quote inside the expansion so shell glob metacharacters in the
+    # path (improbable in this repo, but cheap to be correct) are
+    # treated as literals. CodeRabbit nitpick on PR #215.
+    local rel="${f#"$mp_full/"}"
     local target="$consumer_full/$rel"
     if [ ! -e "$target" ]; then
       missing_count=$((missing_count + 1))
