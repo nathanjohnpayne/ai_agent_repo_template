@@ -172,6 +172,42 @@ echo "$output" | grep -q "no local worktree" \
   && fail "worktree (.git as file) misclassified as missing"
 
 # ---------------------------------------------------------------------------
+# Symlink guard on cache refresh (cursor CHANGES_REQUESTED on PR #215).
+# If MERGEPATH_SYNC_CACHE/<consumer> resolves outside the cache dir
+# (because it's symlinked at a sibling clone), refresh_cached_clone
+# must refuse to `git reset --hard` and return error.
+# ---------------------------------------------------------------------------
+hostile_cache="$WORKDIR/hostile-cache"
+hostile_user_tree="$WORKDIR/hostile-user-tree"
+mkdir -p "$hostile_cache" "$hostile_user_tree/scripts/hooks" "$hostile_user_tree/scripts/ci"
+git init -q "$hostile_user_tree"
+# Set up a fake origin so git fetch / git reset have something to point at,
+# and seed user-only content so a hard reset would clobber observable state.
+( cd "$hostile_user_tree" \
+    && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m "user-only commit" )
+# Symlink the cache entry at the user's tree.
+ln -s "$hostile_user_tree" "$hostile_cache/clean-consumer"
+echo "USER_LOCAL_EDIT" >"$hostile_user_tree/scripts/keep-in-sync.sh"
+
+set +e
+hostile_output=$(MERGEPATH_ROOT_OVERRIDE="$MP" \
+  MERGEPATH_SIBLINGS_DIR="$WORKDIR/no-siblings-here" \
+  MERGEPATH_SYNC_CACHE="$hostile_cache" \
+  "$SCRIPT" --audit --repos clean-consumer 2>&1)
+hostile_exit=$?
+set -e
+[[ "$hostile_exit" -eq 3 ]] \
+  || fail "expected exit 3 (fetch error from refusing symlinked cache), got $hostile_exit"
+echo "$hostile_output" | grep -qE "it is a symbolic link|resolves outside MERGEPATH_SYNC_CACHE" \
+  || fail "expected symlink-guard error message; got: $hostile_output"
+# The user's working tree must NOT have been touched — this is the
+# load-bearing assertion. The exit code and error message are
+# observable proxies; what actually matters is that the user's local
+# edits survive.
+[[ "$(cat "$hostile_user_tree/scripts/keep-in-sync.sh")" == "USER_LOCAL_EDIT" ]] \
+  || fail "symlink-guarded cache path was reset, clobbering the user's working tree"
+
+# ---------------------------------------------------------------------------
 # --version / --help smoke
 # ---------------------------------------------------------------------------
 "$SCRIPT" --version | grep -q "sync-to-downstream.sh" || fail "--version output unexpected"

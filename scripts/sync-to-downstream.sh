@@ -141,9 +141,12 @@ require_manifest() {
 # --- consumer worktree resolution -------------------------------------------
 
 # Echo the path on disk where we should read the consumer's working tree.
-# Returns 0 if found, 1 if not. Sets $RESOLVED_FROM to "siblings" or "cache"
-# so the caller knows whether to refresh-fetch (caches drift; siblings are
-# the user's authoritative working tree and must not be touched).
+# Returns 0 if found, 1 if not. The caller distinguishes cache vs.
+# sibling by comparing the returned path's prefix against
+# MERGEPATH_SYNC_CACHE — see the helper `path_is_in_cache` below.
+# (An earlier draft used a $RESOLVED_FROM global, but the function is
+# called via command substitution which runs in a subshell, swallowing
+# the assignment. Encoding the answer in the path is subshell-safe.)
 #
 # Accepts both `.git` directory (regular clone) and `.git` file (git
 # worktree). Codex P2 on PR #215 caught the worktree case — the original
@@ -154,24 +157,72 @@ resolve_consumer_worktree() {
   local cache_dir=${MERGEPATH_SYNC_CACHE:-$HOME/.cache/mergepath-sync}
 
   if [ -e "$siblings_dir/$consumer_name/.git" ]; then
-    RESOLVED_FROM="siblings"
     echo "$siblings_dir/$consumer_name"
     return 0
   fi
   if [ -e "$cache_dir/$consumer_name/.git" ]; then
-    RESOLVED_FROM="cache"
     echo "$cache_dir/$consumer_name"
     return 0
   fi
   return 1
 }
 
+# Lexical prefix check: does $1 live under MERGEPATH_SYNC_CACHE?
+# Trailing slash on the cache root makes the prefix unambiguous so a
+# sibling dir whose name happens to match the cache-dir prefix can't
+# false-match.
+path_is_in_cache() {
+  local p=$1
+  local cache_root=${MERGEPATH_SYNC_CACHE:-$HOME/.cache/mergepath-sync}
+  [[ "$p" == "$cache_root"/* ]]
+}
+
 # Bring a cached clone up to date with the consumer's default branch.
 # Skipped silently if the path was resolved from a sibling worktree —
 # refreshing a user's working tree would clobber uncommitted edits.
 # Codex P1 on PR #215 caught the stale-cache hazard.
+#
+# Symlink guard (cursor CHANGES_REQUESTED on PR #215): a user who
+# symlinks $MERGEPATH_SYNC_CACHE/<consumer> at their sibling clone
+# (or vice versa) would otherwise have their working tree reset by
+# the `git reset --hard` below. Resolve the physical path of the
+# cache entry and the cache root, then refuse to refresh if the
+# entry escapes the cache root. This catches both direct symlinks
+# (cache_path itself is a symlink) and indirect symlinks
+# (any ancestor in the path is symlinked elsewhere).
 refresh_cached_clone() {
   local cache_path=$1
+  local cache_root=${MERGEPATH_SYNC_CACHE:-$HOME/.cache/mergepath-sync}
+
+  # Direct-symlink guard: if the cache entry itself is a symlink, the
+  # `git reset --hard` below would clobber whatever it points at. Refuse.
+  if [ -L "$cache_path" ]; then
+    err "refusing to refresh $cache_path — it is a symbolic link."
+    err "       \`git reset --hard\` would clobber the symlink target,"
+    err "       which is likely a sibling/user clone. Remove the symlink"
+    err "       (the script will re-clone into the cache) or run with"
+    err "       --no-refresh."
+    return 3
+  fi
+
+  # Ancestor-symlink guard: if `cd && pwd -P` resolves to a path
+  # outside the cache root, an ancestor in the path is symlinked
+  # elsewhere. `pwd -P` is POSIX and resolves all symlinks; macOS
+  # `realpath` lacks `-P` so we don't use it. cursor's
+  # CHANGES_REQUESTED on PR #215 found this attack surface.
+  local phys_path phys_root
+  phys_path=$(cd "$cache_path" 2>/dev/null && pwd -P) || phys_path=""
+  phys_root=$(cd "$cache_root" 2>/dev/null && pwd -P) || phys_root="$cache_root"
+
+  if [ -z "$phys_path" ] || [[ "$phys_path" != "$phys_root"/* && "$phys_path" != "$phys_root" ]]; then
+    err "refusing to refresh $cache_path — physical path ($phys_path)"
+    err "       resolves outside MERGEPATH_SYNC_CACHE ($phys_root)."
+    err "       Some ancestor of the cache entry is symlinked elsewhere."
+    err "       Run with --no-refresh, or rebuild MERGEPATH_SYNC_CACHE"
+    err "       without symlinks."
+    return 3
+  fi
+
   log "refreshing cached clone at $cache_path"
   # `origin/HEAD` is set by `gh repo clone`'s underlying `git clone` to
   # the consumer's default branch. Resetting hard is safe here: this
@@ -342,7 +393,6 @@ run_audit() {
     echo "$consumer_name ($consumer_repo)"
 
     local consumer_root
-    RESOLVED_FROM=""
     if ! consumer_root=$(resolve_consumer_worktree "$consumer_name"); then
       if [ "${AUDIT_NO_CLONE:-0}" = "1" ]; then
         echo "  ! no local worktree for $consumer_name (set MERGEPATH_SIBLINGS_DIR or drop --no-clone)"
@@ -354,14 +404,12 @@ run_audit() {
         AUDIT_FETCH_ERROR=1
         continue
       fi
-      RESOLVED_FROM="cache"
     fi
-    # If we're reading from a stale cache (resolved on the second branch
-    # of resolve_consumer_worktree), pull the latest default branch
-    # before comparing. Skip for sibling worktrees; that's the user's
-    # working tree and must not be auto-reset. Honors --no-refresh for
-    # offline / sandboxed runs.
-    if [ "$RESOLVED_FROM" = "cache" ] && [ "${AUDIT_NO_REFRESH:-0}" != "1" ]; then
+    # If we're reading from a cache path (vs. a sibling worktree),
+    # pull the latest default branch before comparing. Skip for
+    # sibling worktrees; that's the user's working tree and must not
+    # be auto-reset. Honors --no-refresh for offline / sandboxed runs.
+    if path_is_in_cache "$consumer_root" && [ "${AUDIT_NO_REFRESH:-0}" != "1" ]; then
       if ! refresh_cached_clone "$consumer_root"; then
         echo "  ! could not refresh cached clone for $consumer_name"
         AUDIT_FETCH_ERROR=1
