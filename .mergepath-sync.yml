@@ -37,6 +37,9 @@ consumers:
   - name: swipewatch
     repo: nathanjohnpayne/swipewatch
     visibility: public
+  - name: tadlockpsychiatry
+    repo: nathanjohnpayne/tadlockpsychiatry
+    visibility: private
 
 # Path types:
 #   canonical  — byte-for-byte mirror. Any difference is drift.
