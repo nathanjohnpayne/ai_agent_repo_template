@@ -735,8 +735,16 @@ sync_open_pr() {
   local templated_list=$8
   local short_sha=${sha:0:7}
 
+  # Portable mktemp: `-t TEMPLATE` semantics differ between BSD (macOS)
+  # and GNU coreutils. macOS treats TEMPLATE as a literal prefix and
+  # appends random chars; GNU treats it as a TMPDIR-rooted basename
+  # but ONLY if the value contains no slash, AND the trailing X-pattern
+  # rules differ. Use the explicit-path form `mktemp -d "$TMPDIR/<X...>"`
+  # which both implementations honor identically. cursor CHANGES_REQUESTED
+  # on PR #217 caught the GNU/Linux portability gap.
+  local tmp_root=${TMPDIR:-/tmp}
   local workspace
-  workspace=$(mktemp -d -t "mergepath-sync-$consumer_name") || {
+  workspace=$(mktemp -d "$tmp_root/mergepath-sync-${consumer_name}.XXXXXX") || {
     err "could not create workspace tmpdir"
     return 1
   }
@@ -751,10 +759,30 @@ sync_open_pr() {
   # Materialize Mergepath's $sha worktree state for the target files.
   # Using `git show $sha:<path>` is robust against the working tree
   # having other uncommitted edits.
+  #
+  # Deletion handling: when Mergepath drops a canonical file at $sha,
+  # `git ls-tree $sha <path>` returns empty (the path no longer exists
+  # in the tree). Treat that as a delete propagation: rm the consumer
+  # copy if present. cursor CHANGES_REQUESTED on PR #217 caught the
+  # missing delete propagation — without this branch, deletes would
+  # fail noisily on `git show` and the script would abort the entire
+  # consumer rather than mirroring the delete.
   local target
   while IFS= read -r target; do
     [ -z "$target" ] && continue
     local consumer_target="$workspace/repo/$target"
+    local src_mode
+    src_mode=$(git -C "$MERGEPATH_ROOT" ls-tree "$sha" -- "$target" | awk '{print $1}')
+
+    if [ -z "$src_mode" ]; then
+      # Path absent at $sha → delete propagation.
+      if [ -e "$consumer_target" ]; then
+        rm -f "$consumer_target"
+      fi
+      # No mode-mirror for deletes; the path is gone in both trees.
+      continue
+    fi
+
     mkdir -p "$(dirname "$consumer_target")"
     if ! git -C "$MERGEPATH_ROOT" show "$sha:$target" >"$consumer_target" 2>/dev/null; then
       err "$consumer_name: could not read $target from mergepath@$short_sha"
@@ -767,8 +795,6 @@ sync_open_pr() {
     # consumer historically had +x set on a file Mergepath later
     # decided should be plain). cursor's CHANGES_REQUESTED on PR #217
     # caught the one-way version that only added +x.
-    local src_mode
-    src_mode=$(git -C "$MERGEPATH_ROOT" ls-tree "$sha" "$target" | awk '{print $1}')
     case "$src_mode" in
       100755) chmod +x "$consumer_target" ;;
       100644) chmod -x "$consumer_target" ;;

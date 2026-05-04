@@ -404,6 +404,29 @@ grep -q 'chmod +x "$consumer_target"' "$SCRIPT" \
   || fail "sync_open_pr is missing the 'chmod +x' branch"
 
 # ---------------------------------------------------------------------------
+# Deletion propagation + tmpdir portability (cursor CHANGES_REQUESTED on
+# PR #217). Two source-grep assertions because the live cycle isn't
+# unit-testable without stubbing gh:
+#
+# 1. The materialization loop must check `git ls-tree` for a path
+#    BEFORE trying `git show`, and if the path is absent at the sha,
+#    rm the consumer copy instead of failing on a missing blob.
+# 2. The mktemp invocation must use the explicit `$TMPDIR/<X-pattern>`
+#    form (portable across BSD/macOS and GNU/Linux), not `mktemp -d -t
+#    "literal-prefix"` (BSD-specific behavior).
+# ---------------------------------------------------------------------------
+grep -q 'ls-tree "$sha" -- "$target"' "$SCRIPT" \
+  || fail "materialization loop is missing the ls-tree pre-check; deletes would fail on git show"
+grep -q '\[ -z "\$src_mode" \]' "$SCRIPT" \
+  || fail "materialization loop is missing the absent-at-sha branch (rm consumer copy on delete propagation)"
+grep -q 'rm -f "\$consumer_target"' "$SCRIPT" \
+  || fail "materialization loop is missing 'rm -f \$consumer_target' for delete propagation"
+grep -q 'mktemp -d "\$tmp_root/mergepath-sync-' "$SCRIPT" \
+  || fail "mktemp invocation is missing the portable \$TMPDIR/<prefix>.XXXXXX form"
+grep -q 'mktemp -d -t "mergepath-sync' "$SCRIPT" \
+  && fail "mktemp invocation still uses the BSD-specific '-t literal-prefix' form (not GNU portable)"
+
+# ---------------------------------------------------------------------------
 # --version / --help smoke
 # ---------------------------------------------------------------------------
 "$SCRIPT" --version | grep -q "sync-to-downstream.sh" || fail "--version output unexpected"
