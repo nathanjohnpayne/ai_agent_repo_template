@@ -231,17 +231,40 @@ fetch_api_array() {
 # transient API hiccup (network, 5xx, etc.) — caller treats it as
 # "fall through to the existing comment-driven path."
 #
-# This is the load-bearing query for the StatusContext fast-path. The
-# `.statuses[]` filter narrows to the CodeRabbit context specifically;
-# other GitHub Apps may post their own contexts on the same SHA.
+# Two defensive guards (CodeRabbit ⚠️ Critical on PR #224 round 1):
+#
+# 1. Filter by `creator.login == $BOT_LOGIN` in addition to context.
+#    Anyone with write access to commit statuses can post a status
+#    with the literal context string "CodeRabbit"; without the
+#    creator filter, that's a spoof vector. The configured bot login
+#    is the only signal we trust.
+#
+# 2. Use `sort_by(.created_at) | last` to pick the latest status, not
+#    `head -n 1`. The /statuses endpoint does not guarantee chronological
+#    ordering across calls, so `head` could return a stale status if
+#    multiple have been posted on the same SHA (e.g., re-evaluation
+#    after a CodeRabbit retry).
+#
+# Endpoint choice: `/commits/{sha}/statuses` (plural) returns each
+# status object with full `creator` details. The singular
+# `/commits/{sha}/status` rolls up state but omits per-status creator
+# fields, which would defeat guard 1. Confirmed empirically — see
+# PR #224 round 2.
 check_status_context() {
   local resp state
-  resp=$(gh api "repos/$REPO/commits/$HEAD_SHA/status" 2>/dev/null) || {
+  resp=$(gh api "repos/$REPO/commits/$HEAD_SHA/statuses" 2>/dev/null) || {
     echo "missing"
     return
   }
-  state=$(echo "$resp" | jq -r '.statuses[]? | select(.context == "CodeRabbit") | .state' \
-    | head -n 1)
+  state=$(echo "$resp" | jq -r --arg bot "$BOT_LOGIN" '
+    [ .[]?
+      | select(.context == "CodeRabbit")
+      | select((.creator.login // "") == $bot)
+    ]
+    | sort_by(.created_at)
+    | last
+    | .state // ""
+  ')
   if [ -z "$state" ]; then
     echo "missing"
     return
@@ -525,11 +548,36 @@ sleep_or_timeout() {
   sleep "$actual"
 }
 
-emit_status_context_clearance() {
+emit_status_context_verdict() {
   local state=$1
-  local synthetic
-  synthetic=$(jq -nc --arg sha "$HEAD_SHA" --arg state "$state" \
-    '{endpoint:"status_context", head_sha:$sha, context_state:$state, body_excerpt:("CodeRabbit StatusContext = " + $state + " on " + $sha)}')
+  # CodeRabbit's StatusContext SUCCESS state means "review completed"
+  # — NOT "no findings remain." With CodeRabbit's default
+  # `request_changes_workflow: false`, the status flips to success
+  # whenever the review finishes, even if Potential issue / ⚠️
+  # comments were posted. Codex (chatgpt-codex-connector[bot]) caught
+  # this on PR #224 round 1 (P1 finding, line 546). The fix: scan
+  # inline `Potential issue` / `⚠️` markers anchored on HEAD before
+  # declaring clearance, exactly like the comment-driven path's
+  # post-classification scan does. If any exist, exit 2 (findings)
+  # so the caller addresses them instead of merging past them.
+  local potential_issues synthetic
+  potential_issues=$(count_potential_issues)
+  synthetic=$(jq -nc \
+    --arg sha "$HEAD_SHA" \
+    --arg state "$state" \
+    --argjson p "$potential_issues" \
+    '{
+      endpoint: "status_context",
+      head_sha: $sha,
+      context_state: $state,
+      potential_issue_count: $p,
+      body_excerpt: ("CodeRabbit StatusContext = " + $state + " on " + $sha + " (potential_issue_count=" + ($p | tostring) + ")")
+    }')
+  if [ "$potential_issues" -gt 0 ]; then
+    log "StatusContext $state but $potential_issues Potential issue/⚠️ marker(s) on HEAD — emitting findings (exit 2)"
+    emit_json_and_exit "findings" 2 "$synthetic" "$potential_issues"
+  fi
+  log "StatusContext $state and 0 Potential issue/⚠️ markers — emitting cleared (exit 0)"
   emit_json_and_exit "cleared" 0 "$synthetic" 0
 }
 
@@ -542,8 +590,8 @@ if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
   INITIAL_CTX=$(check_status_context)
   log "initial CodeRabbit StatusContext = $INITIAL_CTX on $HEAD_SHA"
   if [ "$INITIAL_CTX" = "success" ]; then
-    log "StatusContext success — short-circuit clearance (no comment poll needed)"
-    emit_status_context_clearance "$INITIAL_CTX"
+    log "StatusContext success — entering fast-path verdict (scans inline findings before clearance)"
+    emit_status_context_verdict "$INITIAL_CTX"
   fi
 fi
 
@@ -562,8 +610,8 @@ while :; do
   if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
     LOOP_CTX=$(check_status_context)
     if [ "$LOOP_CTX" = "success" ]; then
-      log "CodeRabbit StatusContext flipped to success mid-loop on $HEAD_SHA — short-circuit clearance"
-      emit_status_context_clearance "$LOOP_CTX"
+      log "CodeRabbit StatusContext flipped to success mid-loop on $HEAD_SHA — entering fast-path verdict"
+      emit_status_context_verdict "$LOOP_CTX"
     fi
   fi
 
