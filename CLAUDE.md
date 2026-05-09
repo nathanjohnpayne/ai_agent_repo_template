@@ -101,7 +101,18 @@ keyring active is your agent identity. No switch needed for commits.
 5. Post comments on any issues found.
 6. Address each comment via fix commits (commits use git config, no
    gh auth involved — byline stays nathanjohnpayne).
-7. Repeat steps 4–6 until the reviewer identity approves.
+7. Repeat steps 4–6 until the reviewer identity approves. The mechanism
+   of "approves" is scope-dependent (REVIEW_POLICY.md
+   § No-self-approve scoping):
+   - **Under-threshold PRs** (lines changed < `external_review_threshold`
+     AND no file matches `external_review_paths`): the reviewer identity
+     posts `gh pr review <PR#> --repo owner/repo --approve --body "..."`
+     once CodeRabbit has cleared the current HEAD. This is the intended
+     path — it satisfies branch protection's required-approving-review
+     check without bouncing a small PR to an external agent.
+   - **Above-threshold PRs**: the reviewer identity posts `--comment`
+     only. Phase 4 (step 9 below) carries the cross-agent merge gate
+     via Codex 👍 (4a) or external CLI reviewer's `APPROVED` (4b).
 7.5. If `.github/review-policy.yml` has `coderabbit.enabled: true`:
      a. Wait for CodeRabbit to post on the current HEAD. Prefer
         `scripts/coderabbit-wait.sh <PR#>` over an ad-hoc poll — it
