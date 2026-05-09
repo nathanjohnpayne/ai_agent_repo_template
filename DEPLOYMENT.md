@@ -427,8 +427,13 @@ gh auth switch -u nathanjohnpayne && \
 - On local interactive machines, the `op read` command itself may trigger the
   1Password biometric prompt even if `op whoami` says you are not signed in.
 - `Review Can not approve your own pull request` means you are the active
-  account on a PR you authored. Switch to a different agent's reviewer
-  identity (or skip self-approve per the no-self-approve rule).
+  account on a PR you authored under the SAME GitHub account. Switch to
+  your reviewer identity (`gh auth switch -u nathanpayne-<agent>`). If
+  you intentionally skipped `--approve` under the no-self-approve scoping
+  rule (Phase 4 / above-threshold PRs only — see REVIEW_POLICY.md
+  § No-self-approve scoping), post `--comment` and let Phase 4 carry the
+  gate. For under-threshold PRs the reviewer identity is allowed and
+  expected to `--approve`.
 
 ### Token rotation (as needed)
 

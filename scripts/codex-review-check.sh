@@ -557,16 +557,20 @@ APPROVING_REVIEWER=$(echo "$REVIEWS_JSON" | jq -r \
 ')
 
 if [ -z "$APPROVING_REVIEWER" ]; then
-  # Branch 2 (#170): same-agent author/reviewer fallback. The
-  # no-self-approve rule prohibits the agent that authored the PR from
-  # also approving under its own reviewer identity, which leaves
-  # same-agent PRs unable to clear gate (b) by branch 1 unless a second
-  # agent (cursor / codex CLI) reviews independently. In a single-agent
-  # session that's friction with no policy benefit — Codex's external
-  # review IS the cross-agent signal. Accept a fresh Codex 👍 reaction
-  # on the PR issue as a substitute for branch 1, BUT ONLY when the
-  # PR's Authoring-Agent matches an entry in available_reviewers
-  # (otherwise this would weaken gate (b) for cross-agent PRs that
+  # Branch 2 (#170): same-agent author/reviewer fallback. For Phase 4
+  # PRs, the no-self-approve scoping rule (REVIEW_POLICY.md § No-self-
+  # approve scoping; #220) prohibits the agent that authored the PR from
+  # also approving under its own reviewer identity — that's the case
+  # this branch handles. (Under-threshold PRs don't reach this script;
+  # they self-approve via the reviewer identity per the same scoping
+  # rule.) Same-agent PRs at Phase 4 would otherwise be unable to clear
+  # gate (b) by branch 1 unless a second agent (cursor / codex CLI)
+  # reviews independently. In a single-agent session that's friction
+  # with no policy benefit — Codex's external review IS the cross-agent
+  # signal. Accept a fresh Codex 👍 reaction on the PR issue as a
+  # substitute for branch 1, BUT ONLY when the PR's Authoring-Agent
+  # matches an entry in available_reviewers (otherwise this would
+  # weaken gate (b) for cross-agent PRs that
   # genuinely need a reviewer-identity APPROVED).
   #
   # Freshness: same REACTION_THRESHOLD that gate (c) uses, computed
