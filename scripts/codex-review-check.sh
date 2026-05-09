@@ -762,6 +762,14 @@ fi
 # HEAD_SHA match — no time-window approximation needed since the
 # review API returns the exact SHA the review was submitted on.
 #
+# Latest-state-per-reviewer filter (Codex P1 round 1 on PR #225):
+# group reviews on HEAD by reviewer identity, take each reviewer's
+# most-recent review on this SHA, then accept ONLY if that latest
+# state is APPROVED. Without this guard, a reviewer who first APPROVED
+# then later submitted CHANGES_REQUESTED on the same HEAD would still
+# satisfy the substitute via the stale APPROVED. Mirrors gate (b)
+# branch 1's same-shaped filter (line 547 above).
+#
 # When this branch fires, the auto-clear-blocking-labels workflow
 # correctly removes `needs-external-review` on the next event-driven
 # trigger or scheduled sweep, instead of stalling on a permanently-
@@ -772,20 +780,22 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     --arg author "$PR_AUTHOR" \
     --arg sha "$HEAD_SHA" '
       [ .[]
-        | select(.state == "APPROVED")
+        | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
         | select(.commit_id == $sha)
         | select(.user.login as $u | $reviewers | index($u))
         | select(.user.login != $author)
       ]
-      | sort_by(.submitted_at)
-      | last
+      | group_by(.user.login)
+      | map(max_by(.submitted_at))
+      | map(select(.state == "APPROVED"))
+      | first
       | if . == null then "" else .user.login + "|" + .submitted_at end
   ')
   if [ -n "$PHASE_4B_APPROVER" ]; then
     PHASE_4B_LOGIN="${PHASE_4B_APPROVER%|*}"
     PHASE_4B_TIME="${PHASE_4B_APPROVER#*|}"
     CLEARED=true
-    CLEARANCE_REASON="Phase 4b substitute: APPROVED review from $PHASE_4B_LOGIN @ $PHASE_4B_TIME on $HEAD_SHA (codex.allow_phase_4b_substitute=true)"
+    CLEARANCE_REASON="Phase 4b substitute: latest-state APPROVED on HEAD from $PHASE_4B_LOGIN @ $PHASE_4B_TIME (codex.allow_phase_4b_substitute=true)"
   fi
 fi
 
