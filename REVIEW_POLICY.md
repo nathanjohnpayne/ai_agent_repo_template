@@ -711,9 +711,13 @@ gh auth switch -u nathanjohnpayne && \
   command in an interactive TTY. That is what triggers the 1Password biometric
   prompt on local machines.
 - If GitHub returns `Review Can not approve your own pull request`, you
-  are the active account on a PR you authored. Switch to a different
-  agent's reviewer identity (or skip self-approve per the no-self-approve
-  rule).
+  are the active account on a PR you authored under the SAME GitHub
+  account. Typically the keyring active is `nathanjohnpayne` rather
+  than your reviewer identity — fix with
+  `gh auth switch -u nathanpayne-<agent>`. If you intentionally skipped
+  `--approve` under the [No-self-approve scoping](#no-self-approve-scoping)
+  rule (Phase 4 / above-threshold PRs), post `--comment` instead and let
+  Phase 4 carry the gate.
 
 > **If `op read` fails with a sign-in or biometric error here**, follow the pause-and-prompt procedure in `docs/agents/operating-rules.md` under "1Password CLI authentication failures." Do not hardcode tokens, skip review, or retry in a loop.
 
