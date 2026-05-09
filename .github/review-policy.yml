@@ -130,6 +130,21 @@ coderabbit:
   # between consecutive CodeRabbit reviews.
   wallclock_freshness_window_seconds: 1800
 
+  # Trust CodeRabbit's per-SHA `CodeRabbit` StatusContext check as a
+  # standalone clearance signal in `scripts/coderabbit-wait.sh`. When
+  # `true` (default), the wait helper short-circuits with status=cleared
+  # the moment the StatusContext goes SUCCESS for the current HEAD —
+  # even if no narrative review comment was posted on this push.
+  # CodeRabbit does NOT re-narrate when a fix-up push genuinely cleared
+  # all prior findings, so the comment-driven path alone burns the full
+  # `max_wait_seconds` budget on every clean fix-up cycle. The
+  # StatusContext is CodeRabbit's own authoritative per-SHA verdict, so
+  # there's no scenario where the comment contradicts a green status.
+  # Set to `false` for repos that prefer the strict comment-driven gate
+  # (e.g., if a downstream consumer relies on parsing CodeRabbit's
+  # narrative for some other purpose). See nathanjohnpayne/mergepath#221.
+  trust_status_context_for_clearance: true
+
 # ---------------------------------------------------------------------------
 # Codex (Automated External Review — Phase 4a)
 # ---------------------------------------------------------------------------

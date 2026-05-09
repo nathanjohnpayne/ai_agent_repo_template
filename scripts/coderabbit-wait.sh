@@ -179,6 +179,30 @@ BOT_LOGIN=${BOT_LOGIN:-"coderabbitai[bot]"}
 POLL_INTERVAL_SECONDS=15
 RATE_LIMIT_BUFFER_SECONDS=30
 
+# CodeRabbit emits two distinct per-SHA signals:
+#   1. Narrative review comment (issue/PR comment + inline diff comments).
+#      The freshness-anchored polling loop watches for this. Posted only
+#      when there's commentary to add — clean re-reviews on fix-up pushes
+#      can skip it entirely.
+#   2. `CodeRabbit` StatusContext check on the commit status API. Always
+#      posted per-SHA, terminal state SUCCESS/FAILURE.
+# The narrative comment alone is the historical terminal-state source,
+# but on a fix-up push that genuinely cleared all prior findings, signal
+# (2) flips to SUCCESS while signal (1) stays silent — and this script
+# would burn its full MAX_WAIT_SECONDS budget waiting for a comment that
+# never comes. Toggle off via `coderabbit.trust_status_context_for_clearance:
+# false` in `.github/review-policy.yml` for repos that prefer the
+# strict comment-driven gate. See nathanjohnpayne/mergepath#221.
+TRUST_STATUS_CONTEXT=$(coderabbit_field trust_status_context_for_clearance)
+TRUST_STATUS_CONTEXT=${TRUST_STATUS_CONTEXT:-true}
+case "$TRUST_STATUS_CONTEXT" in
+  true|false) ;;
+  *)
+    echo "ERROR: coderabbit.trust_status_context_for_clearance must be true|false; got '$TRUST_STATUS_CONTEXT'" >&2
+    exit 3
+    ;;
+esac
+
 # --- logging helpers --------------------------------------------------------
 
 log() {
@@ -199,6 +223,30 @@ fetch_api_array() {
   raw=$(gh api --paginate "$endpoint" 2>&1) || die 3 "failed to fetch $label: $raw"
   echo "$raw" | jq -s 'add // []' 2>/dev/null \
     || die 3 "failed to flatten $label pagination output"
+}
+
+# Fetch the CodeRabbit `StatusContext` check on the current HEAD SHA.
+# Emits one of: success | failure | pending | error | missing
+# on stdout. `missing` covers both the no-statuses-yet case and any
+# transient API hiccup (network, 5xx, etc.) — caller treats it as
+# "fall through to the existing comment-driven path."
+#
+# This is the load-bearing query for the StatusContext fast-path. The
+# `.statuses[]` filter narrows to the CodeRabbit context specifically;
+# other GitHub Apps may post their own contexts on the same SHA.
+check_status_context() {
+  local resp state
+  resp=$(gh api "repos/$REPO/commits/$HEAD_SHA/status" 2>/dev/null) || {
+    echo "missing"
+    return
+  }
+  state=$(echo "$resp" | jq -r '.statuses[]? | select(.context == "CodeRabbit") | .state' \
+    | head -n 1)
+  if [ -z "$state" ]; then
+    echo "missing"
+    return
+  fi
+  echo "$state"
 }
 
 # --- fetch PR metadata ------------------------------------------------------
@@ -477,12 +525,46 @@ sleep_or_timeout() {
   sleep "$actual"
 }
 
+emit_status_context_clearance() {
+  local state=$1
+  local synthetic
+  synthetic=$(jq -nc --arg sha "$HEAD_SHA" --arg state "$state" \
+    '{endpoint:"status_context", head_sha:$sha, context_state:$state, body_excerpt:("CodeRabbit StatusContext = " + $state + " on " + $sha)}')
+  emit_json_and_exit "cleared" 0 "$synthetic" 0
+}
+
+# Pre-loop fast-path. If CodeRabbit posted SUCCESS on this SHA before
+# the script started polling, we can short-circuit immediately and
+# avoid the first 15s sleep. See #221 — the historical comment-driven
+# poll burned the full 300s budget on every clean fix-up push because
+# CodeRabbit doesn't re-narrate when there's nothing new to flag.
+if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
+  INITIAL_CTX=$(check_status_context)
+  log "initial CodeRabbit StatusContext = $INITIAL_CTX on $HEAD_SHA"
+  if [ "$INITIAL_CTX" = "success" ]; then
+    log "StatusContext success — short-circuit clearance (no comment poll needed)"
+    emit_status_context_clearance "$INITIAL_CTX"
+  fi
+fi
+
 while :; do
   NOW_EPOCH=$(date +%s)
   ELAPSED=$((NOW_EPOCH - START_EPOCH))
   if [ "$ELAPSED" -ge "$MAX_WAIT_SECONDS" ]; then
     log "max_wait_seconds ($MAX_WAIT_SECONDS) exceeded after ${ELAPSED}s — timing out"
     emit_json_and_exit "timeout" 4 "null" 0
+  fi
+
+  # In-loop fast-path — same intent as the pre-loop check, for the case
+  # where CodeRabbit posts SUCCESS while we're already polling. Cheaper
+  # API call than `scan_latest_comment` so it's worth doing first each
+  # iteration; falls through to the comment scan if not success/failure.
+  if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
+    LOOP_CTX=$(check_status_context)
+    if [ "$LOOP_CTX" = "success" ]; then
+      log "CodeRabbit StatusContext flipped to success mid-loop on $HEAD_SHA — short-circuit clearance"
+      emit_status_context_clearance "$LOOP_CTX"
+    fi
   fi
 
   LATEST=$(scan_latest_comment)
