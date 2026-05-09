@@ -98,6 +98,21 @@ fail() { echo "FAIL: $*" >&2; echo "---output---" >&2; echo "$output" >&2; exit 
 # Exit 1 because at least one consumer drifts.
 [[ "$exit_code" -eq 1 ]] || fail "expected exit 1 (drift), got $exit_code"
 
+# Per-consumer header presence checks (#216). The awk block-parsers
+# below use `/^<consumer-name>/` to extract a section, then grep for
+# ✓/✗/⊘ markers and `&& fail` on a hit. If the header line ever changes
+# shape (e.g., gains a leading prefix or a trailing suffix that breaks
+# the literal awk regex), the awk filter produces an empty stream, the
+# grep finds nothing, and the test silently passes — drift goes
+# undetected. These three explicit header presence assertions turn that
+# silent-pass into a loud failure.
+echo "$output" | grep -q "^clean-consumer" \
+  || fail "clean-consumer block missing from --audit output"
+echo "$output" | grep -q "^drifted" \
+  || fail "drifted block missing from --audit output"
+echo "$output" | grep -q "^missing-everything" \
+  || fail "missing-everything block missing from --audit output"
+
 # Clean consumer: every line should be ✓ in sync (the consumer-only extra
 # file under scripts/ci/ must NOT be flagged — kit type is allow-extras).
 echo "$output" | awk '
