@@ -234,6 +234,24 @@ codex:
   # and poll scans.
   reaction_freshness_window_seconds: 1800
 
+  # When true (default), `codex-review-check.sh` accepts an APPROVED
+  # review on the current HEAD from a non-author identity in
+  # `available_reviewers` as a Codex-equivalent gate (c) clearance.
+  # This is the merge gate's understanding of Phase 4b clearance: when
+  # the Codex GitHub App is unavailable (not review-ready, timed out,
+  # agent usage limits hit), Phase 4b kicks in and an external CLI
+  # reviewer (e.g., nathanpayne-cursor) posts APPROVED on the current
+  # HEAD. Without this knob ON, gate (c) requires a Codex bot signal
+  # (👍 or COMMENTED-on-HEAD) that will never arrive in Phase 4b, and
+  # the auto-clear-blocking-labels workflow fails to remove
+  # `needs-external-review` until a human clears it manually.
+  #
+  # Set to false for repos that genuinely require Codex clearance and
+  # not a substitute Phase 4b reviewer (e.g., a repo where the Codex
+  # App provides domain-specific checks no other reviewer matches).
+  # See nathanjohnpayne/mergepath#218.
+  allow_phase_4b_substitute: true
+
 # ---------------------------------------------------------------------------
 # Phase 4b proactive triggers (#158)
 # ---------------------------------------------------------------------------

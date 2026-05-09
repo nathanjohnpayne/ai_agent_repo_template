@@ -184,6 +184,27 @@ fi
 REQUIRE_CI_GREEN=$(codex_field require_ci_green)
 REQUIRE_CI_GREEN=${REQUIRE_CI_GREEN:-true}
 
+# Honor codex.allow_phase_4b_substitute. When true (default), gate (c)
+# also accepts an APPROVED review on the current HEAD from an
+# available_reviewers identity != the PR author as a Codex-equivalent
+# clearance signal. This is the merge gate's understanding of Phase 4b
+# clearance per REVIEW_POLICY.md § Phase 4b — without it, PRs that
+# clear via Phase 4b (Codex App not review-ready, App timeout, agent
+# usage limits) leave gate (c) failing forever and the auto-clear
+# workflow stops working until a human removes the
+# `needs-external-review` label by hand. Set to false for repos that
+# genuinely require Codex clearance and not a substitute Phase 4b
+# reviewer. See nathanjohnpayne/mergepath#218.
+ALLOW_PHASE_4B_SUBSTITUTE=$(codex_field allow_phase_4b_substitute)
+ALLOW_PHASE_4B_SUBSTITUTE=${ALLOW_PHASE_4B_SUBSTITUTE:-true}
+case "$ALLOW_PHASE_4B_SUBSTITUTE" in
+  true|false) ;;
+  *)
+    echo "ERROR: codex.allow_phase_4b_substitute must be true|false; got '$ALLOW_PHASE_4B_SUBSTITUTE'" >&2
+    exit 3
+    ;;
+esac
+
 # Read the available_reviewers list (one per line). Same state-machine
 # awk pattern, but collecting list items rather than matching a scalar.
 # Outputs one reviewer login per line to stdout. Handles both quoted
@@ -730,9 +751,51 @@ elif [ -n "$CODEX_REVIEW_TIME" ]; then
   fi
 fi
 
+# Phase 4b substitute (#218): if Codex hasn't cleared via 👍 or a
+# COMMENTED-on-HEAD review, and the knob is on, accept a fresh APPROVED
+# review on the current HEAD from an available_reviewers identity that
+# is NOT the PR author. This is the merge gate's understanding of
+# Phase 4b clearance per REVIEW_POLICY.md § Phase 4b: when the Codex
+# App is unavailable / times out / hits usage limits, an external CLI
+# reviewer (e.g., nathanpayne-cursor or nathanpayne-codex) is the
+# cross-agent signal. The freshness anchor is a strict commit_id ==
+# HEAD_SHA match — no time-window approximation needed since the
+# review API returns the exact SHA the review was submitted on.
+#
+# When this branch fires, the auto-clear-blocking-labels workflow
+# correctly removes `needs-external-review` on the next event-driven
+# trigger or scheduled sweep, instead of stalling on a permanently-
+# failing gate (c) until a human clears the label by hand.
+if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
+  PHASE_4B_APPROVER=$(echo "$REVIEWS_JSON" | jq -r \
+    --argjson reviewers "$REVIEWERS_JSON" \
+    --arg author "$PR_AUTHOR" \
+    --arg sha "$HEAD_SHA" '
+      [ .[]
+        | select(.state == "APPROVED")
+        | select(.commit_id == $sha)
+        | select(.user.login as $u | $reviewers | index($u))
+        | select(.user.login != $author)
+      ]
+      | sort_by(.submitted_at)
+      | last
+      | if . == null then "" else .user.login + "|" + .submitted_at end
+  ')
+  if [ -n "$PHASE_4B_APPROVER" ]; then
+    PHASE_4B_LOGIN="${PHASE_4B_APPROVER%|*}"
+    PHASE_4B_TIME="${PHASE_4B_APPROVER#*|}"
+    CLEARED=true
+    CLEARANCE_REASON="Phase 4b substitute: APPROVED review from $PHASE_4B_LOGIN @ $PHASE_4B_TIME on $HEAD_SHA (codex.allow_phase_4b_substitute=true)"
+  fi
+fi
+
 if [ "$CLEARED" != "true" ]; then
   if [ -z "$LATEST_THUMBS_UP_TIME" ] && [ -z "$CODEX_REVIEW_TIME" ]; then
-    fail_gate "Codex has not cleared current HEAD (no review on $HEAD_SHA and no +1 reaction from $BOT_LOGIN on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)"
+    if [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
+      fail_gate "Codex has not cleared current HEAD and no Phase 4b substitute APPROVED on $HEAD_SHA from a non-author identity in available_reviewers (no review on HEAD, no +1 reaction from $BOT_LOGIN on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)"
+    else
+      fail_gate "Codex has not cleared current HEAD (no review on $HEAD_SHA and no +1 reaction from $BOT_LOGIN on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)"
+    fi
   else
     PATHS=$(echo "$UNADDRESSED_P01" | jq -r '[.[] | "\(.path):\(.line)"] | join(", ")')
     fail_gate "latest Codex signal is a review on HEAD with $UNADDRESSED_COUNT unaddressed P0/P1 finding(s): $PATHS"
