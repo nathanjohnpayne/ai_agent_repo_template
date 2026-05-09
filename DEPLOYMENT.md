@@ -149,7 +149,7 @@ For `scripts/deploy.sh` and the underlying `op-firebase-deploy`, the source-cred
 
 `op-firebase-deploy` logs the selected source on stderr: `[op-firebase-deploy] source credential: ...`. Deploy auth debugging is no longer opaque — read the line to know which step won.
 
-This precedence applies to deploy flows ONLY. General `gcloud` commands continue to use the local `gcloud` wrapper's same source-credential resolution chain (so commands like `gcloud auth print-access-token` work under the same precedence) but with quota attribution from explicit flags / `.firebaserc` / active config rather than the deploy script's project pin.
+This precedence applies to deploy flows ONLY. General `gcloud` commands go through the local `gcloud` wrapper at `scripts/gcloud/gcloud`, which uses a narrower 3-step chain — `GOOGLE_APPLICATION_CREDENTIALS` if set, else the shared 1Password ADC (`op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential`), else the local ADC file. The `gcloud` wrapper does NOT consult the per-project Firebase-vault SA key from step 2 above; that step is specific to `op-firebase-deploy`. Quota attribution for `gcloud` commands is resolved separately from explicit flags / `.firebaserc` / active config rather than from the deploy script's project pin.
 
 ### Trade-off
 
