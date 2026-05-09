@@ -43,11 +43,11 @@ This template includes the canonical Google Cloud and Firebase helper scripts fo
 
 - `scripts/gcloud/gcloud` installs a local wrapper so ordinary `gcloud` commands can use 1Password-backed or explicit source credentials without a routine interactive `gcloud auth login`, while attributing quota to the resolved target project from explicit flags, the repo's `.firebaserc`, or the active `gcloud` config.
 - `scripts/firebase/op-firebase-setup` creates a per-project `firebase-deployer@{project-id}.iam.gserviceaccount.com`, grants deploy roles, and configures impersonation.
-- `scripts/firebase/op-firebase-deploy` turns a 1Password-backed or explicit source credential, or a CI-provided `external_account` credential, into a temporary impersonated credential for `firebase deploy`, with the target project stamped in as the quota project.
+- `scripts/firebase/op-firebase-deploy` resolves a source credential per the canonical precedence (project Firebase-vault SA key first, with shared 1Password ADC and impersonation as fallbacks) and runs `firebase deploy` with the target project stamped in as the quota project.
 
-Human maintainers should use 1Password-backed GCP ADC plus service account impersonation. CI should prefer Workload Identity Federation or another `external_account` source credential instead of stored service-account keys.
+The canonical source-credential precedence is documented in `DEPLOYMENT.md` § [Deploy credential precedence (canonical)](DEPLOYMENT.md#deploy-credential-precedence-canonical). The default day-to-day credential — interactive and CI — is the per-project Firebase-vault SA key (`op://Firebase/{project-id} — Firebase Deployer SA Key`), with the shared 1Password ADC as a fallback and an explicit `GOOGLE_APPLICATION_CREDENTIALS` as the highest-priority override.
 
-This 1Password-first deploy-auth model is intentional. Do not revert template-derived repos to ADC-first or deploy-key-based guidance unless a human explicitly requests that change.
+This 1Password-first deploy-auth model is intentional. Do not revert template-derived repos to deploy-key-on-disk or routine `firebase login`-based guidance unless a human explicitly requests that change.
 
 See `DEPLOYMENT.md` for the full bootstrap and deploy flow.
 
