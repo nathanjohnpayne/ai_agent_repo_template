@@ -134,8 +134,30 @@ If both machines modified the same 1Password item:
 - [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) (`gcloud`) installed
 - [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) installed and signed in
 - `gcloud`, `op-firebase-deploy`, and `op-firebase-setup` on PATH (see Script Installation below)
-- Access to the project SA key in `op://Firebase/{project-id} — Firebase Deployer SA Key` (the **preferred default** for both interactive and CI/headless deploys per #154 — the most stable credential, no daily-reauth churn from #137), with the shared 1Password ADC `op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential` as a fallback, plus support for an explicit `GOOGLE_APPLICATION_CREDENTIALS` file as the highest-priority override
+- Access to the project SA key in `op://Firebase/{project-id} — Firebase Deployer SA Key` (the **preferred default** for both interactive and CI/headless deploys per [Deploy credential precedence (canonical)](#deploy-credential-precedence-canonical)), with the shared 1Password ADC `op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential` as a fallback, plus support for an explicit `GOOGLE_APPLICATION_CREDENTIALS` file as the highest-priority override
 - Permission to create resources in the target Firebase/GCP project and impersonate the deployer service account
+
+## Deploy credential precedence (canonical)
+
+For `scripts/deploy.sh` and the underlying `op-firebase-deploy`, the source-credential resolution order is:
+
+1. **Genuine human-supplied override** — `GOOGLE_APPLICATION_CREDENTIALS` set by the human OUTSIDE preflight (no `OP_PREFLIGHT_ADC_TMPFILE` marker, or its value differs from the marker). Wins. Used for one-off debugging, alternate-account deploys, or CI runners that materialize their own credential.
+2. **Project Firebase-vault SA key** — `op://Firebase/{project-id} — Firebase Deployer SA Key`, when present. **The standard day-to-day credential, both interactive and CI.** Stable (no `firebase login --reauth` churn from RAPT/refresh-token expiry on the shared ADC; see [#137](https://github.com/nathanjohnpayne/mergepath/issues/137)), parity between local and CI flows, no dependence on Firebase CLI local-login state.
+3. **Preflight-injected `GOOGLE_APPLICATION_CREDENTIALS`** — when no project SA key is provisioned, `scripts/op-preflight.sh --mode deploy` (or `--mode all`) materializes the shared 1Password ADC into a tempfile and exports its path. Subject to the same RAPT-expiry surface as the shared ADC.
+4. **Shared 1Password ADC read directly** — `op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential`, read by the script when neither preflight nor an SA key are available. Same RAPT-expiry surface.
+5. **Local ADC file** — `~/.config/gcloud/application_default_credentials.json` from a prior `gcloud auth application-default login`. Last resort.
+
+`op-firebase-deploy` logs the selected source on stderr: `[op-firebase-deploy] source credential: ...`. Deploy auth debugging is no longer opaque — read the line to know which step won.
+
+This precedence applies to deploy flows ONLY. General `gcloud` commands go through the local `gcloud` wrapper at `scripts/gcloud/gcloud`, which uses a narrower 3-step chain — `GOOGLE_APPLICATION_CREDENTIALS` if set, else the shared 1Password ADC (`op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential`), else the local ADC file. The `gcloud` wrapper does NOT consult the per-project Firebase-vault SA key from step 2 above; that step is specific to `op-firebase-deploy`. Quota attribution for `gcloud` commands is resolved separately from explicit flags / `.firebaserc` / active config rather than from the deploy script's project pin.
+
+### Trade-off
+
+This precedence shifts the day-to-day human deploy path from "impersonation-first via shared ADC" to "stored per-project SA key first." The trade-off is intentional:
+
+- **Why this is acceptable.** The SA key is per-project (blast radius bounded to one Firebase project), stored in 1Password (encryption + access control + audit trail per the org's existing controls), and rotatable on demand without coordination. The stability win — no daily `firebase login --reauth` from RAPT expiry on the shared ADC ([#137](https://github.com/nathanjohnpayne/mergepath/issues/137)) — materially improves deploy reliability across all consumer repos. It also gives interactive and CI/headless flows the same source credential, removing a class of "works in CI, fails locally" deploy bugs.
+- **What we give up.** The strict "no long-lived credentials on disk" property of impersonation-first is weakened for deploys: the SA key sits in 1Password rather than being purely ephemeral. We retain the property for the broader `gcloud` surface (general cloud workflows still use impersonation by default; the SA-key-first precedence only applies under `op-firebase-deploy`).
+- **Rotation.** The SA key is rotated by re-issuing via the Firebase console or `op-firebase-setup`'s key-issuance flow, updating the 1Password item, and invalidating the prior key. The next deploy's source-credential lookup picks up the new key automatically. Detailed rotation steps land alongside [#154 sub-C](https://github.com/nathanjohnpayne/mergepath/issues/210) in `docs/agents/deployment-process.md`.
 
 ## Script Installation
 
@@ -518,18 +540,12 @@ op-firebase-deploy --only functions
 ```
 
 `op-firebase-deploy`:
-1. Auto-detects the Firebase project from `.firebaserc`
-2. Reads source credentials in this order (per #154):
-   1. **Genuinely user-supplied `GOOGLE_APPLICATION_CREDENTIALS`** — when a human explicitly set the env var (debugging, alternate project, one-off flow). The script distinguishes this from preflight-injected ADC by comparing against `OP_PREFLIGHT_ADC_TMPFILE`.
-   2. **Project SA key** from `op://Firebase/{project-id} — Firebase Deployer SA Key` — the **default day-to-day deploy credential**, both interactive and CI. Stable, no RAPT/refresh-token expiry.
-   3. **Preflight-injected `GOOGLE_APPLICATION_CREDENTIALS`** — used when no project SA key is provisioned. The shared 1Password ADC's RAPT-expiry surface (#137) is the cost of this fallback; consumers wanting stable deploys should provision the project SA key.
-   4. **Shared 1Password ADC** read directly from `op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential` — used when neither preflight nor SA key are available.
-   5. **Local ADC file** `~/.config/gcloud/application_default_credentials.json` — last resort.
-3. Logs the selected credential source on stderr (`[op-firebase-deploy] source credential: ...`) so deploy auth debugging is no longer opaque.
-4. If the source credential is a `service_account` key matching the target `firebase-deployer@{project-id}.iam.gserviceaccount.com`, uses it directly (no impersonation wrapper needed — faster, no `serviceAccountTokenCreator` required).
-5. Otherwise, unwraps nested impersonated credentials if needed, stamps the target project into `quota_project_id`, and writes a temporary `impersonated_service_account` credential file.
-6. Runs `firebase deploy --non-interactive`.
-7. Cleans up the temp credentials on exit.
+1. Auto-detects the Firebase project from `.firebaserc`.
+2. Reads source credentials per [Deploy credential precedence (canonical)](#deploy-credential-precedence-canonical) above. Logs the selected source on stderr (`[op-firebase-deploy] source credential: ...`) so deploy auth debugging is no longer opaque.
+3. If the source credential is a `service_account` key matching the target `firebase-deployer@{project-id}.iam.gserviceaccount.com`, uses it directly (no impersonation wrapper needed — faster, no `serviceAccountTokenCreator` required).
+4. Otherwise, unwraps nested impersonated credentials if needed, stamps the target project into `quota_project_id`, and writes a temporary `impersonated_service_account` credential file.
+5. Runs `firebase deploy --non-interactive`.
+6. Cleans up the temp credentials on exit.
 
 No browser prompt is needed for routine use once a valid credential exists in the resolution chain and the 1Password CLI is unlocked.
 
