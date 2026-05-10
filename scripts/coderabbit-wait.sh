@@ -252,7 +252,16 @@ fetch_api_array() {
 # PR #224 round 2.
 check_status_context() {
   local resp state
-  resp=$(gh api "repos/$REPO/commits/$HEAD_SHA/statuses" 2>/dev/null) || {
+  # Pagination (CodeRabbit ⚠️ Minor @ line 267 on PR #224 round 2):
+  # `/commits/{ref}/statuses` defaults to per_page=30 and returns
+  # statuses in reverse chronological order. Without `--paginate`, a
+  # commit with >30 statuses (e.g., long-running PR with retries)
+  # could miss the latest CodeRabbit entry in the unpaginated first
+  # page if non-CodeRabbit statuses crowd it out. `--paginate` plus
+  # `jq -s 'add // []'` flattens all pages into a single array before
+  # the context+creator filter runs.
+  resp=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/statuses" 2>/dev/null \
+    | jq -s 'add // []' 2>/dev/null) || {
     echo "missing"
     return
   }
@@ -463,6 +472,46 @@ count_potential_issues() {
   '
 }
 
+# SHA-scoped variant of count_potential_issues, used by the
+# StatusContext fast-path. Counts CodeRabbit inline findings whose
+# `commit_id` (the SHA GitHub considers the comment currently anchored
+# to, after rebases / new commits) equals the given SHA — independent
+# of HEAD_ANCHOR's wallclock floor.
+#
+# Why this is needed (codex CHANGES_REQUESTED on PR #224 round 2 +
+# CodeRabbit ⚠️ Major @ line 581): the freshness-anchored count_potential_
+# issues filters reviews with `submitted_at >= HEAD_ANCHOR`. Once the
+# same unchanged HEAD sits longer than `coderabbit.wallclock_freshness_
+# window_seconds` (default 1800s / 30 min), HEAD_ANCHOR advances past
+# the prior CodeRabbit review's submitted_at, latest_review_id becomes
+# null, and the helper returns 0 — false-clearing the fast-path even
+# while the same SHA still has unresolved Potential issue/⚠️ inline
+# findings. The fast-path is the only caller that has authoritative
+# per-SHA scope (from the StatusContext check) and should leverage it.
+#
+# Filter shape: inline review comments where the bot author posted a
+# comment whose `commit_id == HEAD_SHA` (i.e., GitHub still considers
+# it applicable to HEAD after any rebases) and whose body contains a
+# `Potential issue` / `⚠️` marker. Resolved-thread state is NOT
+# consulted — same scope as count_potential_issues — so an addressed-
+# but-not-resolved finding will still count. That's the conservative
+# interpretation: "if there's any current-HEAD finding I haven't
+# explicitly resolved, hold the gate."
+count_potential_issues_for_sha() {
+  local sha=$1
+  local pulls_comments
+  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
+  echo "$pulls_comments" | jq \
+    --arg bot "$BOT_LOGIN" \
+    --arg sha "$sha" '
+    [ .[]
+      | select(.user.login == $bot)
+      | select(.commit_id == $sha)
+      | select((.body // "") | test("Potential issue|⚠️"; "i"))
+    ] | length
+  '
+}
+
 post_retry_trigger() {
   # Strip the `[bot]` suffix that GitHub REST uses for App logins —
   # @-mentions address the user-facing handle (`@coderabbitai`), not
@@ -557,11 +606,20 @@ emit_status_context_verdict() {
   # comments were posted. Codex (chatgpt-codex-connector[bot]) caught
   # this on PR #224 round 1 (P1 finding, line 546). The fix: scan
   # inline `Potential issue` / `⚠️` markers anchored on HEAD before
-  # declaring clearance, exactly like the comment-driven path's
-  # post-classification scan does. If any exist, exit 2 (findings)
-  # so the caller addresses them instead of merging past them.
+  # declaring clearance.
+  #
+  # Round 2 sharpening (codex CHANGES_REQUESTED + CodeRabbit ⚠️ Major
+  # @ line 581 on the round 1 fix): use `count_potential_issues_for_sha
+  # "$HEAD_SHA"` rather than `count_potential_issues`. The latter is
+  # filtered by HEAD_ANCHOR (wallclock freshness floor); after 30 min
+  # on the same unchanged HEAD, anchor advances past prior reviews and
+  # the count drops to 0 — false-clearing the fast-path. The
+  # SHA-scoped variant ignores the wallclock anchor entirely and counts
+  # findings whose `commit_id == HEAD_SHA`, which is the right scope
+  # given the fast-path already has authoritative SHA-level evidence
+  # from the StatusContext check.
   local potential_issues synthetic
-  potential_issues=$(count_potential_issues)
+  potential_issues=$(count_potential_issues_for_sha "$HEAD_SHA")
   synthetic=$(jq -nc \
     --arg sha "$HEAD_SHA" \
     --arg state "$state" \
