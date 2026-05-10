@@ -14,3 +14,20 @@ If the project uses Firebase or Google Cloud, prefer the canonical
 - If credential preflight was run at session start (`scripts/op-preflight.sh --mode all`),
   deploy credentials are already cached. No additional biometric prompt is needed for deployment.
 - If an `op` command fails with a sign-in or biometric error during deploy, follow the pause-and-prompt procedure in [operating-rules.md](operating-rules.md#1password-cli-authentication-failures). Do not retry or work around the failure without the human present.
+
+## Credential source debugging
+
+When `op-firebase-deploy` runs, it prints a single line on stderr identifying which step in the [Deploy credential precedence](../../DEPLOYMENT.md#deploy-credential-precedence-canonical) won:
+
+```text
+[op-firebase-deploy] source credential: project Firebase-vault SA key (project foo-prod, path /tmp/...)
+```
+
+If the source is unexpected, the diagnosis order is usually:
+
+1. **Source = `local-adc`** when `project-sa-key` was expected → the 1Password item `op://Firebase/{project-id} — Firebase Deployer SA Key` likely doesn't exist or `op` CLI auth is stale. Verify with `op item get "{project-id} — Firebase Deployer SA Key" --vault Firebase --reveal`. If the item is missing, follow `DEPLOYMENT.md` § Provisioning the Firebase-vault SA key. If `op item get` errors with a sign-in failure, run `op signin` and retry.
+2. **Source = `human-override`** unexpectedly → a `GOOGLE_APPLICATION_CREDENTIALS` env var is set in the shell that wasn't materialized by preflight. Check with `env | grep GOOGLE_APPLICATION_CREDENTIALS` and unset it (`unset GOOGLE_APPLICATION_CREDENTIALS`) for routine deploys.
+3. **Source = `preflight-adc`** when `project-sa-key` was expected → same as case 1 (no SA key item), but preflight has run and provided the shared ADC fallback. The deploy will work but is subject to the shared ADC's RAPT-expiry surface. Provision the per-project SA key for stable deploys.
+4. **Deploy succeeds but logs an `ADC quota project` warning** → expected when the underlying credential was originally stamped for another project. `op-firebase-deploy` overrides `quota_project_id` to the target project for actual deploy commands, so the warning is cosmetic.
+
+If the rotation procedure is needed, follow `DEPLOYMENT.md` § [Rotating a Firebase deploy SA key](../../DEPLOYMENT.md#rotating-a-firebase-deploy-sa-key). Rotation is human-only and not automated by any agent or workflow.
