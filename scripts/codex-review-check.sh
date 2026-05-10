@@ -800,14 +800,43 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
       | group_by(.user.login)
       | map(max_by(.submitted_at))
       | map(select(.state == "APPROVED"))
-      | first
+      | max_by(.submitted_at)
       | if . == null then "" else .user.login + "|" + .submitted_at end
   ')
   if [ -n "$PHASE_4B_APPROVER" ]; then
     PHASE_4B_LOGIN="${PHASE_4B_APPROVER%|*}"
     PHASE_4B_TIME="${PHASE_4B_APPROVER#*|}"
-    CLEARED=true
-    CLEARANCE_REASON="Phase 4b substitute: latest-state APPROVED on HEAD from $PHASE_4B_LOGIN @ $PHASE_4B_TIME (codex.allow_phase_4b_substitute=true)"
+
+    # Latest-signal-wins guard (codex CHANGES_REQUESTED + CodeRabbit ⚠️
+    # Major @ scripts/codex-review-check.sh:811 on PR #225 round 3):
+    # accept the Phase 4b substitute ONLY when its APPROVED is the
+    # newest external clearance signal on HEAD. If a Codex bot review
+    # or 👍 reaction on HEAD is newer than the Phase 4b APPROVED, the
+    # Codex signal carries the verdict — and since the Codex paths
+    # above already failed to clear (CLEARED != true at this point),
+    # that means Codex's newer signal indicated unresolved P0/P1
+    # findings or had no qualifying clearance, and the older Phase 4b
+    # APPROVED must NOT override.
+    #
+    # Edge cases:
+    # - No Codex signals on HEAD (`LATEST_CODEX_SIGNAL_TIME` empty):
+    #   Phase 4b APPROVED is the only external-clearance evidence on
+    #   HEAD; accept it. This is the bare Phase 4b path (Codex App
+    #   not review-ready / timed out / etc.).
+    # - Phase 4b APPROVED newer than Codex review timestamp: the
+    #   reviewer saw Codex's findings and approved anyway (or the
+    #   findings were addressed and Codex's review captured them
+    #   without a 👍). Treat as deliberate; accept.
+    LATEST_CODEX_SIGNAL_TIME="$LATEST_THUMBS_UP_TIME"
+    if [ -n "$CODEX_REVIEW_TIME" ] && { [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$CODEX_REVIEW_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; }; then
+      LATEST_CODEX_SIGNAL_TIME="$CODEX_REVIEW_TIME"
+    fi
+    if [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$PHASE_4B_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; then
+      CLEARED=true
+      CLEARANCE_REASON="Phase 4b substitute: latest-state APPROVED on HEAD from $PHASE_4B_LOGIN @ $PHASE_4B_TIME (codex.allow_phase_4b_substitute=true; newer than any Codex bot signal on HEAD: ${LATEST_CODEX_SIGNAL_TIME:-none})"
+    else
+      log "gate (c): Phase 4b substitute candidate $PHASE_4B_LOGIN @ $PHASE_4B_TIME is older than newest Codex bot signal @ $LATEST_CODEX_SIGNAL_TIME; latest-signal-wins guard rejects substitute"
+    fi
   fi
 fi
 
