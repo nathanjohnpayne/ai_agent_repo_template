@@ -289,9 +289,47 @@ else
   fail "scalar skip_paths did not produce expected diagnostic; got: $out"
 fi
 
-# Test 16: marker name with special characters (`-`, `.`) — the
-# apply-overrides.sh helpers must look it up via strenv-bracket, not
-# yq's dot-path syntax. Round 1 CodeRabbit ⚠️ Major caught the bug.
+# Test 18: scalar at document root → fail validation cleanly.
+# CodeRabbit ⚠️ Major round 2 caught: without a root-type guard,
+# a top-level scalar passes silently because yq's `keys | .[]`
+# returns nothing on non-map roots and rules 2-6 no-op.
+scalar_root="$WORKDIR/scalar-root.yml"
+cat >"$scalar_root" <<'YAML'
+"not-a-map"
+YAML
+out=$("$VALIDATOR" "$scalar_root" "$MANIFEST" 2>&1 || true)
+if echo "$out" | grep -q "document root must be a map"; then
+  pass "scalar root → clean diagnostic, not a silent pass"
+else
+  fail "scalar root did not produce expected diagnostic; got: $out"
+fi
+
+# Sequence at document root → also fail.
+seq_root="$WORKDIR/seq-root.yml"
+cat >"$seq_root" <<'YAML'
+- entry-one
+- entry-two
+YAML
+out=$("$VALIDATOR" "$seq_root" "$MANIFEST" 2>&1 || true)
+if echo "$out" | grep -q "document root must be a map"; then
+  pass "sequence root → clean diagnostic"
+else
+  fail "sequence root did not produce expected diagnostic; got: $out"
+fi
+
+# Empty / null root → pass (empty file is the "no overrides" case).
+null_root="$WORKDIR/null-root.yml"
+echo "" >"$null_root"
+if "$VALIDATOR" "$null_root" "$MANIFEST" >/dev/null 2>&1; then
+  pass "empty document root → exits 0 (no overrides)"
+else
+  fail "empty document root should pass; validator returned non-zero"
+fi
+
+# Test 16 (renumbered to keep stable counts): marker name with special
+# characters (`-`, `.`) — the apply-overrides.sh helpers must look it
+# up via strenv-bracket, not yq's dot-path syntax. Round 1 CodeRabbit
+# ⚠️ Major caught the bug.
 specialchar_subs="$WORKDIR/specialchar.yml"
 cat >"$specialchar_subs" <<'YAML'
 substitutions:

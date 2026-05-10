@@ -89,6 +89,27 @@ if ! yq eval '.' "$OVERRIDES_FILE" >/dev/null 2>&1; then
   fail "$OVERRIDES_FILE is not valid YAML"
 fi
 
+# --- Rule 1b: document root must be a map ---------------------------
+# Without this guard, a top-level scalar (e.g., the file contents are
+# just `"not-a-map"`) or sequence (`- foo\n- bar`) would pass rules
+# 2-6 silently — yq's `keys | .[]` returns nothing on non-map roots,
+# so all the per-key checks no-op without complaint. CodeRabbit ⚠️
+# Major on PR #228 round 2 caught this. `!!null` (empty document)
+# round-trips as no overrides, same as an absent file.
+ROOT_TYPE=$(yq eval '. | type' "$OVERRIDES_FILE" 2>/dev/null || echo "!!unknown")
+case "$ROOT_TYPE" in
+  "!!map")
+    ;;
+  "!!null")
+    # Empty / `~` / `null` document — treat as no overrides.
+    echo "validate-overrides: OK — $OVERRIDES_FILE is empty (no overrides)"
+    exit 0
+    ;;
+  *)
+    fail "$OVERRIDES_FILE document root must be a map (got $ROOT_TYPE)"
+    ;;
+esac
+
 # --- Rule 2: top-level keys are restricted --------------------------
 ALLOWED_KEYS=(version skip_paths substitutions)
 # Portable replacement for `mapfile -t` (not available in bash 3.2 on
