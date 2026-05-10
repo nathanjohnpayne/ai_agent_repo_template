@@ -614,7 +614,7 @@ Or use Firebase Console → Hosting → Release History → Roll back.
 
 Deploys are manual via `op-firebase-deploy`. CI workflows (repo linting, review policy enforcement) run on push/PR via GitHub Actions — see `.github/workflows/`.
 
-When connecting CI, prefer Workload Identity Federation or another `external_account` credential as the source credential. If CI already exposes `GOOGLE_APPLICATION_CREDENTIALS` pointing at an `external_account` file, `op-firebase-deploy` can reuse it to impersonate the deployer service account and attribute quota to the target project.
+When connecting CI, the recommended source credential is the same per-project Firebase-vault SA key used by interactive deploys — see [Deploy credential precedence (canonical)](#deploy-credential-precedence-canonical) and the headless setup below. Materialize the SA key into the runner's filesystem (e.g., from a CI secret) and point `GOOGLE_APPLICATION_CREDENTIALS` at it; `op-firebase-deploy` will detect the `service_account` shape, skip the impersonation wrapper, and use the key directly. Workload Identity Federation or another `external_account` credential is also supported — if CI exposes `GOOGLE_APPLICATION_CREDENTIALS` pointing at an `external_account` file, `op-firebase-deploy` reuses it via the impersonation wrapper to attribute quota to the target project. The SA-key path is preferred because it gives interactive and CI flows the same source-credential shape and removes a class of "works in CI, fails locally" deploy bugs.
 
 ### CI/CD & Headless Deploy
 
@@ -684,7 +684,74 @@ rm -f "$KEY_PATH"
 op-firebase-deploy --only hosting   # or whatever target
 ```
 
-Rotation (e.g., key compromised, GCP-side key expiry, agent identity change): repeat steps 1–4 with `--key-file-type=json` on `gcloud iam service-accounts keys create`. Old key on the SA can be deleted via `gcloud iam service-accounts keys delete <key-id>` after the new one is verified.
+### Rotating a Firebase deploy SA key
+
+The SA key is the standard day-to-day deploy credential per [Deploy credential precedence (canonical)](#deploy-credential-precedence-canonical). Rotate it on a calendar cadence and on demand for any of these triggers:
+
+- **Calendar rotation** — target every 90 days. Track the last-rotation timestamp in the 1Password item's notes field so the next rotation is auditable.
+- **Compromise indicator** — key leaked in logs/screenshots, exposed by a misconfigured CI runner, or invalidated by org policy. Rotate immediately and audit downstream usage.
+- **Personnel change affecting key custody** — a maintainer with 1Password vault access leaves, or vault membership changes.
+
+Procedure (assumes `op-firebase-setup` already ran, the `firebase-deployer` SA exists, and your principal has `iam.serviceAccountKeyAdmin` on the project):
+
+```bash
+PROJECT_ID="{project-id}"
+SA_EMAIL="firebase-deployer@${PROJECT_ID}.iam.gserviceaccount.com"
+KEY_PATH="$(mktemp -t firebase-sa-key.json)"
+
+# 1. Mint a new JSON key for the deployer SA.
+gcloud iam service-accounts keys create "$KEY_PATH" \
+  --iam-account="$SA_EMAIL" \
+  --project="$PROJECT_ID"
+
+# 2. Capture the old key's id BEFORE replacing the 1Password item, so
+#    we can revoke it cleanly after verification. The old key's
+#    private_key_id is also stored inside the 1Password item.
+OLD_KEY_ID=$(op document get "${PROJECT_ID} — Firebase Deployer SA Key" \
+  --vault Firebase 2>/dev/null \
+  | jq -r '.private_key_id')
+
+# 3. Replace the 1Password item with the new key. Use the SAME title
+#    "{project-id} — Firebase Deployer SA Key" so op-firebase-deploy's
+#    item-title lookup keeps working without a per-rotation script edit.
+#    Update the item's notes to record the rotation date.
+op document edit "${PROJECT_ID} — Firebase Deployer SA Key" \
+  "$KEY_PATH" \
+  --vault Firebase \
+  --notes "Rotated $(date -u +%Y-%m-%d) (see DEPLOYMENT.md § Rotating a Firebase deploy SA key)"
+
+# 4. Wipe the local copy.
+rm -f "$KEY_PATH"
+
+# 5. Verify with a non-prod deploy. The source-credential log line
+#    must still show "project Firebase-vault SA key" — if it falls
+#    through to a different source, the new key isn't being read
+#    (mistyped item title, vault permissions, etc.) and rolling
+#    forward could leave the project on stale auth.
+op-firebase-deploy --only hosting   # or any low-risk target
+
+# 6. Once the new-key deploy succeeds, revoke the old key in GCP.
+#    Doing this AFTER step 5 ensures we never leave the project
+#    without a valid key.
+if [ -n "$OLD_KEY_ID" ]; then
+  gcloud iam service-accounts keys delete "$OLD_KEY_ID" \
+    --iam-account="$SA_EMAIL" \
+    --project="$PROJECT_ID" --quiet
+fi
+
+# 7. (Optional) Record the rotation in the repo's CHANGELOG.md or
+#    deploy log if the repo tracks security events. The 1Password
+#    notes field from step 3 is the primary record.
+```
+
+This procedure is intentionally human-only — the bootstrap wizard (#156) does NOT automate rotation. Rotation cadence is low enough (quarterly) that the manual path is fine, and the cost of a botched automation (silently invalidating production deploy auth across multiple consumers) exceeds the benefit. If a maintainer wants to rotate keys for several projects in a single sitting, run the procedure above once per project — `PROJECT_ID` is the only thing that changes between iterations.
+
+If step 5 fails (deploy doesn't pick up the new key), the most common causes are:
+- **Mistyped item title.** The script reads `op://Firebase/{project-id} — Firebase Deployer SA Key` exactly. Confirm with `op item get "${PROJECT_ID} — Firebase Deployer SA Key" --vault Firebase`.
+- **Stale `op` session.** Run `op signin` and re-try.
+- **Source credential precedence override.** A `GOOGLE_APPLICATION_CREDENTIALS` env var set outside preflight wins over the SA key. Unset it and re-run.
+
+Roll back by restoring the old key into the 1Password item from step 2's `OLD_KEY_ID` (if you still have access to it via GCP) and re-running step 5.
 
 ## Auth Maintenance
 
