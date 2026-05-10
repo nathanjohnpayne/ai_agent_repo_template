@@ -19,7 +19,7 @@ If the project uses Firebase or Google Cloud, prefer the canonical
 
 When `op-firebase-deploy` runs, it prints a single line on stderr identifying which step in the [Deploy credential precedence](../../DEPLOYMENT.md#deploy-credential-precedence-canonical) won:
 
-```
+```text
 [op-firebase-deploy] source credential: project Firebase-vault SA key (project foo-prod, path /tmp/...)
 ```
 

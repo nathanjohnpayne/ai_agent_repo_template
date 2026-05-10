@@ -751,7 +751,12 @@ If step 5 fails (deploy doesn't pick up the new key), the most common causes are
 - **Stale `op` session.** Run `op signin` and re-try.
 - **Source credential precedence override.** A `GOOGLE_APPLICATION_CREDENTIALS` env var set outside preflight wins over the SA key. Unset it and re-run.
 
-Roll back by restoring the old key into the 1Password item from step 2's `OLD_KEY_ID` (if you still have access to it via GCP) and re-running step 5.
+**Roll back / recovery.** GCP does NOT let you re-download a previous key's private JSON — only `private_key_id` (which step 2 captures) is recoverable, and that's just the public identifier, not the key material. So the rollback path depends on what you retained:
+
+- **If you saved a backup of the old `application_default_credentials.json` BEFORE step 3** (e.g., to a separate secure tempfile), restore that backup into the 1Password item with the same canonical title and re-run step 5. This is the only true rollback.
+- **If no backup exists** (the common case, since step 3 overwrites the only canonical copy), the recovery is roll-FORWARD, not roll-back: mint a fresh key with step 1, replace the 1Password item with it (step 3), verify with step 5, then revoke any keys still attached to the SA that aren't the new one. Only step 6 (revoking the prior key) is destructive — if you haven't reached step 6 yet, the prior key is still valid in GCP and the most reliable recovery is to delete the failed-verification 1Password item entry, re-fetch the prior key from a secure backup if available, or mint-and-rotate again.
+
+The takeaway: if you want a recoverable rollback, retain a copy of the old JSON before step 3 and store it temporarily in a secure location (e.g., another `op document create`-ed item with `-old` in the title, then delete after the new key is verified).
 
 ## Auth Maintenance
 
