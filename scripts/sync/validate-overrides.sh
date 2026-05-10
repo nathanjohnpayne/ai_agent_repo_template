@@ -125,7 +125,28 @@ if [ "$HAS_VERSION" = "true" ]; then
 fi
 
 # --- Rules 4 + 5: skip_paths validation ----------------------------
-SKIP_COUNT=$(yq eval '.skip_paths | length // 0' "$OVERRIDES_FILE" 2>/dev/null || echo "0")
+# Type-check skip_paths first — same defense as the substitutions block
+# below. yq's `length` aborts on scalar values, which would otherwise
+# produce a confusing diagnostic rather than a clean "skip_paths must
+# be a sequence" violation. `null` round-trips as empty (no-op).
+HAS_SKIP=$(yq eval 'has("skip_paths")' "$OVERRIDES_FILE" 2>/dev/null || echo "false")
+SKIP_TYPE="!!null"
+if [ "$HAS_SKIP" = "true" ]; then
+  SKIP_TYPE=$(yq eval '.skip_paths | type' "$OVERRIDES_FILE" 2>/dev/null || echo "!!unknown")
+  case "$SKIP_TYPE" in
+    "!!seq"|"!!null")
+      ;;
+    *)
+      err "skip_paths: must be a sequence (got $SKIP_TYPE)"
+      VIOLATIONS=$((VIOLATIONS + 1))
+      SKIP_TYPE="!!null"
+      ;;
+  esac
+fi
+SKIP_COUNT=0
+if [ "$SKIP_TYPE" = "!!seq" ]; then
+  SKIP_COUNT=$(yq eval '.skip_paths | length' "$OVERRIDES_FILE" 2>/dev/null || echo "0")
+fi
 if [ "$SKIP_COUNT" -gt 0 ]; then
   # Snapshot the manifest's set of declared paths once, for fast lookup.
   MANIFEST_PATHS=()
@@ -173,8 +194,25 @@ fi
 # --- Rule 6: substitutions validation -------------------------------
 HAS_SUBS=$(yq eval 'has("substitutions")' "$OVERRIDES_FILE" 2>/dev/null || echo "false")
 if [ "$HAS_SUBS" = "true" ]; then
+  # Type-check substitutions before traversing keys (CodeRabbit ⚠️ Major
+  # on PR #228). yq's `keys | .[]` aborts non-zero on a scalar value
+  # (e.g., `substitutions: foo` where foo isn't a map), so without the
+  # type check the validator would crash with `set -u`-unfriendly
+  # diagnostics rather than emitting a clear "substitutions must be a
+  # map" violation. `null` is allowed (treated as no-op, like an empty
+  # map) so `substitutions: ~` round-trips cleanly.
+  SUBS_TYPE=$(yq eval '.substitutions | type' "$OVERRIDES_FILE" 2>/dev/null || echo "!!unknown")
+  case "$SUBS_TYPE" in
+    "!!map"|"!!null")
+      ;;
+    *)
+      err "substitutions: must be a map (got $SUBS_TYPE)"
+      VIOLATIONS=$((VIOLATIONS + 1))
+      SUBS_TYPE="!!null"
+      ;;
+  esac
   SUBS_COUNT=$(yq eval '.substitutions | length // 0' "$OVERRIDES_FILE" 2>/dev/null || echo "0")
-  if [ "$SUBS_COUNT" -gt 0 ]; then
+  if [ "$SUBS_TYPE" = "!!map" ] && [ "$SUBS_COUNT" -gt 0 ]; then
     # Collect the set of substitution markers declared by the manifest's
     # templated paths. v1 manifest has only canonical + kit types so
     # this set is empty until templated lands; the validator then

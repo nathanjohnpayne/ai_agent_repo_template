@@ -26,7 +26,11 @@ fi
 [[ -x "$VALIDATOR" ]] || { echo "missing or non-executable $VALIDATOR" >&2; exit 1; }
 [[ -f "$APPLY_LIB" ]] || { echo "missing $APPLY_LIB" >&2; exit 1; }
 
-WORKDIR="$(mktemp -d -t sync-overrides-test)"
+# Use the explicit `$TMPDIR/<prefix>.XXXXXX` form for cross-platform
+# portability — `mktemp -d -t literal-prefix` is BSD-specific and
+# behaves differently on GNU/Linux (CodeRabbit ⚠️ Major on PR #228;
+# same defense matchline applied to test_sync_to_downstream.sh in #217).
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/sync-overrides-test.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 PASS=0
@@ -258,6 +262,45 @@ if override_substitution_for "/nonexistent/.sync-overrides.yml" "phase_4b_defaul
 else
   pass "override_substitution_for tolerates absent file"
 fi
+
+# Test 14: substitutions as a scalar (not a map) → fail validation,
+# don't crash. CodeRabbit ⚠️ Major round 1 caught the underlying
+# bug — yq's `length` aborts on scalar values.
+scalar_subs="$WORKDIR/scalar-subs.yml"
+cat >"$scalar_subs" <<'YAML'
+substitutions: "this is a scalar, not a map"
+YAML
+out=$("$VALIDATOR" "$scalar_subs" "$MANIFEST" 2>&1 || true)
+if echo "$out" | grep -q "must be a map"; then
+  pass "scalar substitutions → clean diagnostic, not a crash"
+else
+  fail "scalar substitutions did not produce expected diagnostic; got: $out"
+fi
+
+# Test 15: skip_paths as a scalar → fail validation cleanly.
+scalar_skip="$WORKDIR/scalar-skip.yml"
+cat >"$scalar_skip" <<'YAML'
+skip_paths: "scalar instead of sequence"
+YAML
+out=$("$VALIDATOR" "$scalar_skip" "$MANIFEST" 2>&1 || true)
+if echo "$out" | grep -q "must be a sequence"; then
+  pass "scalar skip_paths → clean diagnostic, not a crash"
+else
+  fail "scalar skip_paths did not produce expected diagnostic; got: $out"
+fi
+
+# Test 16: marker name with special characters (`-`, `.`) — the
+# apply-overrides.sh helpers must look it up via strenv-bracket, not
+# yq's dot-path syntax. Round 1 CodeRabbit ⚠️ Major caught the bug.
+specialchar_subs="$WORKDIR/specialchar.yml"
+cat >"$specialchar_subs" <<'YAML'
+substitutions:
+  phase-4b.default: fallback-only
+YAML
+val=$(override_substitution_for "$specialchar_subs" "phase-4b.default") \
+  && [ "$val" = "fallback-only" ] \
+  && pass "override_substitution_for handles special-char marker name (-, .)" \
+  || fail "override_substitution_for failed on special-char marker (got '$val')"
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -44,9 +44,9 @@ skip_paths: []
 # manifest — overriding a marker the manifest doesn't declare gets
 # caught as a validation error.
 #
-# v1 manifest has no templated paths yet; this section will start
-# rejecting non-empty content once templated paths land in the
-# manifest with their own substitution markers.
+# v1 manifest has no templated paths yet, so non-empty content in this
+# section currently fails validation. Once templated paths land in the
+# manifest with declared substitution markers, matching keys are allowed.
 substitutions: {}
 # substitutions:
 #   phase_4b_default: fallback-only

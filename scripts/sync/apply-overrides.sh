@@ -65,8 +65,13 @@ override_should_skip_path() {
     return 1
   fi
 
+  # Use strenv() bracket-lookup rather than string-interpolating $path
+  # into a yq filter. CodeRabbit ⚠️ Major on PR #228: a path containing
+  # quotes or other yq metacharacters would otherwise break the filter
+  # or, worse, alter its semantics. strenv reads the value safely from
+  # the environment.
   local reason
-  reason=$(yq eval ".skip_paths[]? | select(.path == \"$path\") | .reason" "$overrides_file" 2>/dev/null | head -n 1)
+  reason=$(YQ_PATH="$path" yq eval '.skip_paths[]? | select(.path == strenv(YQ_PATH)) | .reason' "$overrides_file" 2>/dev/null | head -n 1)
   if [ -n "$reason" ] && [ "$reason" != "null" ]; then
     OVERRIDE_SKIP_REASON="$reason"
     return 0
@@ -98,12 +103,17 @@ override_substitution_for() {
     return 1
   fi
 
+  # Bracket-lookup with strenv() rather than dot-string-interpolation —
+  # marker names can legitimately contain `-`, `.`, or other characters
+  # that break yq's dot-path syntax (e.g., `phase-4b.default`). CodeRabbit
+  # ⚠️ Major on PR #228 caught this. strenv() reads the marker name from
+  # the environment and treats it as a literal map key.
   local has_key
-  has_key=$(yq eval ".substitutions | has(\"$marker\")" "$overrides_file" 2>/dev/null || echo "false")
+  has_key=$(YQ_MARKER="$marker" yq eval '.substitutions | has(strenv(YQ_MARKER))' "$overrides_file" 2>/dev/null || echo "false")
   if [ "$has_key" != "true" ]; then
     return 1
   fi
 
-  yq eval ".substitutions.$marker" "$overrides_file" 2>/dev/null
+  YQ_MARKER="$marker" yq eval '.substitutions[strenv(YQ_MARKER)]' "$overrides_file" 2>/dev/null
   return 0
 }

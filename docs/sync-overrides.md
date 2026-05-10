@@ -106,9 +106,11 @@ substitutions:
 
 1. Remove the entry from `.sync-overrides.yml`.
 2. From a Mergepath checkout, run a dry-run sync to confirm the next propagation will write the canonical version:
+
    ```bash
    scripts/sync-to-downstream.sh HEAD --repos <consumer-name> --dry-run
    ```
+
 3. Merge in the consumer repo.
 4. The next live propagation run picks up the removed override and writes the canonical content.
 
