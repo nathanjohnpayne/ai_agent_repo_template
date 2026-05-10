@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# scripts/ci/check_sync_overrides — CI entry point for #200 tests.
+#
+# Wraps tests/test_sync_overrides.sh so the repo_lint workflow's
+# "run all scripts/ci/check_*" loop picks it up. Mirrors the
+# pattern used by the other check_* scripts in this directory.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_sync_overrides.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_sync_overrides: SKIP (no $TEST_SCRIPT)"
+  exit 0
+fi
+
+bash "$TEST_SCRIPT"

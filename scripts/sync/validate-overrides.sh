@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# scripts/sync/validate-overrides.sh — schema validator for .sync-overrides.yml
+#
+# Each downstream consumer carries a `.sync-overrides.yml` at its repo
+# root declaring intentional divergence from the Mergepath canonical
+# mirror. This validator enforces the override schema BEFORE the
+# propagation script (sync-to-downstream.sh) honors any entry — drift
+# without a documented `reason` is the failure mode the override
+# system exists to prevent.
+#
+# Usage:
+#   scripts/sync/validate-overrides.sh [overrides-file] [manifest-file]
+#
+# Arguments:
+#   overrides-file  Optional. Path to the .sync-overrides.yml. Defaults
+#                   to ./.sync-overrides.yml relative to the cwd.
+#   manifest-file   Optional. Path to the .mergepath-sync.yml manifest.
+#                   Defaults to MERGEPATH_ROOT/.mergepath-sync.yml,
+#                   resolved via env var MERGEPATH_ROOT_OVERRIDE (used
+#                   in tests) or, if unset, the parent of the directory
+#                   containing this script (i.e., scripts/sync/.. → repo
+#                   root for an in-mergepath-checkout invocation).
+#
+# Validation rules:
+#   1. Overrides file (if it exists) parses as YAML.
+#   2. Top-level keys are limited to `version`, `skip_paths`, `substitutions`.
+#      Unknown top-level keys exit non-zero.
+#   3. `version`, when present, equals SUPPORTED_OVERRIDE_VERSION (currently 1).
+#   4. Every `skip_paths[].path` exists in the manifest's `paths[].path`.
+#      Skip-of-nonexistent-file exits non-zero.
+#   5. Every `skip_paths[]` has a non-empty `reason` field.
+#   6. Every `substitutions.<key>` matches a marker declared by a
+#      manifest path with `type: templated`. (No templated paths in v1
+#      means any `substitutions:` content fails validation. This is the
+#      correct strict default — when templated paths land, the
+#      validator picks them up automatically without a code change.)
+#
+# Exit codes:
+#   0   Overrides file is absent OR all rules pass. Both cases are
+#       valid for downstream CI: a repo with no divergences is fine.
+#   1   Validation failure. One or more diagnostics on stderr.
+#   2   Usage error / missing prerequisite (no `yq`, manifest absent
+#       and not provided, etc.).
+#
+# Design notes:
+#   - Read-only. Never writes to disk except diagnostics on stderr.
+#   - Uses `yq` (mikefarah/yq v4+) for YAML parsing. Same dependency
+#     the existing sync-to-downstream.sh uses.
+#   - Absent overrides file is intentionally a pass — most consumers
+#     won't have any divergences to document.
+
+set -euo pipefail
+
+SUPPORTED_OVERRIDE_VERSION=1
+
+OVERRIDES_FILE="${1:-.sync-overrides.yml}"
+
+if [ -n "${2:-}" ]; then
+  MANIFEST_FILE="$2"
+else
+  MERGEPATH_ROOT="${MERGEPATH_ROOT_OVERRIDE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+  MANIFEST_FILE="$MERGEPATH_ROOT/.mergepath-sync.yml"
+fi
+
+err() { echo "validate-overrides: ERROR: $*" >&2; }
+fail() { err "$@"; exit 1; }
+usage() { err "$@"; exit 2; }
+
+if ! command -v yq >/dev/null 2>&1; then
+  usage "yq (mikefarah/yq v4+) is required. Install via 'brew install yq'."
+fi
+if ! yq --version 2>&1 | grep -q "mikefarah/yq"; then
+  usage "Detected non-mikefarah yq. Install mikefarah/yq v4+ from https://github.com/mikefarah/yq."
+fi
+
+# Absent overrides file = no divergences = pass. This is intentional;
+# most consumers should not have any documented overrides on day one.
+if [ ! -f "$OVERRIDES_FILE" ]; then
+  echo "validate-overrides: OK — no overrides file at $OVERRIDES_FILE"
+  exit 0
+fi
+
+if [ ! -f "$MANIFEST_FILE" ]; then
+  usage "manifest not found at $MANIFEST_FILE (set MERGEPATH_ROOT_OVERRIDE or pass as 2nd arg)"
+fi
+
+# --- Rule 1: overrides file parses as YAML --------------------------
+if ! yq eval '.' "$OVERRIDES_FILE" >/dev/null 2>&1; then
+  fail "$OVERRIDES_FILE is not valid YAML"
+fi
+
+# --- Rule 2: top-level keys are restricted --------------------------
+ALLOWED_KEYS=(version skip_paths substitutions)
+# Portable replacement for `mapfile -t` (not available in bash 3.2 on
+# macOS). Read each yq output line into an array element, preserving
+# the count via ${#TOP_KEYS[@]}.
+TOP_KEYS=()
+while IFS= read -r _line; do
+  TOP_KEYS+=("$_line")
+done < <(yq eval 'keys | .[]' "$OVERRIDES_FILE" 2>/dev/null || true)
+VIOLATIONS=0
+for k in "${TOP_KEYS[@]:-}"; do
+  [ -z "$k" ] && continue
+  found=0
+  for allowed in "${ALLOWED_KEYS[@]}"; do
+    if [ "$k" = "$allowed" ]; then
+      found=1
+      break
+    fi
+  done
+  if [ "$found" -eq 0 ]; then
+    err "unknown top-level key: $k (allowed: ${ALLOWED_KEYS[*]})"
+    VIOLATIONS=$((VIOLATIONS + 1))
+  fi
+done
+
+# --- Rule 3: version, if present, must match -----------------------
+HAS_VERSION=$(yq eval 'has("version")' "$OVERRIDES_FILE" 2>/dev/null || echo "false")
+if [ "$HAS_VERSION" = "true" ]; then
+  V=$(yq eval '.version' "$OVERRIDES_FILE" 2>/dev/null)
+  if [ "$V" != "$SUPPORTED_OVERRIDE_VERSION" ]; then
+    err "version $V not supported by this validator (expected $SUPPORTED_OVERRIDE_VERSION)"
+    VIOLATIONS=$((VIOLATIONS + 1))
+  fi
+fi
+
+# --- Rules 4 + 5: skip_paths validation ----------------------------
+SKIP_COUNT=$(yq eval '.skip_paths | length // 0' "$OVERRIDES_FILE" 2>/dev/null || echo "0")
+if [ "$SKIP_COUNT" -gt 0 ]; then
+  # Snapshot the manifest's set of declared paths once, for fast lookup.
+  MANIFEST_PATHS=()
+  while IFS= read -r _line; do
+    MANIFEST_PATHS+=("$_line")
+  done < <(yq eval '.paths[].path' "$MANIFEST_FILE" 2>/dev/null || true)
+  if [ "${#MANIFEST_PATHS[@]}" -eq 0 ]; then
+    fail "manifest at $MANIFEST_FILE has no paths declared (cannot validate skip_paths)"
+  fi
+
+  for ((i = 0; i < SKIP_COUNT; i++)); do
+    P=$(yq eval ".skip_paths[$i].path // \"\"" "$OVERRIDES_FILE")
+    R=$(yq eval ".skip_paths[$i].reason // \"\"" "$OVERRIDES_FILE")
+
+    if [ -z "$P" ]; then
+      err "skip_paths[$i]: missing 'path' field"
+      VIOLATIONS=$((VIOLATIONS + 1))
+      continue
+    fi
+    # Strip surrounding whitespace from reason; treat trim-empty as missing.
+    R_TRIMMED=$(printf '%s' "$R" | tr -d '[:space:]')
+    if [ -z "$R_TRIMMED" ]; then
+      err "skip_paths[$i] (path=$P): missing or empty 'reason' field — drift without a reason is the failure mode this file exists to prevent"
+      VIOLATIONS=$((VIOLATIONS + 1))
+    fi
+
+    # Match the path against the manifest. Manifest paths can be exact
+    # files (e.g., scripts/keep-in-sync.sh) or directories ending in `/`
+    # (e.g., scripts/ci/). For skip_paths, the override path must equal
+    # a manifest entry exactly; partial-prefix skips would be ambiguous.
+    found=0
+    for mp in "${MANIFEST_PATHS[@]}"; do
+      if [ "$mp" = "$P" ]; then
+        found=1
+        break
+      fi
+    done
+    if [ "$found" -eq 0 ]; then
+      err "skip_paths[$i] (path=$P): not found in manifest's paths[].path — cannot skip a path the manifest doesn't declare"
+      VIOLATIONS=$((VIOLATIONS + 1))
+    fi
+  done
+fi
+
+# --- Rule 6: substitutions validation -------------------------------
+HAS_SUBS=$(yq eval 'has("substitutions")' "$OVERRIDES_FILE" 2>/dev/null || echo "false")
+if [ "$HAS_SUBS" = "true" ]; then
+  SUBS_COUNT=$(yq eval '.substitutions | length // 0' "$OVERRIDES_FILE" 2>/dev/null || echo "0")
+  if [ "$SUBS_COUNT" -gt 0 ]; then
+    # Collect the set of substitution markers declared by the manifest's
+    # templated paths. v1 manifest has only canonical + kit types so
+    # this set is empty until templated lands; the validator then
+    # rejects any substitution entries (correct strict default).
+    TEMPLATED_MARKERS=()
+    while IFS= read -r _line; do
+      TEMPLATED_MARKERS+=("$_line")
+    done < <(yq eval '.paths[] | select(.type == "templated") | .substitutions // {} | keys | .[]' "$MANIFEST_FILE" 2>/dev/null | sort -u || true)
+
+    SUB_KEYS=()
+    while IFS= read -r _line; do
+      SUB_KEYS+=("$_line")
+    done < <(yq eval '.substitutions | keys | .[]' "$OVERRIDES_FILE" 2>/dev/null || true)
+    for k in "${SUB_KEYS[@]:-}"; do
+      [ -z "$k" ] && continue
+      found=0
+      for marker in "${TEMPLATED_MARKERS[@]}"; do
+        if [ "$marker" = "$k" ]; then
+          found=1
+          break
+        fi
+      done
+      if [ "$found" -eq 0 ]; then
+        if [ "${#TEMPLATED_MARKERS[@]}" -eq 0 ]; then
+          err "substitutions.$k: manifest has no templated paths declared yet, so no substitution markers exist to override"
+        else
+          err "substitutions.$k: not declared as a substitution marker by any templated path in manifest (declared markers: ${TEMPLATED_MARKERS[*]})"
+        fi
+        VIOLATIONS=$((VIOLATIONS + 1))
+      fi
+    done
+  fi
+fi
+
+if [ "$VIOLATIONS" -gt 0 ]; then
+  err "$VIOLATIONS validation error(s) in $OVERRIDES_FILE"
+  exit 1
+fi
+
+echo "validate-overrides: OK — $OVERRIDES_FILE matches schema"
+exit 0
