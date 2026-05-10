@@ -162,15 +162,25 @@ coderabbit:
 #        a) required CI checks are green
 #        b) an approving review from a registered reviewer identity
 #           (`available_reviewers`) is present on the PR
-#        c) Codex has signaled clearance on the current HEAD in one of two
-#           forms — NEVER an `APPROVED` review state, because the Codex
-#           GitHub App does not post `APPROVED` reviews:
+#        c) Codex (or a Phase 4b substitute reviewer) has signaled
+#           clearance on the current HEAD via one of three forms — the
+#           Codex bot signals NEVER include an `APPROVED` review state,
+#           because the Codex GitHub App does not post `APPROVED`
+#           reviews:
 #            - a `COMMENTED` review from `chatgpt-codex-connector[bot]`
 #              on or after the latest commit, with no unaddressed P0/P1
 #              inline findings on the `/pulls/{pr}/comments` endpoint, OR
 #            - a 👍 / `+1` reaction from `chatgpt-codex-connector[bot]`
-#              on the PR issue, posted after the latest commit
-#      See #29 for the observational evidence behind this behavior.
+#              on the PR issue, posted after the latest commit, OR
+#            - **Phase 4b substitute** (when `allow_phase_4b_substitute:
+#              true`, see below): an `APPROVED` review on the current
+#              HEAD (`commit_id == HEAD_SHA`) from a non-author identity
+#              in `available_reviewers`. This is the fallback when the
+#              Codex App is unavailable / times out / hits usage limits;
+#              the external CLI reviewer carries the cross-agent merge
+#              gate per REVIEW_POLICY.md § Phase 4b. See #218.
+#      See #29 for the observational evidence behind the Codex bot
+#      behavior, and #218 for the Phase 4b substitute path.
 codex:
   enabled: true
 

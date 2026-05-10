@@ -25,13 +25,25 @@
 #       nathanpayne-cursor, nathanpayne-codex) is present on the PR,
 #       from an account != the PR author.
 #
-#   (c) Codex has cleared on or after the current HEAD commit via one
-#       of two signals:
+#   (c) Codex (or a Phase 4b substitute reviewer) has cleared on or
+#       after the current HEAD commit via one of three signals:
 #
 #         - A COMMENTED review from the Codex bot on the current HEAD
 #           with NO unaddressed P0/P1 inline findings, OR
 #         - A +1 / 👍 reaction from the Codex bot on the PR issue
-#           with created_at >= current HEAD committer date.
+#           with created_at >= current HEAD committer date, OR
+#         - **Phase 4b substitute (#218):** an APPROVED review on the
+#           current HEAD (`commit_id == HEAD_SHA`) from a non-author
+#           identity in `available_reviewers`, gated on
+#           `codex.allow_phase_4b_substitute` (default true). This
+#           handles the case where the Codex App is unavailable
+#           (not review-ready, timeout, agent usage limits) and an
+#           external CLI reviewer (e.g., nathanpayne-cursor or
+#           nathanpayne-codex) carries the cross-agent merge gate
+#           per REVIEW_POLICY.md § Phase 4b. Set the knob to false
+#           for repos that genuinely require Codex bot clearance and
+#           not a substitute Phase 4b reviewer. Mirrors gate (b)
+#           branch 1's filter shape, scoped to HEAD via commit_id.
 #
 #       The merge gate explicitly does NOT require an APPROVED review
 #       state from the Codex bot. The ChatGPT Codex Connector GitHub
