@@ -237,10 +237,12 @@ cat >"$sub_override" <<'YAML'
 substitutions:
   phase_4b_default: fallback-only
 YAML
-val=$(override_substitution_for "$sub_override" "phase_4b_default") \
-  && [ "$val" = "fallback-only" ] \
-  && pass "override_substitution_for returns override value" \
-  || fail "override_substitution_for didn't return expected value (got '$val')"
+if val=$(override_substitution_for "$sub_override" "phase_4b_default") \
+   && [ "$val" = "fallback-only" ]; then
+  pass "override_substitution_for returns override value"
+else
+  fail "override_substitution_for didn't return expected value (got '$val')"
+fi
 
 # Test 12: override_substitution_for returns non-zero when key absent
 # (caller falls back to manifest default).
@@ -335,10 +337,12 @@ cat >"$specialchar_subs" <<'YAML'
 substitutions:
   phase-4b.default: fallback-only
 YAML
-val=$(override_substitution_for "$specialchar_subs" "phase-4b.default") \
-  && [ "$val" = "fallback-only" ] \
-  && pass "override_substitution_for handles special-char marker name (-, .)" \
-  || fail "override_substitution_for failed on special-char marker (got '$val')"
+if val=$(override_substitution_for "$specialchar_subs" "phase-4b.default") \
+   && [ "$val" = "fallback-only" ]; then
+  pass "override_substitution_for handles special-char marker name (-, .)"
+else
+  fail "override_substitution_for failed on special-char marker (got '$val')"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary
