@@ -130,6 +130,32 @@ coderabbit:
   # between consecutive CodeRabbit reviews.
   wallclock_freshness_window_seconds: 1800
 
+  # Use CodeRabbit's per-SHA `CodeRabbit` StatusContext check as a
+  # fast-path gate trigger in `scripts/coderabbit-wait.sh`. When
+  # `true` (default), the wait helper exits as soon as the
+  # StatusContext goes SUCCESS for the current HEAD — without waiting
+  # the full `max_wait_seconds` budget for a narrative comment that
+  # CodeRabbit doesn't always re-post on clean fix-up pushes.
+  #
+  # The fast-path is NOT an unconditional clearance: CodeRabbit's
+  # `success` state means "review completed," not "no findings remain"
+  # (with the default `request_changes_workflow: false`, status flips
+  # to success regardless of whether `Potential issue` / `⚠️` comments
+  # were posted). The fast-path therefore scans inline findings on the
+  # current HEAD before declaring clearance — same scan the comment-
+  # driven path uses. If any are present, it emits status=findings
+  # (exit 2) so the caller addresses them instead of merging past
+  # them. The win is short-circuit on the clean case (most common),
+  # without trading away finding coverage on the dirty case. Codex
+  # caught the over-aggressive original draft on PR #224 round 1
+  # (P1 finding, scripts/coderabbit-wait.sh:546).
+  #
+  # Set to `false` for repos that prefer the strict comment-driven
+  # gate (e.g., if a downstream consumer relies on parsing
+  # CodeRabbit's narrative for some other purpose).
+  # See nathanjohnpayne/mergepath#221.
+  trust_status_context_for_clearance: true
+
 # ---------------------------------------------------------------------------
 # Codex (Automated External Review — Phase 4a)
 # ---------------------------------------------------------------------------
