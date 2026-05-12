@@ -149,18 +149,51 @@ jobs:
 
               // Exemption (#229): PRs opened by `scripts/sync-to-downstream.sh`
               // propagate already-reviewed mergepath commits to downstream
-              // consumers. The head branch namespace `mergepath-sync/*` is
-              // owned by the sync script and never used for human-authored
-              // work; the PR title carries `(mergepath@<sha>)` as a second
-              // confirming signal. Re-reviewing a propagation PR on each
-              // consumer is redundant (the upstream commit was reviewed in
-              // mergepath itself), so the audit's external-review violation
-              // check is skipped for these PRs. Dependabot's separate rule
+              // consumers. Re-reviewing a propagation PR on each consumer
+              // is redundant (the upstream commit was reviewed in mergepath
+              // itself), so the audit's external-review violation check is
+              // skipped for these PRs. Dependabot's separate rule
               // (cliApprovedReviews) is unaffected.
-              const isMergepathSyncPR =
+              //
+              // Four guards, all required, defending against spoofing
+              // (CodeRabbit ⚠️ Major on PR #230 round 1 — naming alone is
+              // not a trusted-provenance signal):
+              //
+              //   1. PR author == author_identity from review-policy.yml
+              //      (typically `nathanjohnpayne`). The propagation script
+              //      runs under that identity per CLAUDE.md's active-account
+              //      convention; a PR from any other login isn't from the
+              //      sync flow.
+              //   2. Head ref comes from the same repo (not a fork). Forks
+              //      can't impersonate the propagation flow because the
+              //      sync script pushes directly to the consumer repo's
+              //      own `mergepath-sync/*` namespace.
+              //   3. Head branch namespace `mergepath-sync/*` — owned by
+              //      the sync script's branch-naming convention
+              //      (`mergepath-sync/<short-sha>`) and never used for
+              //      hand-authored work.
+              //   4. PR title matches `(mergepath@[0-9a-f]{7,40})` — the
+              //      canonical title format the sync script emits,
+              //      identifying the upstream commit.
+              //
+              // Hand-creating all four signals at once is possible but is
+              // an explicit, traceable action that would surface during
+              // self-review.
+              const isTrustedSyncAuthor =
+                pr.user && pr.user.login === authorIdentity;
+              const isSameRepoHead =
+                pr.head && pr.head.repo &&
+                pr.head.repo.full_name === `${context.repo.owner}/${context.repo.repo}`;
+              const hasSyncBranchName =
                 pr.head && pr.head.ref &&
-                pr.head.ref.startsWith('mergepath-sync/') &&
+                pr.head.ref.startsWith('mergepath-sync/');
+              const hasMergepathMarker =
                 /\(mergepath@[0-9a-f]{7,40}\)/.test(pr.title || '');
+              const isMergepathSyncPR =
+                isTrustedSyncAuthor &&
+                isSameRepoHead &&
+                hasSyncBranchName &&
+                hasMergepathMarker;
 
               if (hadExternalLabel || dependabotNeedsApproval) {
                 // For the external-review path we accept either:
