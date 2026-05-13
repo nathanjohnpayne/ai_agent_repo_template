@@ -367,7 +367,18 @@ bootstrap::_print_summary() {
     echo
     echo "REPO:        https://github.com/$full_repo"
     if [ -n "$project_number" ]; then
-      echo "PROJECT:     https://github.com/users/$owner/projects/$project_number"
+      # Project URLs differ by owner type: user-owned uses /users/<name>/
+      # and org-owned uses /orgs/<name>/. Default to user-owned because
+      # nathanjohnpayne (the documented BOOTSTRAP_REPO_OWNER) is a user
+      # account, which is the only scope this script ships supporting
+      # today. BOOTSTRAP_PROJECT_OWNER_TYPE=org overrides for callers
+      # bootstrapping into an org-owned scope. CodeRabbit nitpick on
+      # #246 round 2 called out the assumption — see the issue body for
+      # the upgrade path if/when an org-owned bootstrap lands.
+      case "${BOOTSTRAP_PROJECT_OWNER_TYPE:-user}" in
+        org)  echo "PROJECT:     https://github.com/orgs/$owner/projects/$project_number" ;;
+        *)    echo "PROJECT:     https://github.com/users/$owner/projects/$project_number" ;;
+      esac
     elif [ -n "$project_skipped_reason" ]; then
       echo "PROJECT:     (skipped: $project_skipped_reason)"
     else
