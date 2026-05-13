@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# scripts/ci/check_gh_as_author — CI entry point for #241 tests.
+#
+# Runs the unit tests for scripts/gh-as-author.sh AND for the
+# identity-check addition to scripts/hooks/gh-pr-guard.sh. Both test
+# files are under tests/; this wrapper invokes them in sequence and
+# fails on the first failure. Hard-fails (exit 1, not skip) when
+# either test script is missing, so an accidental delete/rename
+# can't silently disable this check.
+#
+# Mirrors the pattern used by scripts/ci/check_sync_overrides.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+TESTS=(
+  "tests/test_gh_as_author.sh"
+  "tests/test_gh_as_reviewer.sh"
+  "tests/test_gh_pr_guard.sh"
+)
+
+FAILED=0
+for rel in "${TESTS[@]}"; do
+  full="$REPO_ROOT/$rel"
+  if [ ! -f "$full" ]; then
+    echo "check_gh_as_author: ERROR (missing $rel)" >&2
+    FAILED=1
+    continue
+  fi
+  echo "check_gh_as_author: running $rel"
+  if ! bash "$full"; then
+    echo "check_gh_as_author: FAIL ($rel)" >&2
+    FAILED=1
+  fi
+done
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_gh_as_author: FAIL"
+  exit 1
+fi
+
+echo "check_gh_as_author: PASS"
+exit 0

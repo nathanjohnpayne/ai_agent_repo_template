@@ -38,9 +38,15 @@ This repository uses a multi-identity AI agent code review system. The full poli
    machine: `gh auth switch -u nathanpayne-{your-agent}`. Then use
    `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` (or `$OP_PREFLIGHT_AUTHOR_PAT`)
    only for read-path API calls and helper scripts. For author-identity
-   writes (PR create/merge/label edits), wrap the call in a temporary
-   `gh auth switch -u nathanjohnpayne && ... && gh auth switch -u nathanpayne-{your-agent}`.
-   See REVIEW_POLICY.md § Reviewer PAT Quick Start for the full convention.
+   writes (PR create/merge/label edits), MUST wrap the call in
+   `scripts/gh-as-author.sh -- gh pr create ...` — a single bash process
+   that switches, runs, and switches back via `trap EXIT`. Splitting the
+   sequence across two Bash tool calls lands the PR under the wrong
+   identity (#241). The `gh-pr-guard.sh` PreToolUse hook now blocks
+   `gh pr create` when the keyring's active is not `nathanjohnpayne`.
+   See REVIEW_POLICY.md § Reviewer PAT Quick Start for the full convention
+   and § Recovery: PR created under the wrong identity for what to do
+   if a PR already landed under the wrong account.
    Run `scripts/op-preflight.sh --agent {your-agent} --purge` (or
    `--purge-all`) at end of session to delete the cached PATs.
 1. Author code as nathanjohnpayne. File a PR.
