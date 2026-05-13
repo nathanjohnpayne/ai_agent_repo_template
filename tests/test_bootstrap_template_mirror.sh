@@ -389,6 +389,96 @@ diff -q "$TARGET/README.md" "$WORKDIR/readme-once.md" >/dev/null \
   && pass "substitute_one_file is idempotent on already-substituted content" \
   || fail "substitute_one_file is not idempotent"
 
+# --- assertion 11: step ordering — .repo-template.yml cleanup BEFORE
+# substitution (CodeRabbit + Codex round 1 on #233). If substitution
+# ran first, the `mergepath_playground` key would already have been
+# renamed to e.g. `my-new-repo_playground` and yq's
+# `del(.spec_test_map.mergepath_playground)` would silently miss.
+# Pin the ordering via a source-grep so a future refactor that swaps
+# the two calls back fails this test.
+# ---------------------------------------------------------------------------
+awk '
+  /^bootstrap::stage_template_mirror\(\)/ { in_fn = 1 }
+  in_fn && /^}/ { in_fn = 0 }
+  in_fn && /bootstrap::_clean_repo_template_yml/  { saw_clean = NR }
+  in_fn && /bootstrap::apply_name_substitutions/  { saw_sub   = NR }
+  END {
+    if (!saw_clean) { print "missing _clean_repo_template_yml call in stage"; exit 1 }
+    if (!saw_sub)   { print "missing apply_name_substitutions call in stage"; exit 1 }
+    if (saw_clean > saw_sub) {
+      print "ordering wrong: _clean_repo_template_yml must run BEFORE apply_name_substitutions"
+      exit 1
+    }
+  }
+' "$ROOT/scripts/bootstrap/template-mirror.sh" \
+  && pass "stage runs .repo-template.yml cleanup BEFORE substitution" \
+  || fail "stage ordering invariant violated — cleanup must precede substitution"
+
+# --- assertion 12: stage propagates sub-step failures (Codex #233 P1).
+# The dispatch in scripts/bootstrap-new-repo.sh invokes stages as
+# `"$fn" || stage_rc=$?`, which disables `set -e` inside the stage
+# under bash. Without explicit per-step rc capture + early return,
+# a failing sub-step would still record the stage as completed and
+# `--resume` would skip past it. Cover by simulating a failure in
+# the substitution lib: invoke the stage with a non-writable target
+# .repo-template.yml that yq can't edit (chmod 0444). The cleanup
+# step should propagate the failure; the stage must return non-zero
+# and the state file must NOT carry a "template-mirror" entry.
+# ---------------------------------------------------------------------------
+fail_target="$WORKDIR/fail-target"
+rm -rf "$fail_target"
+mkdir -p "$fail_target"
+# Pre-create a .repo-template.yml at the target with read-only parent
+# so the post-rsync yq -i edit fails. Easiest: lock the file itself.
+# rsync writes to target after the mode mirror, so we need to lock
+# the file AFTER rsync but BEFORE cleanup. Cheaper: lock the whole
+# target dir so cleanup's `yq -i` can't open the file for write.
+# But that breaks rsync too. So: simulate via a stub stage that calls
+# the stage function directly with a pre-populated locked file.
+#
+# Simpler: shim the underlying yq via PATH override to always exit 1.
+shim_dir="$WORKDIR/shim-bin"
+mkdir -p "$shim_dir"
+cat >"$shim_dir/yq" <<'SHIM_EOF'
+#!/usr/bin/env bash
+# Test shim — always exits 1 to simulate yq failure on the cleanup step.
+echo "yq shim: deliberate failure for test_bootstrap_template_mirror" >&2
+exit 1
+SHIM_EOF
+chmod +x "$shim_dir/yq"
+
+set +e
+fail_out=$(PATH="$shim_dir:$PATH" \
+           BOOTSTRAP_MERGEPATH_ROOT="$FAKE_MP" \
+           BOOTSTRAP_SKIP_TOOL_CHECK=1 \
+           BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+           BOOTSTRAP_AUTO_CONFIRM=1 \
+           BOOTSTRAP_AUTO_PROMPT=skip \
+           BOOTSTRAP_AUTHOR_NAME="test" \
+           BOOTSTRAP_AUTHOR_EMAIL="t@t" \
+           "$SCRIPT" my-new-repo \
+             --target-dir "$fail_target" \
+             --description "test repo" --visibility private \
+             --firebase none --codex-app n --project new 2>&1)
+fail_ec=$?
+set -e
+# yq is also used in the wizard's preflight if .repo-template.yml
+# parsing is exercised, but the wizard's own require_yq is skipped
+# under BOOTSTRAP_SKIP_TOOL_CHECK. So the only place the shim's yq
+# fires is bootstrap::_yq_clean_repo_template inside the stage —
+# exactly the regression we're guarding.
+[ "$fail_ec" -ne 0 ] \
+  && pass "stage propagates yq failure on .repo-template.yml cleanup (rc=$fail_ec)" \
+  || fail "stage should have returned non-zero when yq fails; got rc=$fail_ec, out: $fail_out"
+
+# State file must NOT have a "template-mirror" entry — the failed
+# stage should not be marked as completed.
+if [ -f "$fail_target/.bootstrap-state" ] && grep -q "^template-mirror$" "$fail_target/.bootstrap-state"; then
+  fail "failed stage was recorded as completed in state file"
+else
+  pass "failed stage NOT recorded in state file (resume can retry)"
+fi
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"

@@ -103,24 +103,68 @@ bootstrap::stage_template_mirror() {
     return 1
   fi
 
+  # Stage-level failure propagation. Each step's rc is captured into
+  # $step_rc and we short-circuit return on the first non-zero — without
+  # this, `set -e` inside the stage is NOT sufficient to stop the run,
+  # because the dispatch in scripts/bootstrap-new-repo.sh invokes the
+  # stage as `"$fn" || stage_rc=$?` (which disables -e inside the called
+  # function under bash). Codex caught this on round 1 of #233 P1.
+  #
+  # Steps that return non-zero are treated as fatal for the stage. The
+  # cross-repo loop step is intentionally tolerant of "no anchors yet"
+  # (it returns 0 with a warning), so it's safe to keep here.
+  local step_rc=0
+
   # Step 1: rsync mergepath → target with excludes.
-  bootstrap::_rsync_template "$source_root" "$target"
+  bootstrap::_rsync_template "$source_root" "$target" || step_rc=$?
+  if [ "$step_rc" -ne 0 ]; then
+    bootstrap::err "template-mirror: rsync step failed (rc=$step_rc); aborting stage"
+    return "$step_rc"
+  fi
 
   # Step 2: post-mirror orphan cleanup.
-  bootstrap::_remove_orphans "$target"
+  bootstrap::_remove_orphans "$target" || step_rc=$?
+  if [ "$step_rc" -ne 0 ]; then
+    bootstrap::err "template-mirror: orphan-removal step failed (rc=$step_rc); aborting stage"
+    return "$step_rc"
+  fi
 
-  # Step 3: apply name substitutions across the 6 name-bearing files.
-  bootstrap::apply_name_substitutions "$target"
+  # Step 3: drop mergepath-specific .repo-template.yml entries.
+  # MUST run BEFORE substitution so the playground key (literally
+  # `mergepath_playground`) is still findable — substitution would
+  # rename it to `<new-repo>_playground` and yq's delete would miss.
+  # CodeRabbit + Codex both caught this on round 1 of #233.
+  bootstrap::_clean_repo_template_yml "$target" || step_rc=$?
+  if [ "$step_rc" -ne 0 ]; then
+    bootstrap::err "template-mirror: .repo-template.yml cleanup failed (rc=$step_rc); aborting stage"
+    return "$step_rc"
+  fi
 
-  # Step 4: drop mergepath-specific .repo-template.yml entries.
-  bootstrap::_clean_repo_template_yml "$target"
+  # Step 4: apply name substitutions across the 6 name-bearing files
+  # (now that the playground key is gone from .repo-template.yml).
+  bootstrap::apply_name_substitutions "$target" || step_rc=$?
+  if [ "$step_rc" -ne 0 ]; then
+    bootstrap::err "template-mirror: substitution step failed (rc=$step_rc); aborting stage"
+    return "$step_rc"
+  fi
 
   # Step 5: initialize git history.
-  bootstrap::_init_target_git "$target"
+  bootstrap::_init_target_git "$target" || step_rc=$?
+  if [ "$step_rc" -ne 0 ]; then
+    bootstrap::err "template-mirror: git-init step failed (rc=$step_rc); aborting stage"
+    return "$step_rc"
+  fi
 
   # Step 6: cross-repo loop update. Writes to mergepath itself, so
-  # gated on a confirmation prompt.
-  bootstrap::_cross_repo_loop_update "$source_root"
+  # gated on a confirmation prompt. Returns 0 (with a warning) when
+  # the anchors aren't present yet — that's a soft no-op, not a
+  # failure. Real failures (e.g., dirty mergepath worktree mid-stage)
+  # do return non-zero and abort the stage.
+  bootstrap::_cross_repo_loop_update "$source_root" || step_rc=$?
+  if [ "$step_rc" -ne 0 ]; then
+    bootstrap::err "template-mirror: cross-repo loop step failed (rc=$step_rc); aborting stage"
+    return "$step_rc"
+  fi
 
   bootstrap::record_stage "template-mirror"
   return 0
@@ -294,16 +338,21 @@ bootstrap::_cross_repo_loop_update() {
     esac
   fi
 
-  # Re-verify mergepath state.
-  local branch
-  branch=$(git -C "$source_root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-  if [ "$branch" != "main" ]; then
-    bootstrap::err "cross-repo loop update: mergepath is on '$branch', expected 'main'; refusing"
-    return 1
-  fi
-  if [ -n "$(git -C "$source_root" status --porcelain 2>/dev/null)" ]; then
-    bootstrap::err "cross-repo loop update: mergepath worktree dirty; refusing to open PR"
-    return 1
+  # Re-verify mergepath state — defense-in-depth re-run of the
+  # preflight check 6 in scripts/bootstrap-new-repo.sh. Honors the
+  # same skip env var so tests / dev-loop runs that bypass preflight
+  # don't trip here either.
+  if [ "${BOOTSTRAP_SKIP_MERGEPATH_GUARD:-0}" != "1" ]; then
+    local branch
+    branch=$(git -C "$source_root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    if [ "$branch" != "main" ]; then
+      bootstrap::err "cross-repo loop update: mergepath is on '$branch', expected 'main'; refusing"
+      return 1
+    fi
+    if [ -n "$(git -C "$source_root" status --porcelain 2>/dev/null)" ]; then
+      bootstrap::err "cross-repo loop update: mergepath worktree dirty; refusing to open PR"
+      return 1
+    fi
   fi
 
   # Probe for anchors BEFORE creating the branch. If neither doc has
