@@ -54,4 +54,15 @@ fi
 
 [ "${1:-}" = "--" ] && shift
 
-exec "$@"
+# Run the wrapped command in THIS shell (NOT exec) so the EXIT trap
+# still fires and restores $PRIOR. `exec "$@"` would replace the
+# bash process with the wrapped command, dropping the trap and
+# leaving the keyring stuck on $REVIEWER. Capture and propagate the
+# wrapped command's exit code so callers see the same rc they would
+# from running the command directly. Same fix shape as
+# scripts/gh-as-author.sh.
+set +e
+"$@"
+WRAPPED_RC=$?
+set -e
+exit "$WRAPPED_RC"

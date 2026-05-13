@@ -330,11 +330,14 @@ keyring active is your agent identity. No switch needed for commits.
       condition before coming back to merge. If `fallback-only`, skip
       directly to merge.
    h. With the gate passing AND the 4b checkpoint cleared, merge as
-      nathanjohnpayne with the switch-around per the active-account
-      convention:
-      `gh auth switch -u nathanjohnpayne && \
-       gh pr merge <PR#> --squash --delete-branch && \
-       gh auth switch -u nathanpayne-claude`
+      nathanjohnpayne via `scripts/gh-as-author.sh` per the active-
+      account convention above (HARD RULE — splitting the switch +
+      merge + switch-back across Bash tool calls has been observed
+      to leave the keyring on the wrong identity, see #241):
+
+      ```
+      scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch
+      ```
 
    **Phase 4b — Manual CLI fallback.** Applies when Phase 4a is
    unavailable (`codex.enabled: false`, either helper script missing,
@@ -349,9 +352,9 @@ keyring active is your agent identity. No switch needed for commits.
    d. Wait for the external reviewer identity to post an `APPROVED` review.
    e. If the external reviewer flags observations or risks, file the
       post-merge GitHub Issues per step 11 below.
-   f. Merge as nathanjohnpayne via the switch-around per the
-      active-account convention (`gh auth switch -u nathanjohnpayne &&
-      gh pr merge ... && gh auth switch -u nathanpayne-claude`).
+   f. Merge as nathanjohnpayne via `scripts/gh-as-author.sh` per the
+      active-account convention above (HARD RULE per #241):
+      `scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch`.
 
 10. Never use `--admin` to merge unless the human explicitly authorizes it
     in chat as a break-glass exception. The hook will block it otherwise.

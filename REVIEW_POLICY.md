@@ -88,9 +88,15 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
 # for the byline. Just run the command.
 gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
 
-# Author-identity write: switch around the call so the byline is the
-# author identity, then switch back so the active state is correct
-# for subsequent reviewer-identity writes.
+# Author-identity write: MUST use scripts/gh-as-author.sh, which
+# switches + runs + restores inside ONE bash process via trap EXIT.
+# Splitting the switch and the write across two Bash invocations has
+# been observed to land the PR under the wrong identity (#241). The
+# gh-pr-guard.sh PreToolUse hook now enforces this for gh pr create.
+scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
+
+# Only when gh-as-author.sh is unavailable, the equivalent inline
+# form is acceptable — but it MUST stay inside one bash invocation:
 gh auth switch -u nathanjohnpayne && \
   gh pr create --title "..." --body "..." && \
   gh auth switch -u nathanpayne-claude
@@ -157,7 +163,7 @@ Replace `claude` with `cursor` or `codex` depending on which agent is running. T
 
 After preflight, these environment variables are set:
 - `OP_PREFLIGHT_REVIEWER_PAT` — use with `GH_TOKEN=` for reviewer-identity **read-path** API calls and helper scripts (`coderabbit-wait.sh`, `codex-review-request.sh`, `codex-review-check.sh`). Write paths (`gh pr review` / `create` / `merge` / `edit`) use the active keyring account regardless of `GH_TOKEN` — see [Reviewer PAT Quick Start](#reviewer-pat-quick-start).
-- `OP_PREFLIGHT_AUTHOR_PAT` — use with `GH_TOKEN=` for author-identity read-path API calls. For author-identity writes (PR create / merge / label edit), use the `gh auth switch -u nathanjohnpayne && ... && gh auth switch -u nathanpayne-<agent>` switch-around pattern.
+- `OP_PREFLIGHT_AUTHOR_PAT` — use with `GH_TOKEN=` for author-identity read-path API calls. For author-identity **writes** (PR create / merge / label edit), wrap the call in `scripts/gh-as-author.sh` — the wrapper switches the gh keyring to the author identity, runs the wrapped command, and restores the prior active account via `trap EXIT`, all in a single bash process. This is the canonical pattern (the `gh-pr-guard.sh` PreToolUse hook enforces it for `gh pr create`). The inline `gh auth switch -u nathanjohnpayne && ... && gh auth switch -u nathanpayne-<agent>` switch-around pattern remains acceptable as a fallback only when the wrapper is unavailable, and only when it stays inside one bash invocation — see [Recovery: PR created under the wrong identity](#recovery-pr-created-under-the-wrong-identity) for the #241 failure mode that motivates the wrapper-first rule.
 - `GOOGLE_APPLICATION_CREDENTIALS` — used automatically by gcloud/Firebase scripts
 - `OP_PREFLIGHT_DONE=1` — flag indicating preflight has been run
 

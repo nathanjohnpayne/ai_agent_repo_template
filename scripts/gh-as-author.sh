@@ -14,7 +14,7 @@
 #   scripts/gh-as-author.sh -- gh pr edit 123 --add-label foo
 #
 # The leading `--` is conventional but optional; the script strips it
-# before exec-ing the wrapped command.
+# before running the wrapped command.
 #
 # Why this exists (#241):
 #
@@ -51,7 +51,11 @@
 #   1    setup error (could not determine prior active account, etc.)
 #   2    switch-to-author failed
 #   5    post-create author verification failed (PR landed under
-#        wrong identity)
+#        wrong identity) OR verification could not complete (PR URL
+#        not extractable from gh pr create output / gh pr view failed
+#        / empty author.login). Fail-closed: an unverified create
+#        is NOT treated as success, so downstream automation can
+#        distinguish "verified clean" from "verification skipped".
 #   *    propagated from the wrapped command otherwise
 #
 # Bash 3.2 compatible (macOS default).
@@ -131,8 +135,15 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
   # diagnostics or other trailing lines.
   PR_URL=$(grep -oE 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' "$TMP_OUT" | tail -1 || true)
   if [ -z "$PR_URL" ]; then
-    echo "gh-as-author: WARNING could not extract PR URL from gh pr create output; skipping post-create author verification." >&2
-    exit 0
+    # Fail closed: a successful `gh pr create` whose URL we cannot
+    # extract is NOT verified. Treating it as verified would let
+    # downstream automation proceed after the safety check was
+    # silently skipped — exactly the #241 footgun this wrapper
+    # exists to close. Operator recovery: verify the new PR's
+    # author.login manually (`gh pr list --author nathanjohnpayne`).
+    echo "gh-as-author: ERROR could not extract PR URL from gh pr create output; refusing to treat the create as verified." >&2
+    echo "gh-as-author: The PR may still have been created — check 'gh pr list --author $AUTHOR' and verify manually." >&2
+    exit 5
   fi
   PR_NUM=$(basename "$PR_URL")
   # Repo slug is the path component between github.com/ and /pull/N.
@@ -144,8 +155,12 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
   # standalone.
   ACTUAL_AUTHOR=$(gh pr view "$PR_NUM" --repo "$PR_REPO" --json author --jq .author.login 2>/dev/null || echo "")
   if [ -z "$ACTUAL_AUTHOR" ]; then
-    echo "gh-as-author: WARNING could not read PR author from gh pr view $PR_NUM --repo $PR_REPO (network? permissions?). Skipping post-create author verification." >&2
-    exit 0
+    # Fail closed: see PR-URL branch above. Network blips and
+    # transient gh errors must NOT be confused with a verified clean
+    # create.
+    echo "gh-as-author: ERROR could not read PR author from gh pr view $PR_NUM --repo $PR_REPO (network? permissions?); refusing to treat the create as verified." >&2
+    echo "gh-as-author: Verify manually: gh pr view $PR_NUM --repo $PR_REPO --json author" >&2
+    exit 5
   fi
 
   if [ "$ACTUAL_AUTHOR" != "$AUTHOR" ]; then
@@ -162,6 +177,15 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
   exit 0
 fi
 
-# Non-gh-pr-create path: just exec the wrapped command. The EXIT trap
-# handles switch-back. No verification overhead.
-exec "$@"
+# Non-gh-pr-create path: run the wrapped command in this shell (NOT
+# exec) so the EXIT trap still fires and restores $PRIOR. Using exec
+# would replace the bash process with the wrapped command, dropping
+# the trap and leaving the keyring stuck on $AUTHOR — the exact
+# state the wrapper exists to prevent. Capture the wrapped command's
+# exit code and propagate it so callers see the same rc they would
+# from running the command directly.
+set +e
+"$@"
+WRAPPED_RC=$?
+set -e
+exit "$WRAPPED_RC"

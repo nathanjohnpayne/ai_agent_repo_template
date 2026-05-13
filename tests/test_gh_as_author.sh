@@ -245,6 +245,17 @@ else
   pass "non-create path: no post-create verification ran for gh pr merge"
 fi
 
+# Same call must also have fired the trap to switch back. Without
+# the fix in this round, `exec "$@"` on the non-create path would
+# replace the shell process and skip the EXIT trap — see CodeRabbit
+# round-1 review id 3237851481.
+if grep -qE $'^gh\tauth\tswitch\t-u\tnathanpayne-claude$' "$WORKDIR/calls.log"; then
+  pass "non-create path: trap EXIT switch-back fired (no exec)"
+else
+  fail "non-create path: trap EXIT switch-back did NOT fire — exec \"\$@\" regression?"
+  cat "$WORKDIR/calls.log" >&2
+fi
+
 # ---------------------------------------------------------------------------
 # Test 5: Empty prior-active fails fast with exit 1, no switch, no
 # wrapped command.
@@ -288,6 +299,78 @@ elif ! grep -qE $'^gh\tauth\tswitch\t-u\tcustom-author$' "$WORKDIR/calls.log"; t
   cat "$WORKDIR/calls.log" >&2
 else
   pass "custom identity: GH_AS_AUTHOR_IDENTITY override switched to custom-author"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 7 (CodeRabbit round-1 id 3237851475 + 3237851481): fail-closed
+# when the PR URL cannot be extracted from gh pr create output. Prior
+# to this round the wrapper silently exited 0 when `grep -oE ... |
+# tail -1` returned empty, letting downstream automation treat an
+# unverified create as verified. Set GH_CREATE_PR_URL to a string the
+# regex can't match and assert the wrapper exits 5 with an ERROR (not
+# WARNING) diagnostic mentioning the manual verification command.
+# ---------------------------------------------------------------------------
+GH_INITIAL_ACTIVE="nathanpayne-claude" \
+GH_CREATE_PR_URL="created PR but no URL in output" \
+reset_state
+
+set +e
+stderr_capture=$(
+  GH_INITIAL_ACTIVE="nathanpayne-claude" \
+  GH_CREATE_PR_URL="created PR but no URL in output" \
+    run_wrapper -- gh pr create --title "t" --body "b" 2>&1 1>/dev/null
+)
+rc=$?
+set -e
+if [ "$rc" -ne 5 ]; then
+  fail "fail-closed (no PR URL): wrapper exited $rc, expected 5"
+elif ! echo "$stderr_capture" | grep -qi "ERROR could not extract PR URL"; then
+  fail "fail-closed (no PR URL): missing ERROR diagnostic; stderr: $stderr_capture"
+elif echo "$stderr_capture" | grep -qi "WARNING.*skipping post-create"; then
+  fail "fail-closed (no PR URL): still emitting WARNING/skipping language; stderr: $stderr_capture"
+else
+  pass "fail-closed (no PR URL): exit 5 with ERROR diagnostic"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 8 (CodeRabbit round-1 id 3237851475 + 3237851481): fail-closed
+# when gh pr view (the verification read) fails. Prior to this round
+# the wrapper silently exited 0 on `gh pr view` failure, masking
+# transient network blips and permission issues as verified creates.
+# Set GH_VIEW_RC=1 and assert the wrapper exits 5.
+# ---------------------------------------------------------------------------
+GH_INITIAL_ACTIVE="nathanpayne-claude" \
+GH_CREATE_PR_URL="https://github.com/example/repo/pull/99" \
+GH_VIEW_RC=1 \
+reset_state
+
+set +e
+stderr_capture=$(
+  GH_INITIAL_ACTIVE="nathanpayne-claude" \
+  GH_CREATE_PR_URL="https://github.com/example/repo/pull/99" \
+  GH_VIEW_RC=1 \
+    run_wrapper -- gh pr create --title "t" --body "b" 2>&1 1>/dev/null
+)
+rc=$?
+set -e
+if [ "$rc" -ne 5 ]; then
+  fail "fail-closed (gh pr view error): wrapper exited $rc, expected 5"
+elif ! echo "$stderr_capture" | grep -qi "ERROR could not read PR author"; then
+  fail "fail-closed (gh pr view error): missing ERROR diagnostic; stderr: $stderr_capture"
+elif echo "$stderr_capture" | grep -qi "WARNING.*Skipping post-create"; then
+  fail "fail-closed (gh pr view error): still emitting WARNING/skipping language; stderr: $stderr_capture"
+else
+  pass "fail-closed (gh pr view error): exit 5 with ERROR diagnostic"
+fi
+
+# Both fail-closed paths must STILL have fired the trap to restore
+# the prior active account — verification failure must not leave
+# the keyring stuck on the author identity.
+if grep -qE $'^gh\tauth\tswitch\t-u\tnathanpayne-claude$' "$WORKDIR/calls.log"; then
+  pass "fail-closed (gh pr view error): trap EXIT switch-back fired"
+else
+  fail "fail-closed (gh pr view error): trap EXIT switch-back did NOT fire"
+  cat "$WORKDIR/calls.log" >&2
 fi
 
 # ---------------------------------------------------------------------------
