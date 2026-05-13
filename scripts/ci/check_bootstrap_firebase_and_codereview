@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# scripts/ci/check_bootstrap_firebase_and_codereview — CI entry point
+# for #156 sub-D / #206 tests.
+#
+# Wraps tests/test_bootstrap_firebase_and_codereview.sh so the
+# repo_lint workflow's "run all scripts/ci/check_*" loop picks it up.
+# Mirrors the pattern used by check_bootstrap_github_infra and the
+# other check_* scripts. Missing test script is a hard error (matches
+# the tightening applied to check_sync_overrides in #228 round 5).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_bootstrap_firebase_and_codereview.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_bootstrap_firebase_and_codereview: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
