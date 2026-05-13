@@ -288,7 +288,15 @@ fi
 BOOTSTRAP_LOG_FILE="$TARGET_DIR/.bootstrap-log"
 BOOTSTRAP_STATE_FILE="$TARGET_DIR/.bootstrap-state"
 
-export BOOTSTRAP_DRY_RUN BOOTSTRAP_LOG_FILE BOOTSTRAP_STATE_FILE
+# Source root for the template-mirror stage. The wizard always lives
+# at <mergepath-root>/scripts/bootstrap-new-repo.sh, so two `dirname`s
+# from $SCRIPT_DIR is the mergepath root. Tests can override via
+# BOOTSTRAP_MERGEPATH_ROOT to point at a synthetic fixture.
+BOOTSTRAP_MERGEPATH_ROOT="${BOOTSTRAP_MERGEPATH_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+
+export BOOTSTRAP_DRY_RUN BOOTSTRAP_LOG_FILE BOOTSTRAP_STATE_FILE \
+       TARGET_DIR BOOTSTRAP_MERGEPATH_ROOT BOOTSTRAP_LIB_DIR \
+       BOOTSTRAP_REPO_OWNER
 
 # --- source the helper lib + stage modules ---------------------------------
 

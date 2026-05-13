@@ -151,7 +151,7 @@ if [ "$ec" -ne 0 ]; then
 else
   pass "dry-run with all flags completes (exit 0)"
 fi
-echo "$out" | grep -q "template-mirror (sub-B stub)" \
+echo "$out" | grep -q "Starting stage: template-mirror" \
   && pass "stage B stub ran" \
   || fail "stage B stub didn't run; got: $out"
 echo "$out" | grep -q "github-infra (sub-C stub)" \
@@ -223,7 +223,7 @@ echo "$ex_out" | grep -q "skip github-infra (already completed)" \
 echo "$ex_out" | grep -q "firebase-and-codereview (sub-D stub)" \
   && pass "explicit-resume ran firebase-and-codereview" \
   || fail "explicit-resume did not run firebase-and-codereview"
-echo "$ex_out" | grep -q "template-mirror (sub-B stub)" \
+echo "$ex_out" | grep -q "Starting stage: template-mirror" \
   && fail "explicit-resume should have skipped template-mirror (came before github-infra)" \
   || pass "explicit-resume correctly skipped pre-target stages"
 
