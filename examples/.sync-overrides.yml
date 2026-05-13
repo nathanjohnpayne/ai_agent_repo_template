@@ -17,9 +17,11 @@
 #
 # Schema details + worked examples: docs/sync-overrides.md in mergepath.
 
-# Schema version. Bumped on incompatible schema changes; the
-# validator refuses to run against an unknown version so old
-# scripts can't silently misinterpret a newer overrides file.
+# Schema version. REQUIRED on any non-empty overrides document —
+# the validator emits "missing required top-level key: version" if
+# omitted. Bumped on incompatible schema changes; the validator
+# refuses to run against an unknown version so old scripts can't
+# silently misinterpret a newer overrides file.
 version: 1
 
 # Paths the canonical-mirror script should NOT overwrite. Each entry
@@ -49,10 +51,11 @@ skip_paths: []
 # manifest with declared substitution markers, matching keys are allowed.
 #
 # Each entry is a structured `{value, reason}` map. Both fields are
-# required and non-empty — the `reason` is the audit-trail (same
-# posture as `skip_paths`), and a bare-scalar override like
-# `phase_4b_default: fallback-only` is explicitly rejected by the
-# validator to prevent undocumented divergence.
+# required and non-empty (whitespace counts as empty for either) —
+# the `reason` is the audit-trail (same posture as `skip_paths`),
+# and a bare-scalar override like `phase_4b_default: fallback-only`
+# is explicitly rejected by the validator to prevent undocumented
+# divergence.
 substitutions: {}
 # substitutions:
 #   phase_4b_default:

@@ -25,7 +25,9 @@
 #   1. Overrides file (if it exists) parses as YAML.
 #   2. Top-level keys are limited to `version`, `skip_paths`, `substitutions`.
 #      Unknown top-level keys exit non-zero.
-#   3. `version`, when present, equals SUPPORTED_OVERRIDE_VERSION (currently 1).
+#   3. `version` is required on any non-empty document and must equal
+#      SUPPORTED_OVERRIDE_VERSION (currently 1). Empty / null-root
+#      documents bypass at Rule 1b before this rule runs.
 #   4. Every `skip_paths[].path` exists in the manifest's `paths[].path`.
 #      Skip-of-nonexistent-file exits non-zero.
 #   5. Every `skip_paths[]` has a non-empty `reason` field.

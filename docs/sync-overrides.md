@@ -19,7 +19,8 @@ Without the override mechanism the script would either silently overwrite legiti
 ## Schema
 
 ```yaml
-# Schema version. Bumped on incompatible schema changes.
+# Schema version. Required on any non-empty document; must equal 1
+# (bumped on incompatible schema changes).
 version: 1
 
 # Paths the propagation script must NOT overwrite for this repo.
@@ -32,12 +33,13 @@ skip_paths:
 # Override values for templated-path substitution markers. Manifest
 # defaults apply where this map is silent. Keys must match a
 # substitution marker declared by a `type: templated` path in the
-# manifest. Each entry is a structured `{value, reason}` map — bare-
+# manifest. Each entry is a structured `{value, reason}` map — both
+# fields required and non-empty (whitespace counts as empty). Bare-
 # scalar overrides are explicitly rejected so substitutions carry
 # the same audit-trail discipline as `skip_paths`.
 substitutions:
   <marker-name>:
-    value: <override-value>
+    value: <non-empty override-value>
     reason: <non-empty rationale; multi-line allowed>
 ```
 
@@ -49,11 +51,11 @@ substitutions:
 |---|---|
 | File parses as YAML | Exit 1 |
 | Top-level keys ⊆ {`version`, `skip_paths`, `substitutions`} | Exit 1 |
-| `version`, when present, == 1 | Exit 1 |
+| `version` is required on non-empty documents and must equal 1 | Exit 1 |
 | Every `skip_paths[].path` is declared by the manifest | Exit 1 |
 | Every `skip_paths[].reason` is non-empty (whitespace counts as empty) | Exit 1 |
 | Every `substitutions.<key>` matches a marker declared by a `type: templated` manifest path | Exit 1 |
-| Every `substitutions.<key>` is a map with `value` and non-empty `reason` fields | Exit 1 |
+| Every `substitutions.<key>` is a map with non-empty `value` and non-empty `reason` fields (whitespace counts as empty for both) | Exit 1 |
 
 Absence of the file → exit 0. Empty file → exit 0 (no entries means no constraints to validate).
 
