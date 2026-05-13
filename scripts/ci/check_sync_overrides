@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# scripts/ci/check_sync_overrides — CI entry point for #200 tests.
+#
+# Wraps tests/test_sync_overrides.sh so the repo_lint workflow's
+# "run all scripts/ci/check_*" loop picks it up. Mirrors the
+# pattern used by the other check_* scripts in this directory.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_sync_overrides.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  # Missing test script is a hard error, not a skip — silent-skip
+  # would let an accidental delete/rename disable this check
+  # without surfacing in CI. CodeRabbit ⚠️ Major on PR #228 round 4.
+  echo "check_sync_overrides: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"

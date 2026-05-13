@@ -1,0 +1,66 @@
+# .sync-overrides.yml — sync-to-downstream divergence registry.
+#
+# Declares paths and substitution values that this repo intentionally
+# diverges from the Mergepath canonical mirror. The propagation script
+# (scripts/sync-to-downstream.sh in mergepath) reads this file to know
+# what to skip or override.
+#
+# Every entry needs a `reason` field for audit-trail. Drift without a
+# documented reason is the failure mode this file exists to prevent;
+# scripts/sync/validate-overrides.sh enforces that on every PR.
+#
+# This is the EXAMPLE template. To use it:
+#   1. Copy to the repo root as `.sync-overrides.yml`
+#   2. Add entries as needed; an empty file (or absent file) means
+#      "no overrides" and is the recommended starting state for new
+#      repos created from the Mergepath template.
+#
+# Schema details + worked examples: docs/sync-overrides.md in mergepath.
+
+# Schema version. REQUIRED on any non-empty overrides document —
+# the validator emits "missing required top-level key: version" if
+# omitted. Bumped on incompatible schema changes; the validator
+# refuses to run against an unknown version so old scripts can't
+# silently misinterpret a newer overrides file.
+version: 1
+
+# Paths the canonical-mirror script should NOT overwrite. Each entry
+# must reference a `paths[].path` value declared by the manifest at
+# .mergepath-sync.yml — skipping a path the manifest doesn't declare
+# is a no-op and gets caught as a validation error.
+#
+# Uncomment and edit these examples; remove them entirely if this
+# repo has no skip-overrides.
+skip_paths: []
+# skip_paths:
+#   - path: .github/workflows/deploy.yml
+#     reason: |
+#       This repo's deploy workflow uses Cloud Run, not Firebase Hosting
+#       (which the canonical workflow assumes). Tracked in <repo>#42 for
+#       eventual canonical convergence once Mergepath ships a Cloud Run
+#       variant.
+
+# Override values for templated paths' substitution markers. Manifest
+# defaults apply where this file is silent. Each key must match a
+# substitution marker declared by a `type: templated` path in the
+# manifest — overriding a marker the manifest doesn't declare gets
+# caught as a validation error.
+#
+# v1 manifest has no templated paths yet, so non-empty content in this
+# section currently fails validation. Once templated paths land in the
+# manifest with declared substitution markers, matching keys are allowed.
+#
+# Each entry is a structured `{value, reason}` map. Both fields are
+# required and non-empty (whitespace counts as empty for either) —
+# the `reason` is the audit-trail (same posture as `skip_paths`),
+# and a bare-scalar override like `phase_4b_default: fallback-only`
+# is explicitly rejected by the validator to prevent undocumented
+# divergence.
+substitutions: {}
+# substitutions:
+#   phase_4b_default:
+#     value: fallback-only
+#     reason: |
+#       Deploy frequency is high (~5 PRs/day), and the latency cost
+#       of always-on phase-4b proactive routing outweighs the safety
+#       benefit. Re-evaluate after 90 days (target review: <date>).
