@@ -674,6 +674,14 @@ sync_one_consumer() {
   local branch
   branch=$(sync_branch_name "$sha")
 
+  # Deferred destructive recreate: populated below when
+  # SYNC_RECREATE_EXISTING=1 + an existing open PR is detected.
+  # Passed to sync_open_pr so the close+delete fires AFTER the
+  # replacement commit is built and BEFORE the push. Stays empty
+  # in the no-recreate case so sync_open_pr knows to skip the
+  # destructive step.
+  local recreate_existing_pr_num=""
+
   local targets
   targets=$(sync_consumer_canonical_targets "$consumer_name" "$changed_files" "$manifest")
 
@@ -711,62 +719,29 @@ sync_one_consumer() {
       open:*)
         local existing_pr_num="${pr_state#open:}"
         if [ "${SYNC_RECREATE_EXISTING:-0}" = "1" ]; then
-          # --recreate-existing escape hatch: close the existing PR
-          # AND delete its head branch on the remote, then fall
-          # through to the normal clone/push/create flow. Both halves
-          # are required:
-          #   1. `gh pr close` alone leaves the branch in place. The
-          #      consumer's freshly synthesized commit is rebuilt on
-          #      top of `main` (not on top of the existing branch
-          #      HEAD), so it has a different SHA from whatever the
-          #      branch currently points at on the remote. A plain
-          #      `git push -u origin <branch>` would be rejected as
-          #      non-fast-forward and the whole --recreate flow would
-          #      fail mid-loop. (Codex #231 P1 round 1 caught this.)
-          #   2. Deleting the branch via `git push --delete` after
-          #      close is the safer half: it tombstones the branch
-          #      cleanly so the subsequent `git push -u origin
-          #      <branch>` is a fresh-branch create rather than a
-          #      forced update, which means no risk of clobbering an
-          #      unrelated branch with the same name, and the standard
-          #      `git push` (no --force) keeps working.
-          # `gh pr close --delete-branch` would conflate the two and
-          # also fight branch protection on `main` if the PR's head
-          # has merge artifacts; explicit two-step is clearer.
-          printf "  ⤷ %s — closing existing PR #%s for --recreate-existing\n" \
-            "$consumer_name" "$existing_pr_num"
-          if ! gh pr close "$existing_pr_num" --repo "$consumer_repo" \
-                --comment "Closed by \`scripts/sync-to-downstream.sh --recreate-existing\`. Reopening with a fresh synthesized body on a recreated \`$branch\`." >&2; then
-            err "$consumer_name: gh pr close failed for #$existing_pr_num"
-            SYNC_FAILED=$((SYNC_FAILED + 1))
-            return 0
-          fi
-          # Delete the remote branch so the subsequent push creates
-          # it fresh. Tolerate "already deleted" (gh pr close can in
-          # some flows tombstone the branch as a side effect on
-          # certain repo configs).
-          printf "  ⤷ %s — deleting remote branch %s for --recreate-existing\n" \
-            "$consumer_name" "$branch"
-          local _del_rc=0
-          gh api -X DELETE "repos/${consumer_repo}/git/refs/heads/${branch}" \
-            >/dev/null 2>&1 || _del_rc=$?
-          if [ "$_del_rc" -ne 0 ]; then
-            # 422 ("Reference does not exist") is fine. Anything else
-            # is a hard failure — better to bail than to push a stale
-            # non-fast-forward branch and surface a confusing
-            # mid-sync error from `git push`.
-            if ! gh api "repos/${consumer_repo}/git/refs/heads/${branch}" \
-                  >/dev/null 2>&1; then
-              printf "    · branch %s already absent on remote (ok)\n" "$branch"
-            else
-              err "$consumer_name: failed to delete remote branch $branch (rc=$_del_rc); refusing to push to avoid non-fast-forward"
-              SYNC_FAILED=$((SYNC_FAILED + 1))
-              return 0
-            fi
-          fi
-          # Fall through to the live clone/push/create below. Because
-          # the remote branch is gone, the local push is a fresh-
-          # branch create.
+          # --recreate-existing escape hatch. The destructive close +
+          # branch-delete is DEFERRED to sync_open_pr, executed only
+          # AFTER the replacement commit is built locally and right
+          # BEFORE the push.
+          #
+          # Rationale (CodeRabbit #231 round 2 caught this): the
+          # original layering closed the PR and deleted the branch
+          # here, before clone/materialize/commit. If any later step
+          # fails (auth, network, no diff after copy, materialize
+          # error) the consumer is left with NO open propagation PR
+          # at all — strictly worse than the pre-recreate state.
+          # Building the replacement first, then collapsing the
+          # destructive step to the moment before push, keeps the
+          # live PR available until we have something concrete to
+          # replace it with.
+          #
+          # The PR number is threaded into sync_open_pr as a 9th
+          # positional arg below; passing as an arg (rather than
+          # exporting a global) keeps cross-consumer state isolated
+          # since sync_one_consumer is called once per consumer.
+          recreate_existing_pr_num="$existing_pr_num"
+          # Fall through to sync_open_pr — clone/commit FIRST, then
+          # close + delete + push.
         else
           printf "  · %s already in flight (PR #%s on branch %s)\n" \
             "$consumer_name" "$existing_pr_num" "$branch"
@@ -817,8 +792,11 @@ sync_one_consumer() {
   fi
 
   # Live mode: clone, branch, commit, push, PR.
+  # 9th arg: existing PR number to close+delete just before push,
+  # used by --recreate-existing. Empty means "no destructive step".
   if ! sync_open_pr "$consumer_name" "$consumer_repo" "$sha" "$commit_subject" \
-                    "$branch" "$targets" "$kit_list" "$templated_list"; then
+                    "$branch" "$targets" "$kit_list" "$templated_list" \
+                    "$recreate_existing_pr_num"; then
     SYNC_FAILED=$((SYNC_FAILED + 1))
     return 0
   fi
@@ -841,6 +819,11 @@ sync_open_pr() {
   local targets=$6  # newline-separated paths
   local kit_list=$7
   local templated_list=$8
+  # 9th arg: existing PR number to close + branch-delete just
+  # before push, only when --recreate-existing fired. Empty when
+  # no destructive step is needed. See sync_one_consumer for why
+  # this is deferred to the moment-before-push and not done upfront.
+  local recreate_existing_pr_num=${9:-}
   local short_sha=${sha:0:7}
 
   # Portable mktemp: `-t TEMPLATE` semantics differ between BSD (macOS)
@@ -901,7 +884,7 @@ sync_open_pr() {
       printf "  ⊘ %s — all canonical targets skipped per .sync-overrides.yml (%d entries)\n" \
         "$consumer_name" "$override_skip_count"
       SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
-      SYNC_PR_OPENED=$((SYNC_PR_OPENED - 1))  # caller incremented eagerly
+      SYNC_PR_OPENED=$((SYNC_PR_OPENED - 1))  # pre-decrement to offset the caller's post-success increment
       return 0
     fi
     # No-targets case without overrides should already have been
@@ -1010,6 +993,67 @@ EOF
 )"; then
     err "$consumer_name: git commit failed"
     return 1
+  fi
+
+  # --recreate-existing destructive step. Deferred from
+  # sync_one_consumer to here so the live PR stays open until we
+  # have a replacement commit in hand. By the time we reach this
+  # point: the clone succeeded, materialize succeeded, the diff is
+  # non-empty (we just committed), so closing the live PR + deleting
+  # its branch is safe — failure between here and the next two
+  # lines (close, delete, push) is the only window where we could
+  # be left with no PR, and all three failures are loudly logged.
+  if [ -n "$recreate_existing_pr_num" ]; then
+    printf "  ⤷ %s — closing existing PR #%s for --recreate-existing\n" \
+      "$consumer_name" "$recreate_existing_pr_num"
+    if ! gh pr close "$recreate_existing_pr_num" --repo "$consumer_repo" \
+          --comment "Closed by \`scripts/sync-to-downstream.sh --recreate-existing\`. Reopening with a fresh synthesized body on a recreated \`$branch\`." >&2; then
+      err "$consumer_name: gh pr close failed for #$recreate_existing_pr_num"
+      return 1
+    fi
+    # Delete the remote branch so the subsequent push is a fresh-
+    # branch create (not a non-fast-forward update against the
+    # branch HEAD the closed PR pointed at — Codex #231 P1 caught
+    # the original missing-delete bug).
+    #
+    # Use --include to capture the HTTP status line and switch on
+    # it explicitly. Only 204 (success) and 404/422 (already-absent)
+    # are safe to swallow; everything else (401/403 auth, 5xx, etc.)
+    # must surface as a hard failure rather than be confused for
+    # "already absent" (CodeRabbit #231 round 2 caught the too-
+    # permissive fallback that masked any failed probe).
+    printf "  ⤷ %s — deleting remote branch %s for --recreate-existing\n" \
+      "$consumer_name" "$branch"
+    local _del_response _del_status _del_rc=0
+    _del_response=$(gh api --include -X DELETE "repos/${consumer_repo}/git/refs/heads/${branch}" 2>&1) || _del_rc=$?
+    _del_status=$(printf '%s\n' "$_del_response" | awk '
+      /^HTTP\/[0-9.]+[[:space:]]+[0-9]+/ {
+        match($0, /[0-9]+/)
+        # The first numeric run in an HTTP status line is the
+        # protocol minor version (e.g. "HTTP/1.1") or status code.
+        # Walk the line, take the second numeric run.
+        n = split($0, parts, /[^0-9]+/)
+        for (i = 1; i <= n; i++) {
+          if (parts[i] != "" && parts[i] != "1" && parts[i] != "2" && length(parts[i]) == 3) {
+            print parts[i]; exit
+          }
+        }
+        # Fallback: print the last numeric run (the status code is
+        # always 3 digits at the end of the status line preamble).
+        for (i = n; i >= 1; i--) if (parts[i] ~ /^[0-9]{3}$/) { print parts[i]; exit }
+      }')
+    case "$_del_status" in
+      204)
+        :  # ok, branch deleted
+        ;;
+      404|422)
+        printf "    · branch %s already absent on remote (status=%s, ok)\n" "$branch" "$_del_status"
+        ;;
+      *)
+        err "$consumer_name: failed to delete remote branch $branch (status=${_del_status:-unknown}, rc=$_del_rc); refusing to push to avoid non-fast-forward"
+        return 1
+        ;;
+    esac
   fi
 
   # Push. The active gh keyring account ('gh config get -h github.com user')
@@ -1152,6 +1196,7 @@ MODE=""
 SYNC_COMMIT_ISH=""
 SYNC_DRY_RUN=0
 SYNC_NO_PR=0
+SYNC_SKIP_EXISTING=0
 SYNC_RECREATE_EXISTING=0
 SYNC_VERBOSE=0
 FILTER_REPOS=""
@@ -1197,11 +1242,16 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --skip-existing)
-      # No-op: skipping when a PR already exists for the commit oid is
-      # the default behavior already encoded in `sync_check_existing_pr`.
+      # Default-behavior alias: skipping when a PR already exists for
+      # the commit oid is the policy encoded in `sync_check_existing_pr`.
       # The flag exists for callers who want to be explicit about the
-      # intent (e.g., in a documented re-run script). Mutually
-      # exclusive with --recreate-existing.
+      # intent (e.g., in a documented re-run script). It must be
+      # mutually exclusive with --recreate-existing — CodeRabbit
+      # caught the silent-loss-of-mutex on PR #231 round 2 where the
+      # flag was a true no-op and `--skip-existing --recreate-existing`
+      # silently flipped to recreate. Track the bit and reject the
+      # combo at the post-parse validation step below.
+      SYNC_SKIP_EXISTING=1
       shift
       ;;
     --recreate-existing)
@@ -1262,6 +1312,19 @@ if [ "$SYNC_NO_PR" = "1" ] && [ "$SYNC_RECREATE_EXISTING" = "1" ]; then
   err "--no-pr is incompatible with --recreate-existing (one stops at push, the other closes-and-recreates a PR)"
   exit 2
 fi
+if [ "$SYNC_SKIP_EXISTING" = "1" ] && [ "$SYNC_RECREATE_EXISTING" = "1" ]; then
+  # The CLI contract documents these as mutually exclusive (the --help
+  # text reads "--skip-existing|--recreate-existing"). Before this
+  # check landed, --skip-existing was parsed as a true no-op, so the
+  # combo silently fell through as recreate — confusing and potentially
+  # destructive. Reject explicitly. (CodeRabbit #231 round 2.)
+  err "--skip-existing is incompatible with --recreate-existing (mutually exclusive policies for an in-flight PR on this oid)"
+  exit 2
+fi
+if [ "$SYNC_SKIP_EXISTING" = "1" ] && [ "$MODE" = "audit" ]; then
+  err "--skip-existing is a sync-mode-only flag; remove it from --audit invocations"
+  exit 2
+fi
 if [ "$SYNC_NO_PR" = "1" ] && [ "$MODE" = "audit" ]; then
   err "--no-pr is a sync-mode-only flag; remove it from --audit invocations"
   exit 2
@@ -1278,7 +1341,7 @@ fi
 # environment under `set -u`. (They're already set as bash variables
 # above, but several helpers reference them with `${VAR:-0}` for
 # defensive defaulting — make sure they exist.)
-export SYNC_NO_PR SYNC_RECREATE_EXISTING SYNC_VERBOSE
+export SYNC_NO_PR SYNC_SKIP_EXISTING SYNC_RECREATE_EXISTING SYNC_VERBOSE
 
 require_yq
 require_manifest

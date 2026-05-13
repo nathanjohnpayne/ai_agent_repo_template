@@ -207,7 +207,7 @@ git init -q "$hostile_user_tree"
 # Set up a fake origin so git fetch / git reset have something to point at,
 # and seed user-only content so a hard reset would clobber observable state.
 ( cd "$hostile_user_tree" \
-    && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m "user-only commit" )
+    && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit --allow-empty -q -m "user-only commit" )
 # Symlink the cache entry at the user's tree.
 ln -s "$hostile_user_tree" "$hostile_cache/clean-consumer"
 echo "USER_LOCAL_EDIT" >"$hostile_user_tree/scripts/keep-in-sync.sh"
@@ -261,26 +261,26 @@ echo "v1" >"$SYNC_MP/scripts/ci/check_one"
 echo "v1" >"$SYNC_MP/AGENTS.md"
 git -C "$SYNC_MP" init -q
 git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
-git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "initial"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "initial"
 
 # Commit A — multi-type touch (canonical + kit + templated)
 echo "v2" >"$SYNC_MP/scripts/hooks/the-hook.sh"
 echo "v2" >"$SYNC_MP/scripts/ci/check_one"
 echo "v2" >"$SYNC_MP/AGENTS.md"
 git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
-git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "multi-type-touch"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "multi-type-touch"
 sha_A=$(git -C "$SYNC_MP" rev-parse HEAD)
 
 # Commit B — single canonical touch
 echo "v3" >"$SYNC_MP/scripts/coderabbit-wait.sh"
 git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
-git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "single-canonical-touch"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "single-canonical-touch"
 sha_B=$(git -C "$SYNC_MP" rev-parse HEAD)
 
 # Commit C — only an unrelated file (no manifest path touched)
 echo "noise" >"$SYNC_MP/.github/UNRELATED"
 git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
-git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "unrelated-only"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "unrelated-only"
 sha_C=$(git -C "$SYNC_MP" rev-parse HEAD)
 
 # 1) Multi-type touch: canonical lands, kit + templated are deferred with
@@ -320,7 +320,7 @@ deferred_only_sha=$(git -C "$SYNC_MP" rev-list HEAD --reverse | sed -n '2p')  # 
 # the multi-type one. Make a fresh commit just for this case.
 echo "v4" >"$SYNC_MP/scripts/ci/check_one"
 git -C "$SYNC_MP" -c user.email=t@t -c user.name=t add -A
-git -C "$SYNC_MP" -c user.email=t@t -c user.name=t commit -q -m "kit-only"
+git -C "$SYNC_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "kit-only"
 sha_D=$(git -C "$SYNC_MP" rev-parse HEAD)
 
 sync_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_D" --dry-run 2>&1)
@@ -366,10 +366,10 @@ YAML
 echo "v1" >"$GUARD_MP/scripts/the-script.sh"
 git -C "$GUARD_MP" init -q
 git -C "$GUARD_MP" -c user.email=t@t -c user.name=t add -A
-git -C "$GUARD_MP" -c user.email=t@t -c user.name=t commit -q -m initial
+git -C "$GUARD_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m initial
 echo "v2" >"$GUARD_MP/scripts/the-script.sh"
 git -C "$GUARD_MP" -c user.email=t@t -c user.name=t add -A
-git -C "$GUARD_MP" -c user.email=t@t -c user.name=t commit -q -m bump
+git -C "$GUARD_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m bump
 guard_sha=$(git -C "$GUARD_MP" rev-parse HEAD)
 
 # Live mode (no --dry-run) with the wrong active account should refuse.
@@ -488,6 +488,31 @@ echo "$mutex_out" | grep -q "incompatible" \
   || fail "expected 'incompatible' diagnostic; got: $mutex_out"
 
 # ---------------------------------------------------------------------------
+# Mutex: --skip-existing + --recreate-existing rejected (CodeRabbit #231
+# round 2). Before the fix, --skip-existing was parsed as a true no-op,
+# so this combo silently flipped to recreate.
+# ---------------------------------------------------------------------------
+set +e
+skip_mutex_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --skip-existing --recreate-existing 2>&1)
+skip_mutex_ec=$?
+set -e
+[ "$skip_mutex_ec" -eq 2 ] || fail "expected exit 2 for --skip-existing + --recreate-existing; got $skip_mutex_ec"
+echo "$skip_mutex_out" | grep -q "incompatible" \
+  || fail "expected 'incompatible' diagnostic for --skip-existing + --recreate-existing; got: $skip_mutex_out"
+
+# ---------------------------------------------------------------------------
+# Sync-mode-only: --skip-existing rejected in --audit.
+# ---------------------------------------------------------------------------
+set +e
+skip_audit_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --skip-existing 2>&1)
+skip_audit_ec=$?
+set -e
+[ "$skip_audit_ec" -eq 2 ] || fail "expected exit 2 when --skip-existing combined with --audit; got $skip_audit_ec"
+echo "$skip_audit_out" | grep -q "sync-mode-only" \
+  || fail "expected 'sync-mode-only' diagnostic for --skip-existing; got: $skip_audit_out"
+
+# ---------------------------------------------------------------------------
 # --verbose dry-run: emits per-file diff hunks for affected targets.
 # ---------------------------------------------------------------------------
 verbose_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run --verbose 2>&1)
@@ -525,33 +550,65 @@ grep -q 'override_should_skip_path "\$consumer_overrides"' "$SCRIPT" \
   || fail "sync_open_pr is missing the override_should_skip_path filter on canonical targets"
 
 # ---------------------------------------------------------------------------
-# --recreate-existing must close PR AND delete the remote branch, in that
-# order, in the same SYNC_RECREATE_EXISTING branch. Without the branch
-# deletion, the subsequent `git push -u origin <branch>` is rejected as
-# non-fast-forward (Codex #231 P1 round 1). Source-grep assertion since
-# this path requires a live gh API to exercise end-to-end.
+# --recreate-existing destructive step is properly ordered:
+#
+#   1. The local commit is built FIRST (clone + materialize + git commit)
+#      inside sync_open_pr.
+#   2. Only THEN does `gh pr close` + `gh api -X DELETE git/refs/heads/...`
+#      fire, immediately before `git push -u origin <branch>`.
+#
+# That ordering closes both windows CodeRabbit #231 round 2 flagged:
+#   - Destructive recreate before the replacement is ready (line 767).
+#   - Insufficient HTTP status handling on the DELETE (line 765).
+#
+# Codex #231 round 1 P1 separately required the branch deletion at all
+# (line 724) since the original code closed the PR but left the branch,
+# guaranteeing a non-fast-forward push rejection.
+#
+# Source-grep assertion since the live integration path requires a real
+# gh API + a downstream consumer worktree.
 # ---------------------------------------------------------------------------
 awk '
-  /SYNC_RECREATE_EXISTING:-0/ { in_block = 1 }
-  in_block && /gh pr close/   { saw_close = NR }
-  in_block && /gh api -X DELETE.*git\/refs\/heads/ { saw_delete = NR }
-  in_block && /Fall through to the live clone/ { in_block = 0 }
+  # Track when we are inside sync_open_pr to anchor the destructive
+  # step within the function that owns the local-commit build.
+  /^sync_open_pr\(\)/ { in_fn = 1 }
+  in_fn && /^}/ { in_fn = 0 }
+
+  # The commit step is the last "ready" boundary before push.
+  in_fn && /git -C "\$workspace\/repo" commit/ { saw_commit = NR }
+
+  # The destructive close + delete should land after the commit and
+  # before the push.
+  in_fn && /gh pr close "\$recreate_existing_pr_num"/ { saw_close = NR }
+  in_fn && /gh api --include -X DELETE.*git\/refs\/heads/ { saw_delete = NR }
+  in_fn && /git -C "\$workspace\/repo" push/ { saw_push = NR }
+
+  # Strict HTTP status case must be present (CodeRabbit round 2 line 765).
+  in_fn && /^[[:space:]]*204\)/ { saw_204 = NR }
+  in_fn && /404\|422\)/ { saw_404_422 = NR }
+
   END {
-    if (!saw_close)  { print "missing gh pr close in --recreate-existing block"; exit 1 }
-    if (!saw_delete) { print "missing gh api -X DELETE in --recreate-existing block (Codex #231 P1)"; exit 1 }
-    if (saw_close > saw_delete) { print "gh pr close must precede branch deletion"; exit 1 }
+    if (!saw_commit) { print "missing commit step in sync_open_pr"; exit 1 }
+    if (!saw_close)  { print "missing gh pr close in sync_open_pr (#231 r2)"; exit 1 }
+    if (!saw_delete) { print "missing gh api --include DELETE in sync_open_pr (Codex #231 r1 P1)"; exit 1 }
+    if (!saw_push)   { print "missing push step in sync_open_pr"; exit 1 }
+    if (!saw_204)    { print "missing 204 case in delete-status switch (CodeRabbit #231 r2 line 765)"; exit 1 }
+    if (!saw_404_422){ print "missing 404|422 case in delete-status switch (CodeRabbit #231 r2 line 765)"; exit 1 }
+    if (saw_commit > saw_close) { print "destructive close fires BEFORE commit — must be deferred (#231 r2 line 767)"; exit 1 }
+    if (saw_close > saw_delete) { print "gh pr close must precede branch delete"; exit 1 }
+    if (saw_delete > saw_push)  { print "branch delete must precede push"; exit 1 }
   }
-' "$SCRIPT" || fail "$(awk '
-  /SYNC_RECREATE_EXISTING:-0/ { in_block = 1 }
-  in_block && /gh pr close/   { saw_close = NR }
-  in_block && /gh api -X DELETE.*git\/refs\/heads/ { saw_delete = NR }
-  in_block && /Fall through to the live clone/ { in_block = 0 }
-  END {
-    if (!saw_close)  print "missing gh pr close"
-    if (!saw_delete) print "missing gh api DELETE"
-    if (saw_close > saw_delete) print "ordering wrong"
-  }
-' "$SCRIPT")"
+' "$SCRIPT" || fail "destructive recreate ordering check failed; see awk diagnostic above"
+
+# Bonus assertion: the OLD location in sync_one_consumer (between
+# pr_state detection and sync_open_pr call) must NOT carry an inline
+# `gh pr close`. Regression guard against accidentally re-introducing
+# the upfront destructive step that #231 r2 line 767 flagged.
+awk '
+  /^sync_one_consumer\(\)/ { in_fn = 1 }
+  in_fn && /^}/ { in_fn = 0 }
+  in_fn && /gh pr close/ { print "FAIL: sync_one_consumer should not call gh pr close — recreate is deferred to sync_open_pr"; exit 1 }
+' "$SCRIPT" || fail "sync_one_consumer carries an inline gh pr close — recreate must be deferred to sync_open_pr"
 
 # ---------------------------------------------------------------------------
 # --version / --help smoke
