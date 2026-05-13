@@ -151,7 +151,7 @@ if [ "$ec" -ne 0 ]; then
 else
   pass "dry-run with all flags completes (exit 0)"
 fi
-echo "$out" | grep -q "template-mirror (sub-B stub)" \
+echo "$out" | grep -q "Starting stage: template-mirror" \
   && pass "stage B stub ran" \
   || fail "stage B stub didn't run; got: $out"
 echo "$out" | grep -q "github-infra (sub-C stub)" \
@@ -223,7 +223,7 @@ echo "$ex_out" | grep -q "skip github-infra (already completed)" \
 echo "$ex_out" | grep -q "firebase-and-codereview (sub-D stub)" \
   && pass "explicit-resume ran firebase-and-codereview" \
   || fail "explicit-resume did not run firebase-and-codereview"
-echo "$ex_out" | grep -q "template-mirror (sub-B stub)" \
+echo "$ex_out" | grep -q "Starting stage: template-mirror" \
   && fail "explicit-resume should have skipped template-mirror (came before github-infra)" \
   || pass "explicit-resume correctly skipped pre-target stages"
 
@@ -385,10 +385,12 @@ mkdir -p "$fb_defer_target"
 # --firebase none, the deferred check should pass with exit 0.
 empty_path_dir="$WORKDIR/empty-path-dir"
 mkdir -p "$empty_path_dir"
-# Symlink the bootstrap-required tools into the manufactured PATH dir
-# so preflight's gh/op/git check passes; firebase/gcloud are
-# deliberately absent.
-for tool in bash gh op git; do
+# Symlink the bootstrap-required tools into the manufactured PATH
+# dir so preflight's tool check passes; firebase/gcloud are
+# deliberately absent. yq + rsync became required in round 3 of
+# #233 (Codex P1: stage-B must fail-closed when yq is unavailable),
+# so they're part of the minimum set now.
+for tool in bash gh op git yq rsync; do
   src=$(command -v "$tool" || true)
   if [ -n "$src" ]; then ln -sf "$src" "$empty_path_dir/$tool"; fi
 done

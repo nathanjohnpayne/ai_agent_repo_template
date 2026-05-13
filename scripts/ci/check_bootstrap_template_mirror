@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# scripts/ci/check_bootstrap_template_mirror — CI entry point for
+# #156 sub-B / #204 tests.
+#
+# Wraps tests/test_bootstrap_template_mirror.sh so the repo_lint
+# workflow's "run all scripts/ci/check_*" loop picks it up. Mirrors
+# the pattern used by check_bootstrap_wizard and the other check_*
+# scripts. Missing test script is a hard error (matches the tightening
+# applied to check_sync_overrides in #228 round 5).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_bootstrap_template_mirror.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_bootstrap_template_mirror: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
