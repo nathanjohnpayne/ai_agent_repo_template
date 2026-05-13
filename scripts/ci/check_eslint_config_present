@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# scripts/ci/check_eslint_config_present
+#
+# Enforces the ESLint flat-config policy from `rules/repo_rules.md`:
+# any repo with a root `package.json` MUST ship an `eslint.config.js`
+# flat config at the repo root, and the file must be syntactically
+# valid JavaScript.
+#
+# Repos without a root `package.json` (mergepath itself is shell-only,
+# for example) are exempt — the check logs a not-applicable note and
+# exits 0.
+#
+# Contract (load-bearing — referenced by docs/agents/code-review-
+# requirements.md and the rule in rules/repo_rules.md):
+#
+#   exit 0 — pass:
+#            (a) no root package.json (policy not applicable), OR
+#            (b) root package.json present AND eslint.config.js
+#                present at root AND `node --check` parses it.
+#   exit 1 — fail:
+#            root package.json present AND either eslint.config.js
+#            missing at root, OR present but fails `node --check`.
+#   exit 2 — environment error (Node not available when we needed it
+#            to parse-check). Treated as fail by the workflow so the
+#            check can't silently degrade to "skip".
+#
+# Bash 3.2 portable (macOS default shell). Mirrors the style of
+# scripts/ci/check_codex_scripts and scripts/ci/check_required_root_files.
+#
+# Synced to consumer repos via the `scripts/ci/` kit entry in
+# .mergepath-sync.yml — the file is canonical at this path everywhere.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+PKG_JSON="$REPO_ROOT/package.json"
+ESLINT_CONFIG="$REPO_ROOT/eslint.config.js"
+
+if [ ! -f "$PKG_JSON" ]; then
+  echo "check_eslint_config_present: no package.json — ESLint policy not applicable to this repo."
+  echo "check_eslint_config_present: PASS"
+  exit 0
+fi
+
+FAILED=0
+
+if [ ! -f "$ESLINT_CONFIG" ]; then
+  echo "FAIL: package.json is present at repo root but eslint.config.js is missing."
+  echo "      Mergepath policy requires a flat ESLint config in every Node-bearing repo."
+  echo "      See rules/repo_rules.md § ESLint policy and examples/eslint.config.js for"
+  echo "      a starting point you can copy."
+  FAILED=1
+fi
+
+if [ "$FAILED" -eq 0 ]; then
+  if ! command -v node >/dev/null 2>&1; then
+    echo "ERROR: node is not on PATH — cannot parse-check eslint.config.js."
+    echo "       Install Node.js >= 18 on the runner."
+    echo "check_eslint_config_present: ERROR"
+    exit 2
+  fi
+  if ! node --check "$ESLINT_CONFIG" 2>/tmp/eslint_config_parse.err; then
+    echo "FAIL: eslint.config.js failed Node syntax check:"
+    sed 's/^/      /' </tmp/eslint_config_parse.err
+    FAILED=1
+  fi
+  rm -f /tmp/eslint_config_parse.err
+fi
+
+if [ "$FAILED" -eq 1 ]; then
+  echo "check_eslint_config_present: FAIL"
+  exit 1
+fi
+
+echo "check_eslint_config_present: PASS"
+exit 0
