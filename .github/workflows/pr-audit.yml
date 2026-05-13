@@ -73,9 +73,23 @@ jobs:
             // Check 2 block for the full rationale; the short
             // version is that CLI identities still require
             // state === 'APPROVED' but the Codex bot can clear
-            // with any review state because the GitHub app never
-            // emits APPROVED — only COMMENTED with a 👍 reaction
-            // or no findings (see #29 for observational evidence).
+            // with a COMMENTED review on the current HEAD that
+            // carries no unaddressed P0/P1 inline findings, because
+            // the GitHub app never emits APPROVED (see #29 for
+            // observational evidence).
+            //
+            // Codex clearance is state-aware (#249): a Codex review
+            // that is present but flags P0/P1 findings does NOT
+            // clear the audit gate. The clearance definition is the
+            // same one `scripts/codex-review-check.sh` enforces at
+            // merge time — a COMMENTED review from the Codex bot on
+            // the current HEAD SHA with zero unresolved P0/P1 inline
+            // findings (P0/P1 detected via the `![P0 Badge]` /
+            // `![P1 Badge]` markdown markers Codex inlines into its
+            // findings). When the merge-gate helper for P0/P1
+            // counting from #235 lands, refactor the inline JS below
+            // to shell out to that shared helper so the two gates
+            // cannot drift. See #249.
 
             const since = new Date();
             since.setDate(since.getDate() - 7);
@@ -199,11 +213,15 @@ jobs:
                 // For the external-review path we accept either:
                 //   - an APPROVED review from a CLI reviewer identity
                 //     (nathanpayne-claude / nathanpayne-codex / etc.), OR
-                //   - ANY review from the Codex GitHub app bot,
-                //     regardless of state, because the Codex app
-                //     never emits APPROVED — only COMMENTED with a
-                //     👍 reaction or no findings (see #29 for the
-                //     observational evidence).
+                //   - a CLEARED review from the Codex GitHub app bot,
+                //     where "cleared" is the same two-condition
+                //     definition the merge gate uses (#249):
+                //       1. a COMMENTED review from the Codex bot on
+                //          the PR's HEAD SHA, AND
+                //       2. zero unresolved P0/P1 inline findings on
+                //          that review (P0/P1 markers are the
+                //          `![P0 Badge]` / `![P1 Badge]` images Codex
+                //          embeds in its inline finding bodies).
                 //
                 // The state-agnostic exception is intentionally
                 // SCOPED to the Codex bot only. CLI reviewer
@@ -215,22 +233,127 @@ jobs:
                 // any external approver, which would have let a
                 // Phase 4b fallback PR with only a COMMENTED CLI
                 // review pass the audit.
+                //
+                // Codex P0/P1 gating (#249): the prior version used
+                // `codexBotReviews.length === 0` as the block
+                // condition — so any Codex review (even one actively
+                // raising P0/P1 findings) satisfied the gate. The
+                // tightened gate mirrors `scripts/codex-review-check.sh`'s
+                // gate (c) two-condition shape on the PR's HEAD SHA.
+                // TODO(#235): once the merge-gate ships a shared
+                // `codex-p1-gate` helper (or equivalent extraction
+                // from codex-review-check.sh), refactor the inline
+                // computation below to call it so the audit gate and
+                // merge gate cannot drift.
                 const cliApprovedReviews = reviews.filter(
                   r => r.state === 'APPROVED' &&
                        reviewerAccounts.includes(r.user.login)
                 );
 
-                const codexBotReviews = reviews.filter(
-                  r => r.user.login === codexBotLogin
+                const headSha = pr.head && pr.head.sha;
+
+                // Codex reviews on the PR's HEAD SHA. The merge-time
+                // gate uses commit_id == HEAD_SHA to scope findings
+                // to the latest review round; the audit applies the
+                // same scope. If the audit's notion of HEAD ever
+                // drifts (e.g. force-pushes post-merge), tighten
+                // here — but post-merge HEAD is immutable in
+                // practice.
+                const codexReviewsOnHead = reviews.filter(
+                  r => r.user.login === codexBotLogin &&
+                       headSha &&
+                       r.commit_id === headSha
                 );
+
+                const codexCommentedOnHead = codexReviewsOnHead.filter(
+                  r => r.state === 'COMMENTED'
+                );
+
+                // Two-condition Codex clearance: at least one
+                // COMMENTED review on HEAD, AND no unresolved
+                // P0/P1 inline findings on the latest round.
+                // Findings are scoped to the latest Codex review's
+                // pull_request_review_id (same as merge gate (c))
+                // so an earlier round's already-addressed findings
+                // don't keep the audit failing.
+                let codexCleared = false;
+                if (codexCommentedOnHead.length > 0) {
+                  // Latest Codex review on HEAD (max by submitted_at).
+                  const latestCodexReview = codexCommentedOnHead.reduce(
+                    (latest, r) => {
+                      if (!latest) return r;
+                      return (r.submitted_at > latest.submitted_at) ? r : latest;
+                    },
+                    null
+                  );
+
+                  // Fetch inline review comments for this PR. The
+                  // outer review-fetch (listReviews) returns review
+                  // metadata only — inline P0/P1 findings live on
+                  // the /pulls/{pr}/comments endpoint, keyed back
+                  // to a review via pull_request_review_id.
+                  let inlineComments = [];
+                  try {
+                    inlineComments = await github.paginate(
+                      github.rest.pulls.listReviewComments,
+                      {
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        pull_number: pr.number,
+                        per_page: 100,
+                      }
+                    );
+                  } catch (e) {
+                    console.log(
+                      `WARNING: could not fetch inline comments for PR #${pr.number}; ` +
+                      `treating Codex clearance as NOT met for safety. Error: ${e.message}`
+                    );
+                    inlineComments = null;
+                  }
+
+                  if (inlineComments !== null && latestCodexReview) {
+                    // P0/P1 finding heuristic — same regex used by
+                    // scripts/codex-review-check.sh gate (c):
+                    // Codex inlines `![P0 Badge]` / `![P1 Badge]`
+                    // markdown images into each finding body.
+                    // Filter on bot author too — review-thread
+                    // replies (e.g., a quote-reply from the PR
+                    // author addressing a Codex finding) inherit
+                    // the same pull_request_review_id and would
+                    // otherwise be misclassified as unaddressed
+                    // findings (see codex-review-check.sh § P0/P1
+                    // for the nathanpaynedotcom #180 round 3
+                    // history on that filter).
+                    const p01Regex = /!\[P[01] Badge\]/;
+                    const unresolvedP01 = inlineComments.filter(
+                      c => c.user && c.user.login === codexBotLogin &&
+                           c.pull_request_review_id === latestCodexReview.id &&
+                           p01Regex.test(c.body || '')
+                    );
+
+                    if (unresolvedP01.length === 0) {
+                      codexCleared = true;
+                    }
+                  }
+                }
 
                 if (hadExternalLabel &&
                     cliApprovedReviews.length === 0 &&
-                    codexBotReviews.length === 0 &&
+                    !codexCleared &&
                     !isMergepathSyncPR) {
-                  prViolations.push(
-                    'External-review PR merged with no APPROVED review from a CLI reviewer identity and no review from the Codex bot'
-                  );
+                  // Distinguish the two failure modes so the audit
+                  // issue points at the right diagnosis: no Codex
+                  // review at all vs. a Codex review with
+                  // unresolved P0/P1 findings.
+                  if (codexReviewsOnHead.length === 0) {
+                    prViolations.push(
+                      'External-review PR merged with no APPROVED review from a CLI reviewer identity and no Codex bot review on the merge HEAD'
+                    );
+                  } else {
+                    prViolations.push(
+                      'External-review PR merged with a Codex bot review on HEAD that did not clear (no COMMENTED state on HEAD, or unresolved P0/P1 inline findings); see #249'
+                    );
+                  }
                 }
 
                 // Dependabot PRs use a strictly narrower rule: only

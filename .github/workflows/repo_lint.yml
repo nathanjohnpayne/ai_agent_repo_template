@@ -63,6 +63,9 @@ jobs:
       - name: check_auto_clear_workflow
         run: ./scripts/ci/check_auto_clear_workflow
 
+      - name: check_pr_audit_codex_clearance
+        run: ./scripts/ci/check_pr_audit_codex_clearance
+
       - name: install_yq_for_sync_manifest
         # mikefarah/yq is needed by check_sync_manifest. Pin a recent v4
         # release; bumped opportunistically. The official ubuntu-latest
