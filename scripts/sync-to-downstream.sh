@@ -712,21 +712,61 @@ sync_one_consumer() {
         local existing_pr_num="${pr_state#open:}"
         if [ "${SYNC_RECREATE_EXISTING:-0}" = "1" ]; then
           # --recreate-existing escape hatch: close the existing PR
-          # with a pointer comment, then fall through to the normal
-          # clone/push/create flow. The newly-created PR will use the
-          # same branch name (sync/mergepath-<oid>) — `gh pr close`
-          # closes the PR but leaves the branch in place, so the next
-          # `git push` updates the same branch and the next
-          # `gh pr create` opens a fresh PR on it.
+          # AND delete its head branch on the remote, then fall
+          # through to the normal clone/push/create flow. Both halves
+          # are required:
+          #   1. `gh pr close` alone leaves the branch in place. The
+          #      consumer's freshly synthesized commit is rebuilt on
+          #      top of `main` (not on top of the existing branch
+          #      HEAD), so it has a different SHA from whatever the
+          #      branch currently points at on the remote. A plain
+          #      `git push -u origin <branch>` would be rejected as
+          #      non-fast-forward and the whole --recreate flow would
+          #      fail mid-loop. (Codex #231 P1 round 1 caught this.)
+          #   2. Deleting the branch via `git push --delete` after
+          #      close is the safer half: it tombstones the branch
+          #      cleanly so the subsequent `git push -u origin
+          #      <branch>` is a fresh-branch create rather than a
+          #      forced update, which means no risk of clobbering an
+          #      unrelated branch with the same name, and the standard
+          #      `git push` (no --force) keeps working.
+          # `gh pr close --delete-branch` would conflate the two and
+          # also fight branch protection on `main` if the PR's head
+          # has merge artifacts; explicit two-step is clearer.
           printf "  ⤷ %s — closing existing PR #%s for --recreate-existing\n" \
             "$consumer_name" "$existing_pr_num"
           if ! gh pr close "$existing_pr_num" --repo "$consumer_repo" \
-                --comment "Closed by \`scripts/sync-to-downstream.sh --recreate-existing\`. Reopening with a fresh synthesized body on the same branch ($branch)." >&2; then
+                --comment "Closed by \`scripts/sync-to-downstream.sh --recreate-existing\`. Reopening with a fresh synthesized body on a recreated \`$branch\`." >&2; then
             err "$consumer_name: gh pr close failed for #$existing_pr_num"
             SYNC_FAILED=$((SYNC_FAILED + 1))
             return 0
           fi
-          # Fall through to the live clone/push/create below.
+          # Delete the remote branch so the subsequent push creates
+          # it fresh. Tolerate "already deleted" (gh pr close can in
+          # some flows tombstone the branch as a side effect on
+          # certain repo configs).
+          printf "  ⤷ %s — deleting remote branch %s for --recreate-existing\n" \
+            "$consumer_name" "$branch"
+          local _del_rc=0
+          gh api -X DELETE "repos/${consumer_repo}/git/refs/heads/${branch}" \
+            >/dev/null 2>&1 || _del_rc=$?
+          if [ "$_del_rc" -ne 0 ]; then
+            # 422 ("Reference does not exist") is fine. Anything else
+            # is a hard failure — better to bail than to push a stale
+            # non-fast-forward branch and surface a confusing
+            # mid-sync error from `git push`.
+            if ! gh api "repos/${consumer_repo}/git/refs/heads/${branch}" \
+                  >/dev/null 2>&1; then
+              printf "    · branch %s already absent on remote (ok)\n" "$branch"
+            else
+              err "$consumer_name: failed to delete remote branch $branch (rc=$_del_rc); refusing to push to avoid non-fast-forward"
+              SYNC_FAILED=$((SYNC_FAILED + 1))
+              return 0
+            fi
+          fi
+          # Fall through to the live clone/push/create below. Because
+          # the remote branch is gone, the local push is a fresh-
+          # branch create.
         else
           printf "  · %s already in flight (PR #%s on branch %s)\n" \
             "$consumer_name" "$existing_pr_num" "$branch"

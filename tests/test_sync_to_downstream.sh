@@ -525,6 +525,35 @@ grep -q 'override_should_skip_path "\$consumer_overrides"' "$SCRIPT" \
   || fail "sync_open_pr is missing the override_should_skip_path filter on canonical targets"
 
 # ---------------------------------------------------------------------------
+# --recreate-existing must close PR AND delete the remote branch, in that
+# order, in the same SYNC_RECREATE_EXISTING branch. Without the branch
+# deletion, the subsequent `git push -u origin <branch>` is rejected as
+# non-fast-forward (Codex #231 P1 round 1). Source-grep assertion since
+# this path requires a live gh API to exercise end-to-end.
+# ---------------------------------------------------------------------------
+awk '
+  /SYNC_RECREATE_EXISTING:-0/ { in_block = 1 }
+  in_block && /gh pr close/   { saw_close = NR }
+  in_block && /gh api -X DELETE.*git\/refs\/heads/ { saw_delete = NR }
+  in_block && /Fall through to the live clone/ { in_block = 0 }
+  END {
+    if (!saw_close)  { print "missing gh pr close in --recreate-existing block"; exit 1 }
+    if (!saw_delete) { print "missing gh api -X DELETE in --recreate-existing block (Codex #231 P1)"; exit 1 }
+    if (saw_close > saw_delete) { print "gh pr close must precede branch deletion"; exit 1 }
+  }
+' "$SCRIPT" || fail "$(awk '
+  /SYNC_RECREATE_EXISTING:-0/ { in_block = 1 }
+  in_block && /gh pr close/   { saw_close = NR }
+  in_block && /gh api -X DELETE.*git\/refs\/heads/ { saw_delete = NR }
+  in_block && /Fall through to the live clone/ { in_block = 0 }
+  END {
+    if (!saw_close)  print "missing gh pr close"
+    if (!saw_delete) print "missing gh api DELETE"
+    if (saw_close > saw_delete) print "ordering wrong"
+  }
+' "$SCRIPT")"
+
+# ---------------------------------------------------------------------------
 # --version / --help smoke
 # ---------------------------------------------------------------------------
 "$SCRIPT" --version | grep -q "sync-to-downstream.sh" || fail "--version output unexpected"
