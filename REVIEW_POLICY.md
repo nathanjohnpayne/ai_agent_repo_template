@@ -905,7 +905,7 @@ This policy and the accompanying `review-policy.yml` should be included in every
 5. Ensure all agent environments have credentials configured for the repo.
 6. If the repo is public, enable secret scanning and push protection via GitHub settings (or API).
 7. If the repo is public and using CodeRabbit, set `coderabbit.enabled: true` in `.github/review-policy.yml` and install the CodeRabbit GitHub App on the repo.
-8. The `.coderabbit.yml` file at the repo root ships with the template and works out of the box. Customize `reviews.path_instructions` to add repo-specific review guidance (e.g., flag currency rounding in billing code, verify type compatibility in shared packages).
+8. The `.coderabbit.yml` file at the repo root ships with the template and works out of the box. The template defaults to `reviews.profile: chill` — per CodeRabbit's docs, the 🧹 Nitpick category is "only in Assertive mode," so `chill` keeps substantive findings while suppressing per-thread nit ceremony (see #237 for the 2026-05-13 sweep data that motivated this default). Override per-repo by setting `reviews.profile: assertive` locally if you want the polish pass on that repo specifically. Customize `reviews.path_instructions` to add repo-specific review guidance (e.g., flag currency rounding in billing code, verify type compatibility in shared packages).
 
 ### CodeRabbit Removal
 

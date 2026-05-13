@@ -178,6 +178,17 @@ CodeRabbit + Codex App posture is configured regardless:
   step the wizard cannot fully automate).
 - Wire `.github/review-policy.yml`'s `coderabbit` + `codex` blocks
   to match the operator's choices.
+- The template's `.coderabbit.yml` ships with `reviews.profile: chill`
+  by default. Per CodeRabbit's docs, the 🧹 Nitpick category is "only
+  in Assertive mode" — `chill` suppresses nitpicks at the source while
+  preserving substantive findings (Potential issue / ⚠️ / Refactor /
+  Security). The 2026-05-13 sweep (#234) surfaced 56 unresolved nit
+  threads across 9 repos, none substantive; #237 commits to the
+  quieter posture at the template level. Override per-repo by
+  setting `reviews.profile: assertive` locally if a specific repo
+  wants the polish pass. The override sticks because the wizard's
+  template-mirror only seeds `.coderabbit.yml` on first bootstrap,
+  not on every sync wave.
 
 **Failure recovery.** Firebase project-creation failures are fatal
 (the wizard refuses to record completion). CodeRabbit/Codex URL

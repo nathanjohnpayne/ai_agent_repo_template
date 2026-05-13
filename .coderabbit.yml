@@ -15,7 +15,17 @@ reviews:
     base_branches:
       - main
 
-  profile: assertive
+  # profile: chill (the default) suppresses 🧹 Nitpick comments entirely
+  # — per CodeRabbit's docs, the Nitpick category is "only in Assertive
+  # mode". The 2026-05-13 sweep (#234) surfaced 56 unresolved nit threads
+  # across 9 repos, none of which represented substantive findings; the
+  # validation pass (#236) classified most as ALREADY-FIXED or
+  # cosmetic. Switching to chill keeps substantive findings (Potential
+  # issue / ⚠️ / Refactor / Security) while removing the per-thread
+  # nit ceremony. See #237 for the full rationale and links to the
+  # supporting audit data. Override per-repo by setting
+  # profile: assertive locally if a repo wants the polish pass.
+  profile: chill
   request_changes_workflow: false
 
   high_level_summary: true

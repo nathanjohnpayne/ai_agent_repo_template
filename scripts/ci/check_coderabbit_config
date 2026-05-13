@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# check_coderabbit_config
+#
+# Validates .coderabbit.yml — the CodeRabbit configuration shipped
+# with the Mergepath template and propagated to consumer repos via
+# the wizard's template-mirror bootstrap (scripts/bootstrap/
+# firebase-and-codereview.sh). See #237 for the nit-collapse change
+# this check enforces.
+#
+# Checks:
+#
+#   1. .coderabbit.yml exists at repo root.
+#   2. The file parses as YAML.
+#   3. reviews.profile is set to "chill" — switching to "assertive"
+#      re-enables 🧹 Nitpick comments per CodeRabbit's documented
+#      profile semantics, which #237 explicitly disabled at the
+#      template level. A consumer repo may still override this
+#      locally (the template-mirror only seeds the file on first
+#      bootstrap, not on every sync wave), but the template itself
+#      must stay on chill so new repos inherit the quieter posture.
+#
+# This check is read-only and does not contact CodeRabbit's API.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CONFIG="$REPO_ROOT/.coderabbit.yml"
+EXPECTED_PROFILE="chill"
+
+if ! command -v yq >/dev/null 2>&1; then
+  echo "FAIL: yq is required (mikefarah/yq v4+). Install via 'brew install yq' or apt."
+  exit 2
+fi
+
+if [ ! -f "$CONFIG" ]; then
+  echo "FAIL: .coderabbit.yml is missing at repo root"
+  exit 1
+fi
+
+if ! yq '.' "$CONFIG" >/dev/null 2>&1; then
+  echo "FAIL: .coderabbit.yml does not parse as YAML"
+  yq '.' "$CONFIG" || true
+  exit 1
+fi
+
+profile=$(yq -r '.reviews.profile // ""' "$CONFIG")
+if [ "$profile" != "$EXPECTED_PROFILE" ]; then
+  echo "FAIL: reviews.profile is '$profile', expected '$EXPECTED_PROFILE' (#237 nit-collapse)"
+  echo "      'assertive' re-enables 🧹 Nitpick comments per CodeRabbit's docs."
+  echo "      Keep the template on '$EXPECTED_PROFILE'; consumer repos may override locally."
+  exit 1
+fi
+
+echo "check_coderabbit_config: PASS (reviews.profile=$profile)"
+exit 0
