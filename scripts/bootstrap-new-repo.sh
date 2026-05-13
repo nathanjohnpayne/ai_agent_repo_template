@@ -84,20 +84,30 @@ BOOTSTRAP_REPO_OWNER="${BOOTSTRAP_REPO_OWNER:-nathanjohnpayne}"
 # functions read these via the BOOTSTRAP_INPUT_<name> shape exported
 # below; see bootstrap_input() for the read accessor.
 
-BOOTSTRAP_INPUT_REPO_NAME=""
-BOOTSTRAP_INPUT_DESCRIPTION=""
-BOOTSTRAP_INPUT_VISIBILITY=""
-BOOTSTRAP_INPUT_FIREBASE=""
-BOOTSTRAP_INPUT_REVIEWERS="claude,cursor,codex"
-BOOTSTRAP_INPUT_CODEX_APP=""
-BOOTSTRAP_INPUT_PROJECT=""
+# Initial defaults — honor any env-var-set value (`${VAR:-}` keeps an
+# inherited value, otherwise empty). The wizard's prompt block fills
+# in defaults for empty entries.
+BOOTSTRAP_INPUT_REPO_NAME="${BOOTSTRAP_INPUT_REPO_NAME:-}"
+BOOTSTRAP_INPUT_DESCRIPTION="${BOOTSTRAP_INPUT_DESCRIPTION:-}"
+BOOTSTRAP_INPUT_VISIBILITY="${BOOTSTRAP_INPUT_VISIBILITY:-}"
+BOOTSTRAP_INPUT_FIREBASE="${BOOTSTRAP_INPUT_FIREBASE:-}"
+BOOTSTRAP_INPUT_REVIEWERS="${BOOTSTRAP_INPUT_REVIEWERS:-claude,cursor,codex}"
+BOOTSTRAP_INPUT_CODEX_APP="${BOOTSTRAP_INPUT_CODEX_APP:-}"
+BOOTSTRAP_INPUT_PROJECT="${BOOTSTRAP_INPUT_PROJECT:-}"
 
-BOOTSTRAP_FROM_FLAG_DESCRIPTION=""
-BOOTSTRAP_FROM_FLAG_VISIBILITY=""
-BOOTSTRAP_FROM_FLAG_FIREBASE=""
+# FROM_FLAG sentinels — "1" iff the input was supplied by a flag OR
+# by a pre-set BOOTSTRAP_INPUT_<name> env var. Either path suppresses
+# the matching interactive prompt in prompt_for_inputs(). Without the
+# env-pre-seeded branch, `BOOTSTRAP_INPUT_PROJECT=7 bootstrap...` would
+# still prompt for project and overwrite the env value (codex P2 on
+# #246). REVIEWERS has a non-empty default ("claude,cursor,codex") and
+# no prompt block, so it doesn't need a sentinel.
+BOOTSTRAP_FROM_FLAG_DESCRIPTION="${BOOTSTRAP_INPUT_DESCRIPTION:+1}"
+BOOTSTRAP_FROM_FLAG_VISIBILITY="${BOOTSTRAP_INPUT_VISIBILITY:+1}"
+BOOTSTRAP_FROM_FLAG_FIREBASE="${BOOTSTRAP_INPUT_FIREBASE:+1}"
 BOOTSTRAP_FROM_FLAG_REVIEWERS=""
-BOOTSTRAP_FROM_FLAG_CODEX_APP=""
-BOOTSTRAP_FROM_FLAG_PROJECT=""
+BOOTSTRAP_FROM_FLAG_CODEX_APP="${BOOTSTRAP_INPUT_CODEX_APP:+1}"
+BOOTSTRAP_FROM_FLAG_PROJECT="${BOOTSTRAP_INPUT_PROJECT:+1}"
 
 BOOTSTRAP_DRY_RUN=0
 BOOTSTRAP_SKIP_FIREBASE=0
@@ -296,7 +306,11 @@ BOOTSTRAP_MERGEPATH_ROOT="${BOOTSTRAP_MERGEPATH_ROOT:-$(cd "$SCRIPT_DIR/.." && p
 
 export BOOTSTRAP_DRY_RUN BOOTSTRAP_LOG_FILE BOOTSTRAP_STATE_FILE \
        TARGET_DIR BOOTSTRAP_MERGEPATH_ROOT BOOTSTRAP_LIB_DIR \
-       BOOTSTRAP_REPO_OWNER
+       BOOTSTRAP_REPO_OWNER BOOTSTRAP_SKIP_BOARD \
+       BOOTSTRAP_INPUT_REPO_NAME BOOTSTRAP_INPUT_DESCRIPTION \
+       BOOTSTRAP_INPUT_VISIBILITY BOOTSTRAP_INPUT_FIREBASE \
+       BOOTSTRAP_INPUT_REVIEWERS BOOTSTRAP_INPUT_CODEX_APP \
+       BOOTSTRAP_INPUT_PROJECT
 
 # --- source the helper lib + stage modules ---------------------------------
 
@@ -626,12 +640,11 @@ dispatch() {
     # Per-flag stage skips. --skip-firebase suppresses stage D's
     # Firebase substeps but the stage function still runs (it
     # handles --skip-firebase / firebase=none internally). --skip-board
-    # skips stage E entirely.
-    if [ "$stage" = "board-and-summary" ] && [ "$BOOTSTRAP_SKIP_BOARD" = "1" ]; then
-      bootstrap::wizard_log "skip $stage (--skip-board)"
-      bootstrap::record_stage "$stage"
-      continue
-    fi
+    # suppresses stage E's Project v2 board sub-step but the stage
+    # function still runs — the final summary block + PRD/spec/plan
+    # scaffold writes are too valuable to gate on whether the operator
+    # wanted a board. The stage reads BOOTSTRAP_SKIP_BOARD and skips
+    # only sub-step 1 internally.
 
     # General-purpose stage skip via env var. BOOTSTRAP_SKIP_STAGES is
     # a comma-separated list of stage names to skip entirely (no
