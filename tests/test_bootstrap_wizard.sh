@@ -154,7 +154,7 @@ fi
 echo "$out" | grep -q "Starting stage: template-mirror" \
   && pass "stage B stub ran" \
   || fail "stage B stub didn't run; got: $out"
-echo "$out" | grep -q "github-infra (sub-C stub)" \
+echo "$out" | grep -q "Starting stage: github-infra" \
   && pass "stage C stub ran" \
   || fail "stage C stub didn't run"
 echo "$out" | grep -q "firebase-and-codereview (sub-D stub)" \

@@ -633,6 +633,21 @@ dispatch() {
       continue
     fi
 
+    # General-purpose stage skip via env var. BOOTSTRAP_SKIP_STAGES is
+    # a comma-separated list of stage names to skip entirely (no
+    # dispatch, no record). Useful for tests that want to scope to a
+    # single stage, and for operators who want to mirror the template
+    # locally without yet creating remote GitHub infra (e.g., to
+    # inspect the result before committing to a name).
+    if [ -n "${BOOTSTRAP_SKIP_STAGES:-}" ]; then
+      case ",${BOOTSTRAP_SKIP_STAGES},"  in
+        *",${stage},"*)
+          bootstrap::wizard_log "skip $stage (BOOTSTRAP_SKIP_STAGES)"
+          continue
+          ;;
+      esac
+    fi
+
     # Dispatch to bootstrap::stage_<name with hyphens to underscores>.
     local fn="bootstrap::stage_${stage//-/_}"
     if ! type "$fn" >/dev/null 2>&1; then

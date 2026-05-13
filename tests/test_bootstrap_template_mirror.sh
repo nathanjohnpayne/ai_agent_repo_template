@@ -189,6 +189,7 @@ out=$(BOOTSTRAP_MERGEPATH_ROOT="$FAKE_MP" \
       BOOTSTRAP_AUTO_PROMPT=skip \
       BOOTSTRAP_AUTHOR_NAME="test" \
       BOOTSTRAP_AUTHOR_EMAIL="t@t" \
+      BOOTSTRAP_SKIP_STAGES="github-infra,firebase-and-codereview,board-and-summary" \
       "$SCRIPT" my-new-repo \
         --target-dir "$TARGET" \
         --description "a test repo" --visibility private \
@@ -355,6 +356,7 @@ dry_out=$(BOOTSTRAP_MERGEPATH_ROOT="$FAKE_MP" \
           BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
           BOOTSTRAP_AUTO_CONFIRM=1 \
           BOOTSTRAP_AUTO_PROMPT=skip \
+          BOOTSTRAP_SKIP_STAGES="github-infra,firebase-and-codereview,board-and-summary" \
           "$SCRIPT" my-new-repo \
             --target-dir "$dry_target" \
             --description "d" --visibility private \
@@ -456,6 +458,7 @@ fail_out=$(PATH="$shim_dir:$PATH" \
            BOOTSTRAP_AUTO_PROMPT=skip \
            BOOTSTRAP_AUTHOR_NAME="test" \
            BOOTSTRAP_AUTHOR_EMAIL="t@t" \
+      BOOTSTRAP_SKIP_STAGES="github-infra,firebase-and-codereview,board-and-summary" \
            "$SCRIPT" my-new-repo \
              --target-dir "$fail_target" \
              --description "test repo" --visibility private \
