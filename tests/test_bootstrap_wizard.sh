@@ -301,6 +301,125 @@ state_lines=$(wc -l <"$log_check_target/.bootstrap-state" | tr -d ' ')
   || fail "expected 4 state-file entries; got $state_lines"
 
 # ---------------------------------------------------------------------------
+# Test 16: --project with non-digit suffix (e.g., "12abc") → exit 1.
+# Codex P2 round 1 caught the `new|[0-9]*` case-glob accepting trailing
+# non-digit chars.
+# ---------------------------------------------------------------------------
+set +e
+"$SCRIPT" some-repo --project 12abc >/dev/null 2>&1
+ec=$?
+set -e
+[ "$ec" -eq 1 ] && pass "--project 12abc → exit 1" \
+                || fail "--project with non-digit suffix should exit 1; got $ec"
+
+# Negative case: --project new and --project 7 should still pass arg validation.
+set +e
+new_target="$WORKDIR/proj-new-target"; mkdir -p "$new_target"
+BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+  BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+  "$SCRIPT" my-new-repo --target-dir "$new_target" \
+  --description d --visibility private --firebase none --codex-app n \
+  --project new --dry-run >/dev/null 2>&1
+new_ec=$?
+set -e
+[ "$new_ec" -eq 0 ] && pass "--project new → exit 0" \
+                    || fail "--project new should pass; got $new_ec"
+
+set +e
+num_target="$WORKDIR/proj-num-target"; mkdir -p "$num_target"
+BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+  BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+  "$SCRIPT" my-new-repo --target-dir "$num_target" \
+  --description d --visibility private --firebase none --codex-app n \
+  --project 42 --dry-run >/dev/null 2>&1
+num_ec=$?
+set -e
+[ "$num_ec" -eq 0 ] && pass "--project 42 → exit 0" \
+                    || fail "--project 42 should pass; got $num_ec"
+
+# ---------------------------------------------------------------------------
+# Test 17: --resume with an unknown stage name → exit 1 (Codex P1
+# round 1 — without the guard, dispatch silently no-ops every stage).
+# ---------------------------------------------------------------------------
+unknown_resume_target="$WORKDIR/unknown-resume-target"
+mkdir -p "$unknown_resume_target"
+set +e
+ur_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+         BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+         "$SCRIPT" my-new-repo \
+         --target-dir "$unknown_resume_target" \
+         --description d --visibility private --firebase none \
+         --codex-app n --project new --dry-run \
+         --resume not-a-real-stage 2>&1)
+ur_ec=$?
+set -e
+[ "$ur_ec" -ne 0 ] && pass "--resume with unknown stage → non-zero" \
+                   || fail "unknown resume stage should fail; got exit 0 silently (CODEX P1)"
+echo "$ur_out" | grep -q "unknown resume stage" \
+  && pass "unknown resume stage produces targeted diagnostic" \
+  || fail "expected 'unknown resume stage' diagnostic; got: $ur_out"
+
+# Resume target from a STALE state file (typo or older-version
+# wizard recorded a stage that doesn't exist anymore) → same exit
+# path, with a guidance line that points at the state file.
+stale_state_target="$WORKDIR/stale-state-target"
+mkdir -p "$stale_state_target"
+echo "stage-from-a-prior-version" >"$stale_state_target/.bootstrap-state"
+set +e
+ss_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+         BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+         "$SCRIPT" my-new-repo \
+         --target-dir "$stale_state_target" \
+         --description d --visibility private --firebase none \
+         --codex-app n --project new --dry-run \
+         --resume 2>&1)
+ss_ec=$?
+set -e
+[ "$ss_ec" -ne 0 ] && pass "--resume with stale state-file stage → non-zero" \
+                   || fail "stale state-file stage should fail; got 0"
+echo "$ss_out" | grep -q "state file" \
+  && pass "stale state-file diagnostic points at the file" \
+  || fail "expected 'state file' diagnostic; got: $ss_out"
+
+# ---------------------------------------------------------------------------
+# Test 18: Firebase dep check is deferred until after prompts populate
+# the input (Codex P1 round 1 — the original gating against
+# `BOOTSTRAP_INPUT_FIREBASE != "none"` rejected interactive runs that
+# defaulted to none). Simulate by NOT passing --firebase and NOT having
+# firebase/gcloud installed (SKIP_TOOL_CHECK=0 + a tmpdir PATH).
+# ---------------------------------------------------------------------------
+fb_defer_target="$WORKDIR/fb-defer-target"
+mkdir -p "$fb_defer_target"
+# Manufactured PATH with only the absolute minimum (bash, gh, op, git).
+# If `firebase` and `gcloud` aren't on this PATH AND the user supplied
+# --firebase none, the deferred check should pass with exit 0.
+empty_path_dir="$WORKDIR/empty-path-dir"
+mkdir -p "$empty_path_dir"
+# Symlink the bootstrap-required tools into the manufactured PATH dir
+# so preflight's gh/op/git check passes; firebase/gcloud are
+# deliberately absent.
+for tool in bash gh op git; do
+  src=$(command -v "$tool" || true)
+  if [ -n "$src" ]; then ln -sf "$src" "$empty_path_dir/$tool"; fi
+done
+set +e
+# Include /usr/bin and /bin so coreutils (dirname, sed, etc.) resolve.
+# Crucially: NO /opt/homebrew/bin and NO ~/google-cloud-sdk/bin, so
+# `firebase` and `gcloud` are NOT findable — that's the scenario under
+# test (operator on a fresh machine, picks --firebase none).
+fb_out=$(PATH="$empty_path_dir:/usr/bin:/bin" \
+         BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 BOOTSTRAP_AUTO_CONFIRM=1 \
+         BOOTSTRAP_AUTO_PROMPT=skip \
+         "$SCRIPT" my-new-repo \
+         --target-dir "$fb_defer_target" \
+         --description d --visibility private --firebase none \
+         --codex-app n --project new --dry-run 2>&1)
+fb_ec=$?
+set -e
+[ "$fb_ec" -eq 0 ] && pass "--firebase none passes even without firebase/gcloud on PATH" \
+                   || fail "--firebase none should pass when firebase/gcloud missing; got rc=$fb_ec, out: $fb_out"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo

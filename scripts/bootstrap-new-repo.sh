@@ -199,9 +199,19 @@ while [ $# -gt 0 ]; do
       ;;
     --project)
       [ -z "${2:-}" ] && { bootstrap::wizard_err "missing argument for --project"; exit 1; }
+      # Validate as either the literal "new" or a non-empty
+      # digits-only string. The naive case-glob `new|[0-9]*` accepts
+      # values like `12abc` because `*` matches any chars; Codex
+      # P2 caught this on PR #232. The two-step case below uses an
+      # explicit reject pattern (`*[!0-9]*`) so non-digit suffixes
+      # are flagged.
       case "$2" in
-        new|[0-9]*) ;;
-        *) bootstrap::wizard_err "--project must be 'new' or a number (got '$2')"; exit 1 ;;
+        new) ;;
+        '') bootstrap::wizard_err "--project value cannot be empty"; exit 1 ;;
+        *[!0-9]*)
+          bootstrap::wizard_err "--project must be 'new' or a non-negative integer (got '$2')"; exit 1
+          ;;
+        *) ;;  # digits-only — accept
       esac
       BOOTSTRAP_INPUT_PROJECT="$2"
       BOOTSTRAP_FROM_FLAG_PROJECT=1
@@ -314,15 +324,12 @@ preflight() {
         violations=$((violations + 1))
       fi
     done
-    # firebase and gcloud only required when Firebase scope != none.
-    if [ "${BOOTSTRAP_INPUT_FIREBASE}" != "none" ] && [ "$BOOTSTRAP_SKIP_FIREBASE" != "1" ]; then
-      for tool in firebase gcloud; do
-        if ! command -v "$tool" >/dev/null 2>&1; then
-          bootstrap::wizard_err "missing Firebase dependency: $tool (skip with --skip-firebase if not deploying)"
-          violations=$((violations + 1))
-        fi
-      done
-    fi
+    # Firebase / gcloud check is deferred to preflight_firebase_deps()
+    # which runs AFTER prompts populate BOOTSTRAP_INPUT_FIREBASE. Codex
+    # P1 on PR #232 round 1 caught the gap: when the user hasn't
+    # explicitly set --firebase, the input is empty until prompts run;
+    # gating the dep check on `!= "none"` here would reject valid
+    # interactive runs whose intended (defaulted) scope is none.
   fi
 
   # 2. op-preflight.sh session cache. Soft-warn rather than hard-fail —
@@ -391,6 +398,34 @@ preflight() {
 
   if [ "$violations" -gt 0 ]; then
     bootstrap::wizard_err "preflight failed ($violations violation(s)). Aborting."
+    return 2
+  fi
+  return 0
+}
+
+# Firebase-specific dependency check. Runs AFTER prompts populate
+# BOOTSTRAP_INPUT_FIREBASE so an interactive run that defaults
+# firebase=none doesn't trip on missing firebase/gcloud. Codex P1
+# on PR #232 round 1.
+preflight_firebase_deps() {
+  if [ "${BOOTSTRAP_SKIP_TOOL_CHECK:-0}" = "1" ]; then
+    return 0
+  fi
+  if [ "$BOOTSTRAP_SKIP_FIREBASE" = "1" ]; then
+    return 0
+  fi
+  if [ "$BOOTSTRAP_INPUT_FIREBASE" = "none" ] || [ -z "$BOOTSTRAP_INPUT_FIREBASE" ]; then
+    return 0
+  fi
+  local violations=0
+  for tool in firebase gcloud; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      bootstrap::wizard_err "missing Firebase dependency: $tool (skip with --skip-firebase if not deploying)"
+      violations=$((violations + 1))
+    fi
+  done
+  if [ "$violations" -gt 0 ]; then
+    bootstrap::wizard_err "Firebase dependency check failed ($violations missing). Aborting."
     return 2
   fi
   return 0
@@ -501,6 +536,25 @@ dispatch() {
       resume_after=$(bootstrap::last_completed_stage)
     fi
     if [ -n "$resume_after" ]; then
+      # Validate resume_after against the known STAGES list BEFORE
+      # entering the dispatch loop. Without this, an unknown stage
+      # name (typo on the CLI, or a stale state file from an older
+      # wizard version) sets `skipping=1` and never finds a matching
+      # stage to flip it back to 0 — every stage is treated as
+      # already completed and the wizard exits 0 with no work done
+      # (silent false-success). Codex P1 on PR #232 round 1.
+      local known=0
+      for s in "${STAGES[@]}"; do
+        if [ "$s" = "$resume_after" ]; then
+          known=1
+          break
+        fi
+      done
+      if [ "$known" != "1" ]; then
+        bootstrap::wizard_err "unknown resume stage: '$resume_after' (known stages: ${STAGES[*]})"
+        bootstrap::wizard_err "If the state file is the source: edit or remove $BOOTSTRAP_STATE_FILE and re-run."
+        return 1
+      fi
       bootstrap::wizard_log "resume: skipping stages up to and including '$resume_after'"
     fi
   fi
@@ -556,6 +610,11 @@ preflight || exit $?
 if [ "${BOOTSTRAP_AUTO_PROMPT:-}" != "skip" ]; then
   prompt_for_inputs
 fi
+
+# Firebase deps check runs HERE — after prompts populate
+# BOOTSTRAP_INPUT_FIREBASE — so the interactive default-to-none path
+# doesn't trip on missing firebase/gcloud (Codex P1 on PR #232 round 1).
+preflight_firebase_deps || exit $?
 
 confirm_inputs || exit $?
 
