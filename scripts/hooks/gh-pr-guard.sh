@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 # gh-pr-guard.sh — PreToolUse hook for Claude Code
 #
-# Gates three operations:
-#   1. gh pr create — blocks unless the command text includes
-#      "Authoring-Agent:" and "## Self-Review"
+# Gates four operations:
+#   1. gh pr create — blocks unless (a) the keyring's active gh
+#      account is the AUTHOR identity (nathanjohnpayne by default;
+#      override via GH_PR_GUARD_EXPECTED_AUTHOR), AND (b) the command
+#      text includes "Authoring-Agent:" and "## Self-Review". The
+#      identity check (#241) prevents the split-invocation footgun
+#      where a `gh auth switch` in one Bash tool call drifts before
+#      the `gh pr create` in a subsequent call, landing the PR under
+#      the wrong account. Canonical fix is to use
+#      scripts/gh-as-author.sh which wraps switch + create + switch-
+#      back in one bash process.
 #   2. gh pr merge --admin — blocks unless BREAK_GLASS_ADMIN=1
 #      (human must explicitly authorize in chat)
 #   3. gh pr merge (non-admin) — blocks when the target PR carries
@@ -13,6 +21,13 @@
 #      merge gate at the hook layer so an agent can't accidentally
 #      merge past Label Gate by removing the label without running
 #      the gate check first.
+#
+# The identity check (1a) honors a
+# BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK=1 escape hatch for tests
+# that PATH-shim gh and have no real keyring. Production code should
+# never set this — the wrapper script gh-as-author.sh switches to the
+# author identity BEFORE the gh pr create call lands, so the check
+# passes naturally without the bypass.
 #
 # Exit codes:
 #   0 = allow
@@ -512,6 +527,58 @@ fi
 # structural ones, and they don't depend on argument positions or
 # global flags.
 if [ "$PR_SUBCOMMAND" = "create" ]; then
+  # Identity check (#241): the keyring's active account must be the
+  # AUTHOR identity (nathanjohnpayne) at the moment of `gh pr create`,
+  # otherwise the PR is authored by whatever identity IS active —
+  # observed concretely on friends-and-family-billing#262 where a
+  # split switch / pr-create across two Bash tool calls landed a PR
+  # under the wrong identity. The canonical fix is to wrap the entire
+  # sequence in `scripts/gh-as-author.sh` so the switch and the create
+  # share one bash process.
+  #
+  # The check uses `gh config get -h github.com user`, NOT `gh auth
+  # status`. The latter is GH_TOKEN-poisonable: when GH_TOKEN is set
+  # it reports the GH_TOKEN entry as Active, but the keyring entry is
+  # still the one that signs writes. `gh config get` reads the
+  # keyring config file directly and is the authoritative read for
+  # "who will this write attribute to".
+  #
+  # Escape hatch: `BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK=1` lets
+  # tests and edge cases bypass this check. The check is additive
+  # defense-in-depth on top of gh-as-author.sh — when an agent runs
+  # `scripts/gh-as-author.sh -- gh pr create ...` correctly, the
+  # wrapper has already switched to the author identity by the time
+  # this hook fires, so the check passes naturally without the
+  # escape. The escape exists for test harnesses that PATH-shim `gh`
+  # and have no real keyring to read.
+  EXPECTED_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-nathanjohnpayne}"
+  if [ "${BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
+    ACTIVE_GH_USER=$(gh config get -h github.com user 2>/dev/null || echo "")
+    if [ -z "$ACTIVE_GH_USER" ]; then
+      echo "BLOCKED: gh-pr-guard could not read the active gh account from 'gh config get -h github.com user'." >&2
+      echo "  Either gh is not installed/authenticated, or the keyring config is corrupt." >&2
+      echo "  Run 'gh auth login' for the $EXPECTED_AUTHOR identity, then retry via scripts/gh-as-author.sh." >&2
+      exit 2
+    fi
+    if [ "$ACTIVE_GH_USER" != "$EXPECTED_AUTHOR" ]; then
+      echo "BLOCKED: gh pr create is about to run under active account '$ACTIVE_GH_USER', not the expected author identity '$EXPECTED_AUTHOR'." >&2
+      echo "" >&2
+      echo "  This is the #241 footgun. A PR created right now would be authored by '$ACTIVE_GH_USER'," >&2
+      echo "  which breaks self-approval (Can not approve your own pull request) and inverts the" >&2
+      echo "  Authoring-Agent: fingerprint in the PR body." >&2
+      echo "" >&2
+      echo "  Canonical fix: wrap the call in scripts/gh-as-author.sh, which switches to" >&2
+      echo "  $EXPECTED_AUTHOR, runs gh pr create, then restores the prior active account via" >&2
+      echo "  trap EXIT — all inside one bash process so the switch and the create can't drift apart:" >&2
+      echo "" >&2
+      echo "    scripts/gh-as-author.sh -- gh pr create --title '...' --body '...'" >&2
+      echo "" >&2
+      echo "  See REVIEW_POLICY.md § Recovery: PR created under the wrong identity for the case" >&2
+      echo "  where a PR already landed under the wrong account." >&2
+      exit 2
+    fi
+  fi
+
   MISSING=""
 
   if ! echo "$COMMAND" | grep -qi 'Authoring-Agent:'; then
