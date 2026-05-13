@@ -55,10 +55,23 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 
 ### 4. Clone and bootstrap all repos
 
+The full bootstrap loop runs across each consumer repo. Current consumers:
+
+<!-- bootstrap-loop-list-start -->
+- friends-and-family-billing
+- device-platform-reporting
+- device-source-of-truth
+- swipewatch
+- nathanpaynedotcom
+- overridebroadway
+<!-- bootstrap-loop-list-end -->
+
+Run the bootstrap script across all of them:
+
 ```bash
 cd ~/Documents/GitHub
 
-for repo in friends-and-family-billing device-platform-reporting device-source-of-truth swipewatch nathanpaynedotcom overridebroadway; do
+for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' DEPLOYMENT.md | grep '^- ' | sed 's/^- //'); do
   git clone "https://github.com/nathanjohnpayne/$repo.git" 2>/dev/null || (cd "$repo" && git pull)
   cd "$repo"
   ./scripts/bootstrap.sh    # restores .env.local from 1Password via op inject
@@ -74,8 +87,10 @@ The bootstrap script for each repo:
 ### 5. Verify
 
 ```bash
-# Quick check that each repo's local config was restored
-for repo in friends-and-family-billing device-platform-reporting device-source-of-truth overridebroadway; do
+# Quick check that each repo's local config was restored.
+# Iterates over the consumer list defined above (§ 4). Repos that don't
+# carry .env files no-op via the fallback echo.
+for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' DEPLOYMENT.md | grep '^- ' | sed 's/^- //'); do
   echo "=== $repo ==="
   ls ~/Documents/GitHub/$repo/.env* 2>/dev/null || echo "  (no env files expected)"
 done
@@ -93,7 +108,7 @@ When you return from a temporary machine, tell your agent:
 
 ```bash
 cd ~/Documents/GitHub
-for repo in friends-and-family-billing device-platform-reporting device-source-of-truth swipewatch nathanpaynedotcom overridebroadway; do
+for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' DEPLOYMENT.md | grep '^- ' | sed 's/^- //'); do
   cd "$repo"
   # Push any local config changes to 1Password
   ./scripts/bootstrap.sh --sync
@@ -107,7 +122,7 @@ done
 
 ```bash
 cd ~/Documents/GitHub
-for repo in friends-and-family-billing device-platform-reporting device-source-of-truth swipewatch nathanpaynedotcom overridebroadway; do
+for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' DEPLOYMENT.md | grep '^- ' | sed 's/^- //'); do
   cd "$repo"
   git pull                          # get code changes from the temp machine
   ./scripts/bootstrap.sh --force    # re-resolve .env.tpl from 1Password (latest values)
