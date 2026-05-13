@@ -156,6 +156,7 @@ run_wizard() {
   BOOTSTRAP_AUTHOR_EMAIL="t@t" \
   BOOTSTRAP_SKIP_INVITE_PAUSE=1 \
   BOOTSTRAP_REVIEWER_PAT_VALUE="fake-test-pat-1234567890" \
+  BOOTSTRAP_SKIP_STAGES=board-and-summary \
   "$SCRIPT" "$@"
 }
 
