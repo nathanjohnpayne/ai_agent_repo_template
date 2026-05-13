@@ -186,16 +186,38 @@ grep -q "^gh project edit 99 --owner nathanjohnpayne --readme " "$SHIM_LOG" \
   && pass "board-and-summary stage recorded in state file" \
   || fail "state file missing board-and-summary entry: $(cat "$TARGET1/.bootstrap-state" 2>/dev/null)"
 
-# Empty PRD/spec/plan scaffolds at the right paths.
-[ -f "$TARGET1/specs/newboard-repo.md" ] \
-  && grep -q "TODO: write the PRD/spec" "$TARGET1/specs/newboard-repo.md" \
-  && pass "specs/newboard-repo.md placeholder written" \
-  || fail "specs file missing or wrong content"
+# Empty PRD/spec/plan scaffolds at the right paths. The spec stub
+# references "PRD/spec" and the plan stub references "Sprint 0 plan"
+# — operator reading both should see distinct intents (CodeRabbit
+# round-1 nit on #246: identical placeholder text masked the
+# what-vs-how distinction).
+SPEC_FILE="$TARGET1/specs/newboard-repo.md"
+PLAN_FILE="$TARGET1/plans/newboard-repo-sprint-0.md"
 
-[ -f "$TARGET1/plans/newboard-repo-sprint-0.md" ] \
-  && grep -q "TODO: write the PRD/spec" "$TARGET1/plans/newboard-repo-sprint-0.md" \
-  && pass "plans/newboard-repo-sprint-0.md placeholder written" \
-  || fail "plans file missing or wrong content"
+if [ -f "$SPEC_FILE" ] && grep -q "TODO: write the PRD/spec" "$SPEC_FILE"; then
+  pass "specs/newboard-repo.md placeholder written"
+else
+  fail "specs file missing or wrong content"
+fi
+
+if [ -f "$PLAN_FILE" ] && grep -q "TODO: write the Sprint 0 plan" "$PLAN_FILE"; then
+  pass "plans/newboard-repo-sprint-0.md placeholder written"
+else
+  fail "plans file missing or wrong content"
+fi
+
+# Distinctness assertion: the two placeholders must NOT be byte-
+# identical. If a future refactor accidentally re-introduces the
+# same text in both files, this test fails loudly. Skip silently
+# if either file is missing — the per-file assertions above will
+# have failed already.
+if [ -f "$SPEC_FILE" ] && [ -f "$PLAN_FILE" ]; then
+  if ! cmp -s "$SPEC_FILE" "$PLAN_FILE"; then
+    pass "spec and plan placeholders are distinct"
+  else
+    fail "spec and plan placeholders are byte-identical"
+  fi
+fi
 
 [ -f "$TARGET1/scripts/gh-projects/examples/newboard-repo/create-issues.sh" ] \
   && grep -q "issue-seeding skeleton" "$TARGET1/scripts/gh-projects/examples/newboard-repo/create-issues.sh" \

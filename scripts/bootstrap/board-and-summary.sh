@@ -298,7 +298,11 @@ bootstrap::_write_placeholder_scaffolds() {
   bootstrap::run "write specs/$repo_name.md (placeholder)" \
     bootstrap::_write_file "$spec_path" "$spec_body"
 
-  local plan_body="TODO: write the PRD/spec for this repo. Wizard left this empty per #156 deliberate-not-in-scope decision."
+  # Distinct placeholder from the spec stub above: an operator reading
+  # both files can see at a glance which is "what we're building" (spec/
+  # PRD) vs "how we're rolling it out" (sprint plan / milestone
+  # breakdown). CodeRabbit caught the identical-text nit on round 1.
+  local plan_body="TODO: write the Sprint 0 plan (milestone breakdown / phasing) for this repo. Wizard left this empty per #156 deliberate-not-in-scope decision."
   bootstrap::run "write plans/$repo_name-sprint-0.md (placeholder)" \
     bootstrap::_write_file "$plan_path" "$plan_body"
 

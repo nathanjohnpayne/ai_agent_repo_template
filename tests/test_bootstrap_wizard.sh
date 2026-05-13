@@ -460,6 +460,43 @@ echo "$ip_ok_out" | grep -q "project: *7" \
   || fail "expected 'project: 7' summary; got: $ip_ok_out"
 
 # ---------------------------------------------------------------------------
+# Test 21: Env-provided BOOTSTRAP_INPUT_* preserved across prompt path
+# (Codex P2 round 1 on #246). Pre-set BOOTSTRAP_INPUT_PROJECT=7 with
+# NO --project flag and NO BOOTSTRAP_AUTO_PROMPT=skip. Before the fix,
+# the FROM_FLAG_PROJECT sentinel was empty so prompt_for_inputs()
+# would prompt and overwrite the env value (default "new" on empty
+# input). After the fix, the env-pre-set value seeds the sentinel
+# and the prompt is skipped. We pipe an empty line to confirm the
+# prompt is NOT consumed; if the fix regressed, project would be
+# captured as "new" instead of "7".
+# ---------------------------------------------------------------------------
+env_proj_target="$WORKDIR/env-proj-target"
+mkdir -p "$env_proj_target"
+set +e
+# stdin closed (`</dev/null`) so any errant `read -r` would fail
+# immediately rather than block. With the fix, no read should fire
+# for the project prompt.
+env_proj_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 \
+               BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+               BOOTSTRAP_INPUT_PROJECT=7 \
+               "$SCRIPT" my-new-repo \
+               --target-dir "$env_proj_target" \
+               --description d --visibility private --firebase none \
+               --codex-app n --dry-run </dev/null 2>&1)
+env_proj_ec=$?
+set -e
+if [ "$env_proj_ec" -eq 0 ]; then
+  pass "env BOOTSTRAP_INPUT_PROJECT=7 dry-run → exit 0"
+else
+  fail "env BOOTSTRAP_INPUT_PROJECT=7 should succeed; got rc=$env_proj_ec, out: $env_proj_out"
+fi
+if echo "$env_proj_out" | grep -q "project: *7"; then
+  pass "env BOOTSTRAP_INPUT_PROJECT=7 preserved (not overwritten by prompt)"
+else
+  fail "expected 'project: 7' summary; env value was overwritten. out: $env_proj_out"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo
