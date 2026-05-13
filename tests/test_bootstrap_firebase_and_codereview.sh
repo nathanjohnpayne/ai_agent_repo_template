@@ -349,6 +349,148 @@ echo "$out" | grep -q "BOOTSTRAP_SKIP_REMOTE_PUSH=1 — skipping git push origin
   || fail "private visibility: push step did not log the skip message; out: $out"
 
 # ========================================================================
+# Case 5a/5b/5c: visibility=private with one or both CodeRabbit files
+# absent — regression for the round-1 Codex P1 finding (PR #248) that
+# `git add --all .github/review-policy.yml .coderabbit.yml` exits 128
+# when either pathspec doesn't match. The fix gates the add list to
+# only-existing-or-tracked paths; the stage must NOT hard-fail when
+# one or both files are missing.
+#
+# We invoke the disable-for-private function directly rather than
+# round-tripping through the full wizard — that keeps the regression
+# narrowly focused on the staging logic at the heart of the finding.
+# ========================================================================
+# Source helpers + the stage module so we can call the internal
+# function. Use a subshell so set -euo pipefail interactions don't
+# bleed into the rest of this test file.
+(
+  set -euo pipefail
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_LOG_FILE="$WORKDIR/case5x.bootstrap-log"
+  BOOTSTRAP_STATE_FILE="$WORKDIR/case5x.bootstrap-state"
+  export BOOTSTRAP_DRY_RUN BOOTSTRAP_LOG_FILE BOOTSTRAP_STATE_FILE
+  # shellcheck source=/dev/null
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  # shellcheck source=/dev/null
+  . "$ROOT/scripts/bootstrap/firebase-and-codereview.sh"
+
+  # Build a target repo with policy file but NO .coderabbit.yml.
+  T5a="$WORKDIR/case5a-policy-only"
+  mkdir -p "$T5a/.github"
+  cat >"$T5a/.github/review-policy.yml" <<'YAML'
+external_review_threshold: 300
+coderabbit:
+  enabled: true
+YAML
+  git -C "$T5a" init -q
+  git -C "$T5a" -c user.email=t@t -c user.name=t -c commit.gpgsign=false add -A
+  git -C "$T5a" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m seed
+
+  BOOTSTRAP_AUTHOR_NAME=t BOOTSTRAP_AUTHOR_EMAIL=t@t \
+    BOOTSTRAP_SKIP_REMOTE_PUSH=1 \
+    bootstrap::_coderabbit_disable_for_private "$T5a"
+) 2>"$WORKDIR/case5a.err"
+rc5a=$?
+if [ "$rc5a" -eq 0 ]; then
+  pass "case 5a: disable-for-private succeeds when .coderabbit.yml is absent"
+else
+  fail "case 5a: hard-failed when .coderabbit.yml was absent (rc=$rc5a); stderr: $(cat "$WORKDIR/case5a.err")"
+fi
+# Verify the commit landed AND only the policy file is in it (no
+# spurious pathspec error before commit).
+# Capture-and-case pattern avoids the `set -o pipefail` race where
+# grep -q closes the pipe on first match, SIGPIPE'ing git log and
+# propagating rc=141. (Same workaround as the case-5 commit check.)
+_5a_log=$(git -C "$WORKDIR/case5a-policy-only" log --oneline 2>/dev/null)
+case "$_5a_log" in
+  *"disable CodeRabbit"*)
+    pass "case 5a: 'disable CodeRabbit' commit recorded with only review-policy.yml present" ;;
+  *)
+    fail "case 5a: no disable-CodeRabbit commit; log: $_5a_log" ;;
+esac
+
+# 5b: .coderabbit.yml present but NO .github/review-policy.yml.
+(
+  set -euo pipefail
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_LOG_FILE="$WORKDIR/case5b.bootstrap-log"
+  BOOTSTRAP_STATE_FILE="$WORKDIR/case5b.bootstrap-state"
+  export BOOTSTRAP_DRY_RUN BOOTSTRAP_LOG_FILE BOOTSTRAP_STATE_FILE
+  # shellcheck source=/dev/null
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  # shellcheck source=/dev/null
+  . "$ROOT/scripts/bootstrap/firebase-and-codereview.sh"
+
+  T5b="$WORKDIR/case5b-coderabbit-only"
+  mkdir -p "$T5b"
+  echo "language: en-US" >"$T5b/.coderabbit.yml"
+  git -C "$T5b" init -q
+  git -C "$T5b" -c user.email=t@t -c user.name=t -c commit.gpgsign=false add -A
+  git -C "$T5b" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m seed
+
+  BOOTSTRAP_AUTHOR_NAME=t BOOTSTRAP_AUTHOR_EMAIL=t@t \
+    BOOTSTRAP_SKIP_REMOTE_PUSH=1 \
+    bootstrap::_coderabbit_disable_for_private "$T5b"
+) 2>"$WORKDIR/case5b.err"
+rc5b=$?
+if [ "$rc5b" -eq 0 ]; then
+  pass "case 5b: disable-for-private succeeds when review-policy.yml is absent"
+else
+  fail "case 5b: hard-failed when review-policy.yml was absent (rc=$rc5b); stderr: $(cat "$WORKDIR/case5b.err")"
+fi
+if [ ! -f "$WORKDIR/case5b-coderabbit-only/.coderabbit.yml" ]; then
+  pass "case 5b: .coderabbit.yml deleted as expected"
+else
+  fail "case 5b: .coderabbit.yml not deleted"
+fi
+_5b_log=$(git -C "$WORKDIR/case5b-coderabbit-only" log --oneline 2>/dev/null)
+case "$_5b_log" in
+  *"disable CodeRabbit"*)
+    pass "case 5b: 'disable CodeRabbit' commit recorded with only .coderabbit.yml present" ;;
+  *)
+    fail "case 5b: no disable-CodeRabbit commit; log: $_5b_log" ;;
+esac
+
+# 5c: both files absent — early return, no commit, exit 0 (already
+# covered by the touched_any=0 branch but assert explicitly so
+# regressions in either branch are caught).
+(
+  set -euo pipefail
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_LOG_FILE="$WORKDIR/case5c.bootstrap-log"
+  BOOTSTRAP_STATE_FILE="$WORKDIR/case5c.bootstrap-state"
+  export BOOTSTRAP_DRY_RUN BOOTSTRAP_LOG_FILE BOOTSTRAP_STATE_FILE
+  # shellcheck source=/dev/null
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  # shellcheck source=/dev/null
+  . "$ROOT/scripts/bootstrap/firebase-and-codereview.sh"
+
+  T5c="$WORKDIR/case5c-both-absent"
+  mkdir -p "$T5c"
+  echo "x" >"$T5c/README.md"
+  git -C "$T5c" init -q
+  git -C "$T5c" -c user.email=t@t -c user.name=t -c commit.gpgsign=false add -A
+  git -C "$T5c" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m seed
+
+  BOOTSTRAP_AUTHOR_NAME=t BOOTSTRAP_AUTHOR_EMAIL=t@t \
+    BOOTSTRAP_SKIP_REMOTE_PUSH=1 \
+    bootstrap::_coderabbit_disable_for_private "$T5c"
+) 2>"$WORKDIR/case5c.err"
+rc5c=$?
+if [ "$rc5c" -eq 0 ]; then
+  pass "case 5c: disable-for-private exits 0 when both files absent"
+else
+  fail "case 5c: hard-failed when both files absent (rc=$rc5c); stderr: $(cat "$WORKDIR/case5c.err")"
+fi
+_5c_log=$(git -C "$WORKDIR/case5c-both-absent" log --oneline 2>/dev/null)
+case "$_5c_log" in
+  *"disable CodeRabbit"*)
+    fail "case 5c: spurious disable-CodeRabbit commit (both files absent — nothing to do)" ;;
+  *)
+    pass "case 5c: no commit when both files absent (correct no-op)" ;;
+esac
+
+# ========================================================================
 # Case 6: codex_app=n → "NOT requested" log + no install URLs.
 # ========================================================================
 : >"$SHIM_LOG"

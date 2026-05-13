@@ -366,16 +366,37 @@ bootstrap::_coderabbit_disable_for_private() {
     return 2
   fi
 
-  # Stage + commit. Use -A on the two specific paths so absent files
-  # are gracefully ignored by git (-A is equivalent to add --all on
-  # the supplied paths under modern git; missing-path behavior is
-  # consistent with stage B's git add). Test code BOOTSTRAP_AUTHOR_NAME
-  # / BOOTSTRAP_AUTHOR_EMAIL parallels stage B's pattern.
+  # Stage + commit. The earlier yq-flip + rm steps each touched
+  # at-most-one file, so build the add list dynamically: include each
+  # path only if the working tree has it OR git already tracks it
+  # (deletion case after `rm -f`). `git add --all <missing-path>`
+  # exits 128 with "pathspec did not match any files" — that would
+  # turn the preceding "warn and continue" misses into a hard
+  # stage failure, contradicting the absent-file tolerance above.
+  # Test code BOOTSTRAP_AUTHOR_NAME / BOOTSTRAP_AUTHOR_EMAIL parallels
+  # stage B's pattern.
   local author_name="${BOOTSTRAP_AUTHOR_NAME:-}"
   local author_email="${BOOTSTRAP_AUTHOR_EMAIL:-}"
 
-  bootstrap::run "git add review-policy.yml + .coderabbit.yml" \
-    git -C "$target" add --all .github/review-policy.yml .coderabbit.yml || step_rc=$?
+  # Build the list of paths that exist on disk or are tracked in git
+  # (deletion needs a stage). `git ls-files --error-unmatch -- <path>`
+  # exits 0 iff git tracks the path; we use the silent variant to
+  # avoid spurious stderr noise on the absent-and-untracked case.
+  local add_paths=()
+  for rel in .github/review-policy.yml .coderabbit.yml; do
+    if [ -e "$target/$rel" ] \
+       || git -C "$target" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+      add_paths+=("$rel")
+    fi
+  done
+
+  if [ "${#add_paths[@]}" -eq 0 ]; then
+    bootstrap::log "CodeRabbit: neither .github/review-policy.yml nor .coderabbit.yml present or tracked; nothing to stage"
+    return 0
+  fi
+
+  bootstrap::run "git add ${add_paths[*]}" \
+    git -C "$target" add --all -- "${add_paths[@]}" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
     bootstrap::err "CodeRabbit: git add failed (rc=$step_rc)"
     return "$step_rc"
