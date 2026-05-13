@@ -573,6 +573,62 @@ echo "$pf_out" | grep -q "missing required dependency: yq" \
   && pass "wizard preflight emits 'missing required dependency: yq' diagnostic" \
   || fail "expected 'missing required dependency: yq'; got: $pf_out"
 
+# --- assertion 15: _cross_repo_loop_update propagates failures from
+# every side-effect step. Codex round 4 P1 caught that bootstrap::run
+# calls inside this helper weren't capturing rc; a mid-flight failure
+# (push, gh pr create, etc.) could be masked by the success of the
+# subsequent return-to-main checkout, leading the outer stage to
+# record completion despite NOT actually opening the loop PR.
+# ---------------------------------------------------------------------------
+# Source-grep assertion: each bootstrap::run / direct side-effect call
+# inside _cross_repo_loop_update must be followed by `|| step_rc=$?`
+# OR a `|| pr_create_rc=$?` (the pr-create path uses a different
+# variable because it must survive the auth-restore step).
+awk '
+  /^bootstrap::_cross_repo_loop_update\(\)/ { in_fn = 1 }
+  in_fn && /^}/ { in_fn = 0 }
+  # Count bootstrap::run calls and how many capture rc.
+  in_fn && /bootstrap::run / { runs++ }
+  in_fn && /\|\| (step_rc|pr_create_rc)=\$\?/ { captures++ }
+  END {
+    if (runs == 0) { print "no bootstrap::run calls in _cross_repo_loop_update"; exit 1 }
+    if (captures < runs) {
+      printf "fewer rc captures (%d) than bootstrap::run calls (%d) in _cross_repo_loop_update\n", captures, runs
+      exit 1
+    }
+  }
+' "$ROOT/scripts/bootstrap/template-mirror.sh" \
+  && pass "_cross_repo_loop_update captures rc from every bootstrap::run call (#233 round 4 P1)" \
+  || fail "rc-capture discipline violated in _cross_repo_loop_update"
+
+# --- assertion 16: _cross_repo_loop_update wraps gh pr create with the
+# author-identity switch-around. Codex round 4 P1 caught the missing
+# wrap — without it, the generated mergepath loop PR would be authored
+# by whichever agent identity is currently active, breaking the repo's
+# identity model.
+# ---------------------------------------------------------------------------
+awk '
+  /^bootstrap::_cross_repo_loop_update\(\)/ { in_fn = 1 }
+  in_fn && /^}/ { in_fn = 0 }
+  in_fn && /BOOTSTRAP_AUTHOR_IDENTITY|nathanjohnpayne/ { saw_author = 1 }
+  in_fn && /gh auth switch -u "\$author_identity"/    { saw_switch = NR }
+  # Match only the actual `gh pr create` COMMAND, not error-message
+  # mentions of it. The command line starts with whitespace then the
+  # bare verb; error messages embed it inside a quoted string.
+  in_fn && /^[[:space:]]*gh pr create / { saw_pr = NR }
+  in_fn && /gh auth switch -u "\$prior_active"/ { saw_restore = NR }
+  END {
+    if (!saw_author)  { print "missing author-identity reference in _cross_repo_loop_update"; exit 1 }
+    if (!saw_switch)  { print "missing gh auth switch -u $author_identity in _cross_repo_loop_update"; exit 1 }
+    if (!saw_pr)      { print "missing gh pr create in _cross_repo_loop_update"; exit 1 }
+    if (!saw_restore) { print "missing gh auth switch -u $prior_active (restore) in _cross_repo_loop_update"; exit 1 }
+    if (saw_switch > saw_pr)    { print "auth switch must precede pr create"; exit 1 }
+    if (saw_pr > saw_restore)   { print "auth restore must follow pr create"; exit 1 }
+  }
+' "$ROOT/scripts/bootstrap/template-mirror.sh" \
+  && pass "_cross_repo_loop_update wraps gh pr create with author-identity switch-around" \
+  || fail "author-identity switch-around invariant violated"
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"
