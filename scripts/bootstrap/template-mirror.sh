@@ -471,15 +471,20 @@ bootstrap::_anchor_insert() {
   local doc=$1 anchor=$2 line=$3
   local tmp
   tmp=$(mktemp "${TMPDIR:-/tmp}/bootstrap-loop.XXXXXX")
+  # Ensure the tmpfile is cleaned up on any error path. Without the
+  # trap, a failed awk or mv left orphan files in $TMPDIR.
+  # CodeRabbit caught this on #233 round 2.
+  trap 'rm -f "$tmp"' RETURN
   # awk: when we hit the anchor line, emit $line first, then the anchor.
-  awk -v anchor="$anchor" -v line="$line" '
+  if ! awk -v anchor="$anchor" -v line="$line" '
     $0 ~ anchor && !inserted { print line; inserted = 1 }
     { print }
-  ' "$doc" > "$tmp"
-  mv "$tmp" "$doc"
-}
-
-bootstrap::_appendln() {
-  local doc=$1 line=$2
-  printf '%s\n' "$line" >> "$doc"
+  ' "$doc" > "$tmp"; then
+    return 1
+  fi
+  if ! mv "$tmp" "$doc"; then
+    return 1
+  fi
+  # mv succeeded so $tmp no longer exists; the trap's rm -f is a
+  # harmless no-op on the now-absent path.
 }
