@@ -47,9 +47,17 @@ skip_paths: []
 # v1 manifest has no templated paths yet, so non-empty content in this
 # section currently fails validation. Once templated paths land in the
 # manifest with declared substitution markers, matching keys are allowed.
+#
+# Each entry is a structured `{value, reason}` map. Both fields are
+# required and non-empty — the `reason` is the audit-trail (same
+# posture as `skip_paths`), and a bare-scalar override like
+# `phase_4b_default: fallback-only` is explicitly rejected by the
+# validator to prevent undocumented divergence.
 substitutions: {}
 # substitutions:
-#   phase_4b_default: fallback-only
-#   # Reason: deploy frequency is high (~5 PRs/day), and the latency
-#   # cost of always-on phase-4b proactive routing outweighs the safety
-#   # benefit. Re-evaluate after 90 days (target review: <date>).
+#   phase_4b_default:
+#     value: fallback-only
+#     reason: |
+#       Deploy frequency is high (~5 PRs/day), and the latency cost
+#       of always-on phase-4b proactive routing outweighs the safety
+#       benefit. Re-evaluate after 90 days (target review: <date>).

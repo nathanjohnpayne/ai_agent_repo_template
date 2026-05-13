@@ -32,9 +32,13 @@ skip_paths:
 # Override values for templated-path substitution markers. Manifest
 # defaults apply where this map is silent. Keys must match a
 # substitution marker declared by a `type: templated` path in the
-# manifest.
+# manifest. Each entry is a structured `{value, reason}` map — bare-
+# scalar overrides are explicitly rejected so substitutions carry
+# the same audit-trail discipline as `skip_paths`.
 substitutions:
-  <marker-name>: <override-value>
+  <marker-name>:
+    value: <override-value>
+    reason: <non-empty rationale; multi-line allowed>
 ```
 
 ### Validation rules
@@ -49,6 +53,7 @@ substitutions:
 | Every `skip_paths[].path` is declared by the manifest | Exit 1 |
 | Every `skip_paths[].reason` is non-empty (whitespace counts as empty) | Exit 1 |
 | Every `substitutions.<key>` matches a marker declared by a `type: templated` manifest path | Exit 1 |
+| Every `substitutions.<key>` is a map with `value` and non-empty `reason` fields | Exit 1 |
 
 Absence of the file → exit 0. Empty file → exit 0 (no entries means no constraints to validate).
 
@@ -86,13 +91,17 @@ The propagation script logs the skip + reason on every run for that repo. The re
 ```yaml
 version: 1
 substitutions:
-  phase_4b_default: fallback-only
-  # Reason: deploy frequency is high (~5 PRs/day), and the latency
-  # cost of always-on phase-4b proactive routing outweighs the safety
-  # benefit. Re-evaluate after 90 days (target review: 2026-08-01).
+  phase_4b_default:
+    value: fallback-only
+    reason: |
+      Deploy frequency is high (~5 PRs/day), and the latency cost of
+      always-on phase-4b proactive routing outweighs the safety
+      benefit. Re-evaluate after 90 days (target review: 2026-08-01).
 ```
 
 (This example assumes a future templated path in the manifest declares `phase_4b_default` as a substitution marker. v1 manifest doesn't yet.)
+
+The `reason` field is part of the substitution map, not a YAML comment — the validator's Rule 7 enforces it the same way `skip_paths[].reason` is enforced. A bare-scalar override (`phase_4b_default: fallback-only`) fails validation explicitly.
 
 ## Workflow: adding an override
 

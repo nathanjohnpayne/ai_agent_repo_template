@@ -114,6 +114,12 @@ override_substitution_for() {
     return 1
   fi
 
-  YQ_MARKER="$marker" yq eval '.substitutions[strenv(YQ_MARKER)]' "$overrides_file" 2>/dev/null
+  # Substitution entries are structured `{value, reason}` maps per the
+  # round 2 schema change (#228; nathanpayne-codex CHANGES_REQUESTED
+  # caught that bare-scalar overrides bypassed the audit-trail reason
+  # contract). Return only the `.value` field — the `.reason` is for
+  # audit / human-readers and is enforced by validate-overrides.sh, not
+  # consumed at propagation time.
+  YQ_MARKER="$marker" yq eval '.substitutions[strenv(YQ_MARKER)].value' "$overrides_file" 2>/dev/null
   return 0
 }

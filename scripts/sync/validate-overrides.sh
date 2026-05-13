@@ -34,6 +34,12 @@
 #      means any `substitutions:` content fails validation. This is the
 #      correct strict default — when templated paths land, the
 #      validator picks them up automatically without a code change.)
+#   7. Every `substitutions.<key>` entry is a map with non-empty
+#      `value` and `reason` fields. Bare scalar substitutions
+#      (`marker: just-a-value`) fail validation — every override
+#      must carry an audit-trail reason, matching the same posture
+#      enforced on `skip_paths`. Closes a schema-contract gap caught
+#      by nathanpayne-codex CHANGES_REQUESTED on PR #228.
 #
 # Exit codes:
 #   0   Overrides file is absent OR all rules pass. Both cases are
@@ -262,6 +268,32 @@ if [ "$HAS_SUBS" = "true" ]; then
         else
           err "substitutions.$k: not declared as a substitution marker by any templated path in manifest (declared markers: ${TEMPLATED_MARKERS[*]})"
         fi
+        VIOLATIONS=$((VIOLATIONS + 1))
+      fi
+
+      # --- Rule 7: substitution entries must be {value, reason} -----
+      # nathanpayne-codex CHANGES_REQUESTED on PR #228 caught the
+      # schema-contract gap: the docs/issue claim every divergence
+      # carries an audit-trail reason, but the original schema let
+      # substitutions ship as a bare scalar (`marker: value`) with
+      # no reason at all. Require a structured map with both fields
+      # present and non-empty — matches the posture skip_paths
+      # already enforces.
+      ENTRY_TYPE=$(YQ_K="$k" yq eval '.substitutions[strenv(YQ_K)] | type' "$OVERRIDES_FILE" 2>/dev/null || echo "!!unknown")
+      if [ "$ENTRY_TYPE" != "!!map" ]; then
+        err "substitutions.$k: must be a map with 'value' and 'reason' fields (got $ENTRY_TYPE — bare scalar substitutions are not allowed; every override must carry an audit-trail reason)"
+        VIOLATIONS=$((VIOLATIONS + 1))
+        continue
+      fi
+      ENTRY_VALUE_PRESENT=$(YQ_K="$k" yq eval '.substitutions[strenv(YQ_K)] | has("value")' "$OVERRIDES_FILE" 2>/dev/null || echo "false")
+      ENTRY_REASON_RAW=$(YQ_K="$k" yq eval '.substitutions[strenv(YQ_K)].reason // ""' "$OVERRIDES_FILE" 2>/dev/null || echo "")
+      ENTRY_REASON_TRIMMED=$(printf '%s' "$ENTRY_REASON_RAW" | tr -d '[:space:]')
+      if [ "$ENTRY_VALUE_PRESENT" != "true" ]; then
+        err "substitutions.$k: missing 'value' field"
+        VIOLATIONS=$((VIOLATIONS + 1))
+      fi
+      if [ -z "$ENTRY_REASON_TRIMMED" ]; then
+        err "substitutions.$k: missing or empty 'reason' field — every override must carry an audit-trail reason"
         VIOLATIONS=$((VIOLATIONS + 1))
       fi
     done

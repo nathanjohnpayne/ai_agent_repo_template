@@ -86,7 +86,11 @@ skip_paths:
       This repo replaced keep-in-sync with a custom variant.
       Tracked in repo#42 for eventual convergence.
 substitutions:
-  phase_4b_default: fallback-only
+  phase_4b_default:
+    value: fallback-only
+    reason: |
+      Deploy frequency is high (~5 PRs/day); always-on phase-4b
+      routing latency outweighs the safety benefit on this repo.
 YAML
 if "$VALIDATOR" "$good" "$MANIFEST" >/dev/null 2>&1; then
   pass "well-formed overrides → exits 0"
@@ -232,10 +236,14 @@ else
 fi
 
 # Test 11: override_substitution_for returns 0 + value when key exists.
+# Structured shape per the round 2 schema change (#228) — entries are
+# `{value, reason}` maps, helper returns the .value field only.
 sub_override="$WORKDIR/helper-sub.yml"
 cat >"$sub_override" <<'YAML'
 substitutions:
-  phase_4b_default: fallback-only
+  phase_4b_default:
+    value: fallback-only
+    reason: test fixture
 YAML
 if val=$(override_substitution_for "$sub_override" "phase_4b_default") \
    && [ "$val" = "fallback-only" ]; then
@@ -335,13 +343,73 @@ fi
 specialchar_subs="$WORKDIR/specialchar.yml"
 cat >"$specialchar_subs" <<'YAML'
 substitutions:
-  phase-4b.default: fallback-only
+  phase-4b.default:
+    value: fallback-only
+    reason: test
 YAML
 if val=$(override_substitution_for "$specialchar_subs" "phase-4b.default") \
    && [ "$val" = "fallback-only" ]; then
   pass "override_substitution_for handles special-char marker name (-, .)"
 else
   fail "override_substitution_for failed on special-char marker (got '$val')"
+fi
+
+# Test 22: bare-scalar substitution → fail validation (the schema-contract
+# fix from #228 round 2; nathanpayne-codex caught that the old shape
+# `marker: value` shipped without an audit-trail reason).
+bare_sub="$WORKDIR/bare-sub.yml"
+cat >"$bare_sub" <<'YAML'
+substitutions:
+  phase_4b_default: fallback-only
+YAML
+out=$("$VALIDATOR" "$bare_sub" "$MANIFEST" 2>&1 || true)
+if echo "$out" | grep -q "must be a map with 'value' and 'reason'"; then
+  pass "bare-scalar substitution → rejected with clear diagnostic"
+else
+  fail "bare-scalar substitution should be rejected; got: $out"
+fi
+
+# Test 23: substitution entry with `value` but no `reason` → fail.
+no_reason_sub="$WORKDIR/no-reason-sub.yml"
+cat >"$no_reason_sub" <<'YAML'
+substitutions:
+  phase_4b_default:
+    value: fallback-only
+YAML
+out=$("$VALIDATOR" "$no_reason_sub" "$MANIFEST" 2>&1 || true)
+if echo "$out" | grep -q "missing or empty 'reason' field"; then
+  pass "substitution without reason → rejected"
+else
+  fail "substitution without reason should be rejected; got: $out"
+fi
+
+# Test 24: substitution entry with empty (whitespace) reason → fail.
+ws_reason_sub="$WORKDIR/ws-reason-sub.yml"
+cat >"$ws_reason_sub" <<'YAML'
+substitutions:
+  phase_4b_default:
+    value: fallback-only
+    reason: "   "
+YAML
+out=$("$VALIDATOR" "$ws_reason_sub" "$MANIFEST" 2>&1 || true)
+if echo "$out" | grep -q "missing or empty 'reason' field"; then
+  pass "substitution with whitespace-only reason → rejected"
+else
+  fail "substitution with whitespace reason should be rejected; got: $out"
+fi
+
+# Test 25: substitution entry with `reason` but no `value` → fail.
+no_value_sub="$WORKDIR/no-value-sub.yml"
+cat >"$no_value_sub" <<'YAML'
+substitutions:
+  phase_4b_default:
+    reason: forgot the value field
+YAML
+out=$("$VALIDATOR" "$no_value_sub" "$MANIFEST" 2>&1 || true)
+if echo "$out" | grep -q "missing 'value' field"; then
+  pass "substitution without value → rejected"
+else
+  fail "substitution without value should be rejected; got: $out"
 fi
 
 # ---------------------------------------------------------------------------
