@@ -115,7 +115,7 @@ set -e
 # Test 8: Missing argument for a value-taking flag → exit 1.
 # ---------------------------------------------------------------------------
 set +e
-"$SCRIPT" some-repo --visibility 2>&1 >/dev/null
+"$SCRIPT" some-repo --visibility >/dev/null 2>&1
 ec=$?
 set -e
 [ "$ec" -eq 1 ] && pass "--visibility with no value → exit 1" \
@@ -418,6 +418,47 @@ fb_ec=$?
 set -e
 [ "$fb_ec" -eq 0 ] && pass "--firebase none passes even without firebase/gcloud on PATH" \
                    || fail "--firebase none should pass when firebase/gcloud missing; got rc=$fb_ec, out: $fb_out"
+
+# ---------------------------------------------------------------------------
+# Test 19: Interactive prompt --project validation mirrors the flag
+# (CodeRabbit round 2 — same `[0-9]*` glob bug existed at the
+# read-loop's case statement). Pipe "12abc\n" to the wizard with no
+# --project flag; the prompt should reject and exit 1.
+# ---------------------------------------------------------------------------
+ip_target="$WORKDIR/interactive-proj-target"
+mkdir -p "$ip_target"
+set +e
+ip_out=$(printf '12abc\n' | BOOTSTRAP_SKIP_TOOL_CHECK=1 \
+         BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+         "$SCRIPT" my-new-repo \
+         --target-dir "$ip_target" \
+         --description d --visibility private --firebase none \
+         --codex-app n --dry-run 2>&1)
+ip_ec=$?
+set -e
+[ "$ip_ec" -ne 0 ] && pass "interactive --project 12abc → non-zero" \
+                  || fail "interactive prompt should reject '12abc'; got rc=$ip_ec, out: $ip_out"
+echo "$ip_out" | grep -q "invalid project value" \
+  && pass "interactive --project rejection emits 'invalid project value'" \
+  || fail "expected 'invalid project value' diagnostic; got: $ip_out"
+
+# Test 20: Interactive prompt accepts empty/new and digits-only.
+ip_ok_target="$WORKDIR/interactive-proj-ok-target"
+mkdir -p "$ip_ok_target"
+set +e
+ip_ok_out=$(printf '7\n' | BOOTSTRAP_SKIP_TOOL_CHECK=1 \
+            BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+            "$SCRIPT" my-new-repo \
+            --target-dir "$ip_ok_target" \
+            --description d --visibility private --firebase none \
+            --codex-app n --dry-run 2>&1)
+ip_ok_ec=$?
+set -e
+[ "$ip_ok_ec" -eq 0 ] && pass "interactive --project 7 → exit 0" \
+                     || fail "interactive '7' should succeed; got rc=$ip_ok_ec"
+echo "$ip_ok_out" | grep -q "project: *7" \
+  && pass "interactive '7' captured as project=7" \
+  || fail "expected 'project: 7' summary; got: $ip_ok_out"
 
 # ---------------------------------------------------------------------------
 # Summary

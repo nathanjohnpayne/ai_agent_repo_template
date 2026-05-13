@@ -371,7 +371,16 @@ preflight() {
   #    probe in dry-run mode + when tool check is suppressed.
   if [ "$BOOTSTRAP_DRY_RUN" != "1" ] && [ "${BOOTSTRAP_SKIP_TOOL_CHECK:-0}" != "1" ] && command -v gh >/dev/null 2>&1; then
     local full_name="$BOOTSTRAP_REPO_OWNER/${BOOTSTRAP_INPUT_REPO_NAME}"
-    if gh repo view "$full_name" >/dev/null 2>&1; then
+    # Use GH_TOKEN explicitly per CLAUDE.md § Active-account convention:
+    # read-path gh calls honor GH_TOKEN, and pinning to the preflight
+    # author/reviewer PAT keeps the call deterministic across machines
+    # where the active keyring account might differ. Fall back to
+    # whatever gh's keyring resolves if no preflight var is present
+    # (developer running wizard locally without preflight).
+    local _gh_repo_view_rc=0
+    GH_TOKEN="${OP_PREFLIGHT_AUTHOR_PAT:-${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}}" \
+      gh repo view "$full_name" >/dev/null 2>&1 || _gh_repo_view_rc=$?
+    if [ "$_gh_repo_view_rc" -eq 0 ]; then
       bootstrap::wizard_err "remote already exists: $full_name. Refusing to bootstrap over an existing repo."
       violations=$((violations + 1))
     fi
@@ -477,10 +486,19 @@ prompt_for_inputs() {
   if [ -z "${BOOTSTRAP_FROM_FLAG_PROJECT:-}" ]; then
     local v="new"
     read -r -p "[bootstrap-wizard] Project v2 board [new/<N>] (default: new): " input
+    # Mirror the strict --project flag validation (round-1 fix at the
+     # arg-parser): `[0-9]*` would accept "12abc", which then breaks
+     # later when the wizard tries `gh project ... --number 12abc`.
+     # Reject anything containing a non-digit, accept empty/new + all-
+     # digits. CodeRabbit caught this as a same-bug-different-path
+     # finding on the interactive prompt after round 1.
     case "${input:-}" in
       new|"") v="new" ;;
-      [0-9]*) v="$input" ;;
-      *) bootstrap::wizard_err "invalid project value '$input'; defaulting to new" ;;
+      *[!0-9]*)
+        bootstrap::wizard_err "invalid project value '$input'; expected 'new' or a non-negative integer"
+        exit 1
+        ;;
+      *) v="$input" ;;  # digits-only
     esac
     BOOTSTRAP_INPUT_PROJECT="$v"
   fi
@@ -589,8 +607,14 @@ dispatch() {
       bootstrap::wizard_err "stage function $fn not found (sourced from $BOOTSTRAP_LIB_DIR)"
       return 3
     fi
-    if ! "$fn"; then
-      bootstrap::wizard_err "stage '$stage' failed (rc=$?). Resume with: $0 ${BOOTSTRAP_INPUT_REPO_NAME} --resume $stage"
+    # Capture the stage's real exit code BEFORE the branch test. The
+    # `! "$fn"` form runs `$fn` and then negates; inside the if-block,
+    # `$?` reflects the negation step (always 0), not the function's
+    # rc. Use a then/else split so we can record the actual rc with $?.
+    local stage_rc=0
+    "$fn" || stage_rc=$?
+    if [ "$stage_rc" -ne 0 ]; then
+      bootstrap::wizard_err "stage '$stage' failed (rc=$stage_rc). Resume with: $0 ${BOOTSTRAP_INPUT_REPO_NAME} --resume $stage"
       return 3
     fi
   done
