@@ -520,9 +520,16 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:
     # checks block the gate. When the list is empty (no branch
     # protection configured or query failed), fall back to the
     # prior behavior of treating all checks as required.
+    #
+    # Bind `.label` to a variable BEFORE the `$required_names | ...`
+    # sub-pipeline, because inside that sub-pipeline `.` rebinds to
+    # `$required_names` (the array) and `.label` would then try to
+    # index the array, producing the jq error
+    # "Cannot index array with string \"label\"".
+    | (.label) as $label_name
     | select(
         ($required_names | length) == 0
-        or ($required_names | index(.label)) != null
+        or ($required_names | index($label_name)) != null
       )
     # A check passes the gate iff its result is SUCCESS, SKIPPED, or
     # NEUTRAL. Everything else — FAILURE, CANCELLED, TIMED_OUT,
