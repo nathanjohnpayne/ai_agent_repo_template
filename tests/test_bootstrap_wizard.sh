@@ -138,8 +138,14 @@ set -e
 clean_target="$WORKDIR/clean-target"
 mkdir -p "$clean_target"
 set +e
+# Skip stages D/E so the wizard scaffold test doesn't try to do real
+# firebase work or wait for the board summary. Stage D is implemented
+# as of #206 and has its own dedicated test
+# (tests/test_bootstrap_firebase_and_codereview.sh); stage E is still
+# a stub.
 out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
       BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+      BOOTSTRAP_SKIP_STAGES="firebase-and-codereview,board-and-summary" \
       "$SCRIPT" my-new-repo \
       --target-dir "$clean_target" \
       --description "test repo" --visibility private --firebase none \
@@ -157,12 +163,12 @@ echo "$out" | grep -q "Starting stage: template-mirror" \
 echo "$out" | grep -q "Starting stage: github-infra" \
   && pass "stage C stub ran" \
   || fail "stage C stub didn't run"
-echo "$out" | grep -q "firebase-and-codereview (sub-D stub)" \
-  && pass "stage D stub ran" \
-  || fail "stage D stub didn't run"
-echo "$out" | grep -q "Starting stage: board-and-summary" \
-  && pass "stage E ran" \
-  || fail "stage E didn't run"
+echo "$out" | grep -q "skip firebase-and-codereview (BOOTSTRAP_SKIP_STAGES)" \
+  && pass "stage D skipped via BOOTSTRAP_SKIP_STAGES" \
+  || fail "stage D skip not logged; got: $out"
+echo "$out" | grep -q "skip board-and-summary (BOOTSTRAP_SKIP_STAGES)" \
+  && pass "stage E skipped via BOOTSTRAP_SKIP_STAGES" \
+  || fail "stage E skip not logged"
 
 # ---------------------------------------------------------------------------
 # Test 11: Resume mechanism. Pre-seed the state file with the first
@@ -175,8 +181,12 @@ template-mirror
 github-infra
 EOF
 set +e
+# Skip stage D since it's now implemented and has its own dedicated
+# test fixture (the wizard's scaffold-level test stays focused on
+# dispatch / resume mechanics).
 resume_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
              BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+             BOOTSTRAP_SKIP_STAGES="firebase-and-codereview" \
              "$SCRIPT" my-new-repo \
              --target-dir "$resume_target" \
              --description "test repo" --visibility private --firebase none \
@@ -191,9 +201,10 @@ echo "$resume_out" | grep -q "skip template-mirror (already completed)" \
 echo "$resume_out" | grep -q "skip github-infra (already completed)" \
   && pass "resume skipped github-infra" \
   || fail "resume did not skip github-infra"
-echo "$resume_out" | grep -q "firebase-and-codereview (sub-D stub)" \
-  && pass "resume ran firebase-and-codereview" \
-  || fail "resume did not run firebase-and-codereview"
+echo "$resume_out" | grep -q "skip firebase-and-codereview (BOOTSTRAP_SKIP_STAGES)" \
+  && pass "resume skipped firebase-and-codereview via BOOTSTRAP_SKIP_STAGES" \
+  || fail "resume did not skip firebase-and-codereview"
+# Stage E is now real (#207 merged); banner is the standard "Starting stage:" form.
 echo "$resume_out" | grep -q "Starting stage: board-and-summary" \
   && pass "resume ran board-and-summary" \
   || fail "resume did not run board-and-summary"
@@ -208,6 +219,7 @@ mkdir -p "$explicit_resume_target"
 set +e
 ex_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
          BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+         BOOTSTRAP_SKIP_STAGES="firebase-and-codereview" \
          "$SCRIPT" my-new-repo \
          --target-dir "$explicit_resume_target" \
          --description "test repo" --visibility private --firebase none \
@@ -220,9 +232,9 @@ set -e
 echo "$ex_out" | grep -q "skip github-infra (already completed)" \
   && pass "explicit-resume skipped github-infra" \
   || fail "explicit-resume did not skip github-infra"
-echo "$ex_out" | grep -q "firebase-and-codereview (sub-D stub)" \
-  && pass "explicit-resume ran firebase-and-codereview" \
-  || fail "explicit-resume did not run firebase-and-codereview"
+echo "$ex_out" | grep -q "skip firebase-and-codereview (BOOTSTRAP_SKIP_STAGES)" \
+  && pass "explicit-resume skipped firebase-and-codereview via BOOTSTRAP_SKIP_STAGES" \
+  || fail "explicit-resume did not skip firebase-and-codereview"
 echo "$ex_out" | grep -q "Starting stage: template-mirror" \
   && fail "explicit-resume should have skipped template-mirror (came before github-infra)" \
   || pass "explicit-resume correctly skipped pre-target stages"
@@ -238,6 +250,7 @@ mkdir -p "$skip_board_target"
 set +e
 sb_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
          BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+         BOOTSTRAP_SKIP_STAGES="firebase-and-codereview" \
          "$SCRIPT" my-new-repo \
          --target-dir "$skip_board_target" \
          --description "test repo" --visibility private --firebase none \
@@ -260,8 +273,14 @@ echo "$sb_out" | grep -q "Starting stage: board-and-summary" \
 skip_fb_target="$WORKDIR/skip-fb-target"
 mkdir -p "$skip_fb_target"
 set +e
+# Note: this test exercises that --skip-firebase routes through the
+# real stage D's "Firebase: scope=none" branch. We deliberately do
+# NOT add stage D to BOOTSTRAP_SKIP_STAGES here — that defeats the
+# purpose. Stage E (board-and-summary) is still skipped to keep the
+# test focused on the firebase branch.
 sf_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
          BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+         BOOTSTRAP_SKIP_STAGES="board-and-summary" \
          "$SCRIPT" my-new-repo \
          --target-dir "$skip_fb_target" \
          --description "test repo" --visibility private \
@@ -271,9 +290,9 @@ sf_ec=$?
 set -e
 [ "$sf_ec" -eq 0 ] && pass "--skip-firebase exits 0" \
                    || fail "--skip-firebase should exit 0; got $sf_ec"
-echo "$sf_out" | grep -q "firebase=none, skipping Firebase setup" \
-  && pass "--skip-firebase routes through firebase=none branch" \
-  || fail "--skip-firebase did not log firebase=none; got: $sf_out"
+echo "$sf_out" | grep -q "Firebase: scope=none" \
+  && pass "--skip-firebase routes through Firebase scope=none branch" \
+  || fail "--skip-firebase did not log Firebase scope=none; got: $sf_out"
 
 # ---------------------------------------------------------------------------
 # Test 15: Dry-run produces the transcript log but does NOT touch
@@ -284,18 +303,22 @@ log_check_target="$WORKDIR/log-check-target"
 mkdir -p "$log_check_target"
 BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
   BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+  BOOTSTRAP_SKIP_STAGES="firebase-and-codereview,board-and-summary" \
   "$SCRIPT" my-new-repo \
   --target-dir "$log_check_target" \
   --description "test repo" --visibility private --firebase none \
   --codex-app n --project new --dry-run >/dev/null 2>&1
-# State file should exist with all four stages recorded.
+# State file should exist with the 2 unskipped stages recorded
+# (template-mirror + github-infra; D+E are in BOOTSTRAP_SKIP_STAGES).
+# BOOTSTRAP_SKIP_STAGES does not record skipped stages — only the
+# dispatched-and-completed ones land in state.
 [ -f "$log_check_target/.bootstrap-state" ] \
   && pass "dry-run created state file" \
   || fail "state file missing after dry-run"
 state_lines=$(wc -l <"$log_check_target/.bootstrap-state" | tr -d ' ')
-[ "$state_lines" -eq 4 ] \
-  && pass "state file has 4 stage entries" \
-  || fail "expected 4 state-file entries; got $state_lines"
+[ "$state_lines" -eq 2 ] \
+  && pass "state file has 2 stage entries (D+E skipped via BOOTSTRAP_SKIP_STAGES)" \
+  || fail "expected 2 state-file entries; got $state_lines"
 
 # ---------------------------------------------------------------------------
 # Test 16: --project with non-digit suffix (e.g., "12abc") → exit 1.
