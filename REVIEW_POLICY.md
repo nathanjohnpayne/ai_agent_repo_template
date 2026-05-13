@@ -696,9 +696,16 @@ GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-request.sh <PR#>
 # Reviewer-identity write (your agent identity is active by default):
 gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
 
-# Author-identity write: temporary switch-around so the byline is
-# nathanjohnpayne, paired with switch-back so active state never lingers
-# wrong for subsequent reviewer-identity writes:
+# Author-identity write: MUST use scripts/gh-as-author.sh, which
+# switches + runs + restores inside ONE bash process via trap EXIT.
+# Splitting the switch and the write across two Bash invocations has
+# been observed to land the PR under the wrong identity (#241). The
+# gh-pr-guard.sh PreToolUse hook now enforces this.
+scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch
+scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
+
+# Only when gh-as-author.sh is unavailable, the equivalent inline form
+# is acceptable — but it MUST stay inside one bash invocation:
 gh auth switch -u nathanjohnpayne && \
   gh pr merge <PR#> --squash --delete-branch && \
   gh auth switch -u nathanpayne-<agent>
@@ -769,6 +776,99 @@ for repo in mergepath swipewatch nathanpaynedotcom \
   fi
 done
 ```
+
+## Recovery: PR created under the wrong identity
+
+If `gh pr create` lands a PR under the wrong account — typically because the
+`gh auth switch -u nathanjohnpayne` and the `gh pr create` were split across
+two Bash tool calls and the gh keyring's active state drifted between them —
+the PR is unrecoverable in place: any review attempt under the same account
+that authored the PR returns `Can not approve your own pull request`, and the
+`Authoring-Agent:` fingerprint in the body now disagrees with `author.login`,
+breaking downstream audit. See #241 for the bug history and
+`nathanjohnpayne/friends-and-family-billing#262` for the canonical incident.
+
+### Prevention (the primary path)
+
+Always wrap author-identity writes in `scripts/gh-as-author.sh`:
+
+```bash
+scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
+```
+
+The wrapper switches to `nathanjohnpayne`, runs the wrapped command, and
+restores the prior active account via `trap EXIT` — all inside one bash
+process so the switch and the write can't drift apart. For `gh pr create`
+specifically, it also runs a post-create `gh pr view --json author`
+verification and exits non-zero (code 5) if `author.login` does not match
+the expected identity. The `gh-pr-guard.sh` PreToolUse hook independently
+blocks `gh pr create` when the keyring's active account is not the author
+identity.
+
+### Detection
+
+If you suspect the wrong-identity failure (e.g., the PR was just created
+and review attempts return `Can not approve your own pull request`), confirm
+with:
+
+```bash
+gh pr view <PR#> --repo <owner>/<repo> --json author --jq .author.login
+```
+
+Expected: `nathanjohnpayne`. If the output is your agent identity (e.g.
+`nathanpayne-claude`), you hit the #241 footgun.
+
+### Recovery procedure
+
+Close the wrong PR and recreate from the same branch. The commits and the
+branch survive the close — what's lost is the PR's review thread history,
+prior CI results, and any `chatgpt-codex-connector[bot]` / CodeRabbit
+comments. There is no in-place fix: GitHub does not expose an API to change
+`author.login` on an existing PR.
+
+```bash
+# 1. Close the wrong-author PR with a comment explaining the recreate.
+gh pr close <PR#> --repo <owner>/<repo> \
+  --comment "Wrong author identity (see #241). Recreating from the same branch."
+
+# 2. Recreate from a fresh shell so any stale gh-state shell vars are gone,
+#    and route through gh-as-author.sh so the new PR can't repeat the
+#    failure mode.
+scripts/gh-as-author.sh -- gh pr create \
+  --repo <owner>/<repo> \
+  --base main --head <same-branch> \
+  --title "..." \
+  --body "..."
+
+# 3. Verify the new PR landed under the right identity (the wrapper also
+#    does this automatically, but it's worth checking once by hand if you
+#    bypassed the wrapper):
+gh pr view <NEW_PR#> --repo <owner>/<repo> --json author --jq .author.login
+# expected: nathanjohnpayne
+```
+
+The fresh shell in step 2 is belt-and-suspenders: any `GH_TOKEN` /
+`GH_HOST` / `GITHUB_TOKEN` env vars exported earlier in the session that
+might have contributed to the drift are cleared by the new process. The
+wrapper script itself does not depend on those env vars, but a fresh shell
+removes ambiguity about which version of the state any helper is reading.
+
+### What's lost vs. what survives
+
+| Item | After recreate |
+|------|----------------|
+| Commits on the branch | survive (`git push` is unaffected) |
+| Branch ref | survives |
+| PR review threads | LOST (closed-PR threads do not carry over) |
+| CodeRabbit comments | LOST (will re-run on the new PR if enabled) |
+| Codex Connector review | LOST (will re-trigger on the new PR if review-ready) |
+| CI run history | LOST (jobs re-run on the new PR) |
+| PR number | new one assigned |
+| Authoring-Agent fingerprint | regenerated (now matches `author.login`) |
+
+Filing a post-merge issue noting the recreated-PR situation is optional but
+helpful for audit trails — link both the closed PR and the new one so a
+later reader can follow the thread.
 
 ## Adding a New Agent
 

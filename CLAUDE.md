@@ -41,11 +41,31 @@ time `gh auth login` per identity per machine). With this convention:
 - Reviewer-identity writes (`gh pr review --comment` from your agent
   identity) just work — no `GH_TOKEN` switch, no `gh auth switch`.
 - Author-identity writes (`gh pr create`, `gh pr merge`, `gh pr edit`
-  for label changes) need a temporary switch-around so the byline is
-  the author identity, paired with a switch-back so the active state
-  never lingers wrong:
+  for label changes) **MUST** use `scripts/gh-as-author.sh` — a single
+  bash process that switches to the author identity, runs the wrapped
+  command, then restores the prior active account via `trap EXIT`:
 
   ```bash
+  scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
+  scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch
+  ```
+
+  Bundling the switch + write + switch-back into one wrapper process
+  is a HARD RULE, not a soft recommendation. Splitting the three
+  steps across two or more Bash tool calls has been observed to land
+  the PR under the wrong identity — see #241 (and the concrete
+  incident on `friends-and-family-billing#262`) for the failure
+  mechanism and consequences (self-approval blocked, policy
+  fingerprint inversion, destructive recovery). The `gh-pr-guard.sh`
+  PreToolUse hook now enforces this: a `gh pr create` while the
+  keyring's active account is not `nathanjohnpayne` is blocked with
+  a diagnostic pointing at `gh-as-author.sh`. The wrapper also runs
+  a post-create `gh pr view --json author` verification to catch the
+  failure within seconds if it slips through. If you ever need the
+  unwrapped form, do it in one bash invocation:
+
+  ```bash
+  # Equivalent, only acceptable if gh-as-author.sh is unavailable for some reason:
   gh auth switch -u nathanjohnpayne && \
     gh pr merge <PR#> --squash --delete-branch && \
     gh auth switch -u nathanpayne-claude
