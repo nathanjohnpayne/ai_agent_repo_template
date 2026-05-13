@@ -137,6 +137,11 @@ bootstrap::stage_github_infra() {
   fi
 
   # Step 2: seed labels.
+  # NOTE: _seed_labels swallows per-label failures (warn + continue
+  # to the next label) and never returns non-zero, so the if-block
+  # below cannot fire today. The structure is kept for symmetry with
+  # the other steps + as a guardrail: a future change that makes the
+  # helper bubble up rc gets failure propagation for free.
   bootstrap::_seed_labels "$full_repo" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
     bootstrap::err "github-infra: label seeding failed (rc=$step_rc)"
@@ -145,6 +150,9 @@ bootstrap::stage_github_infra() {
   fi
 
   # Step 3: invite reviewer collaborators.
+  # Same soft-fail semantics as _seed_labels — per-invite failures
+  # warn + continue. A bad reviewer identity shouldn't block the
+  # bootstrap; the summary surfaces the gap.
   bootstrap::_invite_reviewers "$full_repo" "$reviewers" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
     bootstrap::err "github-infra: reviewer invitations failed (rc=$step_rc)"
@@ -352,13 +360,32 @@ bootstrap::_provision_reviewer_assignment_token() {
   # the original code piped the PAT but also set `--body -`, so the
   # piped value was discarded and `-` would have been stored as
   # the secret. Strip --body entirely for the stdin path.
+  #
+  # We call `gh` DIRECTLY here rather than via bootstrap::run to
+  # avoid logging the PAT value through the bootstrap log
+  # transcript. bootstrap::run prints the full command line; that
+  # would expose the piped-stdin path's command shape (fine) but
+  # any future migration of secrets-to-args would leak the value
+  # itself. The trade-off is that this call MUST be `-e`-safe so
+  # the stage's auth-restore still runs on failure — hence the
+  # inline `|| set_rc=$?` on the pipeline below.
   if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
     bootstrap::run "set REVIEWER_ASSIGNMENT_TOKEN secret (stdin pipe; len=${#pat})" \
       gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo"
     return 0
   fi
-  printf '%s' "$pat" | gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" >&2
-  local set_rc=$?
+  # Capture pipeline rc INLINE via `|| set_rc=$?`. Without the `||`,
+  # the file-top `set -euo pipefail` would fire the moment the
+  # pipeline returns non-zero, aborting the function BEFORE the
+  # `local set_rc=$?` line ran. That bypassed every line below
+  # (the err-log, the explicit `return $set_rc`, the success log)
+  # and — more importantly — the caller's `bootstrap::_restore_active_if_needed`
+  # only ran because the call site has `|| step_rc=$?` to defuse
+  # set -e at the call. The inline `|| set_rc=$?` mirrors the
+  # _provision_llm_secrets pattern + closes the gap nathanpayne-claude
+  # caught on #239 round 2.
+  local set_rc=0
+  printf '%s' "$pat" | gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" >&2 || set_rc=$?
   if [ "$set_rc" -ne 0 ]; then
     bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: gh secret set failed (rc=$set_rc)"
     return "$set_rc"

@@ -334,6 +334,54 @@ echo "$dry_out" | grep -q "DRY-RUN" \
   && pass "dry-run output includes [DRY-RUN] tags" \
   || fail "dry-run missing [DRY-RUN] markers"
 
+# --- assertion 10: REVIEWER_ASSIGNMENT_TOKEN gh-secret-set failure path
+# (nathanpayne-claude review on #239 round 2 — P1).
+#
+# With set -euo pipefail + a failing `gh secret set` pipeline, the
+# pre-fix code aborted the function BEFORE the rc-capture line ran,
+# bypassing the err-log + explicit return path. The fix is the
+# inline `|| set_rc=$?` pattern matching _provision_llm_secrets.
+#
+# Drive the failure via SHIM_EXIT_SECRET=1 + a fake PAT. Even with
+# the failing secret-set, the stage's auth-restore MUST still run
+# (the keyring must end on the prior-active account, not stuck on
+# nathanjohnpayne) — that's the keyring-leak invariant the reviewer
+# called out explicitly.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET5="$WORKDIR/new-repo-secret-fail"
+rm -rf "$TARGET5"
+set +e
+out=$(SHIM_EXIT_SECRET=1 BOOTSTRAP_REVIEWER_PAT_VALUE="fake-pat" run_wizard secretfail-repo \
+        --target-dir "$TARGET5" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new 2>&1)
+ec=$?
+set -e
+# The stage treats secret failures as warned-but-not-fatal (the
+# REVIEWER_ASSIGNMENT_TOKEN failure is swallowed via `step_rc=0` in
+# the caller), so the wizard SHOULD complete with rc=0. The
+# critical invariant is the keyring restore — verify it ran.
+[ "$ec" -eq 0 ] \
+  && pass "stage completes (rc=0) when secret-set fails (warn-not-fatal)" \
+  || fail "stage failed unexpectedly on secret-set failure; rc=$ec, out: $out"
+# Auth-restore MUST have run after the secret-set failure — the
+# keyring-leak invariant nathanpayne-claude flagged.
+grep -q "^gh auth switch -u nathanpayne-claude\$" "$SHIM_LOG" \
+  && pass "auth-restore ran AFTER failing gh secret set (no keyring leak)" \
+  || fail "no auth-restore after secret failure — keyring would be left on nathanjohnpayne; log: $(grep 'auth switch' "$SHIM_LOG")"
+# The pipeline-rc-capture pattern in scripts/bootstrap/github-infra.sh
+# must use `|| set_rc=$?` on the same line as the pipeline so set -e
+# doesn't kill the function before the rc handler can run.
+awk '
+  /^bootstrap::_provision_reviewer_assignment_token\(\)/ { in_fn = 1 }
+  in_fn && /^}/ { in_fn = 0 }
+  in_fn && /gh secret set REVIEWER_ASSIGNMENT_TOKEN.*\|\| set_rc=\$\?/ { saw = 1 }
+  END { if (!saw) { print "no `|| set_rc=$?` inline on gh secret set pipeline"; exit 1 } }
+' "$ROOT/scripts/bootstrap/github-infra.sh" \
+  && pass "_provision_reviewer_assignment_token uses '|| set_rc=\$?' inline on gh secret set pipeline" \
+  || fail "rc-capture-inline invariant violated (regression of nathanpayne-claude #239 r2 P1)"
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_github_infra: $PASS passed, $FAIL failed"
