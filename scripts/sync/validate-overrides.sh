@@ -141,9 +141,18 @@ for k in "${TOP_KEYS[@]:-}"; do
   fi
 done
 
-# --- Rule 3: version, if present, must match -----------------------
+# --- Rule 3: version is required and must match -----------------------
+# Schema-version is required on any non-empty overrides document so a
+# downstream consumer's file declares an unambiguous schema contract
+# from the start. (Empty/null-root documents already exited at Rule 1b.)
+# CodeRabbit ⚠️ Major on PR #228 round 4 caught the gap — previously
+# version was only validated WHEN present, so a non-empty file omitting
+# it would silently pass.
 HAS_VERSION=$(yq eval 'has("version")' "$OVERRIDES_FILE" 2>/dev/null || echo "false")
-if [ "$HAS_VERSION" = "true" ]; then
+if [ "$HAS_VERSION" != "true" ]; then
+  err "missing required top-level key: version (expected $SUPPORTED_OVERRIDE_VERSION)"
+  VIOLATIONS=$((VIOLATIONS + 1))
+else
   V=$(yq eval '.version' "$OVERRIDES_FILE" 2>/dev/null)
   if [ "$V" != "$SUPPORTED_OVERRIDE_VERSION" ]; then
     err "version $V not supported by this validator (expected $SUPPORTED_OVERRIDE_VERSION)"
@@ -286,10 +295,19 @@ if [ "$HAS_SUBS" = "true" ]; then
         continue
       fi
       ENTRY_VALUE_PRESENT=$(YQ_K="$k" yq eval '.substitutions[strenv(YQ_K)] | has("value")' "$OVERRIDES_FILE" 2>/dev/null || echo "false")
+      ENTRY_VALUE_RAW=$(YQ_K="$k" yq eval '.substitutions[strenv(YQ_K)].value // ""' "$OVERRIDES_FILE" 2>/dev/null || echo "")
+      ENTRY_VALUE_TRIMMED=$(printf '%s' "$ENTRY_VALUE_RAW" | tr -d '[:space:]')
       ENTRY_REASON_RAW=$(YQ_K="$k" yq eval '.substitutions[strenv(YQ_K)].reason // ""' "$OVERRIDES_FILE" 2>/dev/null || echo "")
       ENTRY_REASON_TRIMMED=$(printf '%s' "$ENTRY_REASON_RAW" | tr -d '[:space:]')
       if [ "$ENTRY_VALUE_PRESENT" != "true" ]; then
         err "substitutions.$k: missing 'value' field"
+        VIOLATIONS=$((VIOLATIONS + 1))
+      elif [ -z "$ENTRY_VALUE_TRIMMED" ]; then
+        # Present-but-empty value (null, "", or whitespace) — the
+        # `{value, reason}` contract requires non-empty value. CodeRabbit
+        # ⚠️ Major on PR #228 round 4 caught the gap; the prior shape
+        # accepted `value: null` / `value: ""`.
+        err "substitutions.$k: missing or empty 'value' field"
         VIOLATIONS=$((VIOLATIONS + 1))
       fi
       if [ -z "$ENTRY_REASON_TRIMMED" ]; then

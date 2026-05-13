@@ -412,6 +412,100 @@ else
   fail "substitution without value should be rejected; got: $out"
 fi
 
+# Test 26: substitution entry with `value: null` → fail (Rule 7
+# extension; CodeRabbit ⚠️ Major round 4 caught that null/empty
+# values were allowed even though the {value, reason} contract says
+# non-empty).
+null_value_sub="$WORKDIR/null-value-sub.yml"
+cat >"$null_value_sub" <<'YAML'
+version: 1
+substitutions:
+  phase_4b_default:
+    value: null
+    reason: oops, forgot the actual value
+YAML
+out=$("$VALIDATOR" "$null_value_sub" "$MANIFEST" 2>&1 || true)
+if echo "$out" | grep -q "missing or empty 'value' field"; then
+  pass "substitution with value: null → rejected"
+else
+  fail "substitution with null value should be rejected; got: $out"
+fi
+
+# Test 27: substitution entry with `value: ""` → fail.
+empty_value_sub="$WORKDIR/empty-value-sub.yml"
+cat >"$empty_value_sub" <<'YAML'
+version: 1
+substitutions:
+  phase_4b_default:
+    value: ""
+    reason: ditto, but with explicit empty string
+YAML
+out=$("$VALIDATOR" "$empty_value_sub" "$MANIFEST" 2>&1 || true)
+if echo "$out" | grep -q "missing or empty 'value' field"; then
+  pass "substitution with value: \"\" → rejected"
+else
+  fail "substitution with empty value should be rejected; got: $out"
+fi
+
+# Test 28: substitution entry with whitespace-only `value` → fail.
+ws_value_sub="$WORKDIR/ws-value-sub.yml"
+cat >"$ws_value_sub" <<'YAML'
+version: 1
+substitutions:
+  phase_4b_default:
+    value: "   "
+    reason: whitespace value
+YAML
+out=$("$VALIDATOR" "$ws_value_sub" "$MANIFEST" 2>&1 || true)
+if echo "$out" | grep -q "missing or empty 'value' field"; then
+  pass "substitution with whitespace-only value → rejected"
+else
+  fail "substitution with whitespace value should be rejected; got: $out"
+fi
+
+# Test 29: non-empty overrides file missing `version` → fail (Rule 3
+# now requires version on any non-empty document; CodeRabbit ⚠️ Major
+# round 4).
+no_version="$WORKDIR/no-version.yml"
+cat >"$no_version" <<'YAML'
+skip_paths: []
+YAML
+out=$("$VALIDATOR" "$no_version" "$MANIFEST" 2>&1 || true)
+if echo "$out" | grep -q "missing required top-level key: version"; then
+  pass "non-empty file without version → rejected"
+else
+  fail "missing version should be rejected; got: $out"
+fi
+
+# Test 30: apply-overrides.sh treats null/empty .value as "no override"
+# (returns non-zero), so callers fall back to the manifest default
+# rather than propagating a literal null. CodeRabbit ⚠️ Major round 4.
+null_value_apply="$WORKDIR/null-value-apply.yml"
+cat >"$null_value_apply" <<'YAML'
+substitutions:
+  phase_4b_default:
+    value: null
+    reason: shouldn't propagate
+YAML
+if override_substitution_for "$null_value_apply" "phase_4b_default" >/dev/null 2>&1; then
+  fail "override_substitution_for should return non-zero for null value"
+else
+  pass "override_substitution_for treats null .value as no override"
+fi
+
+empty_value_apply="$WORKDIR/empty-value-apply.yml"
+cat >"$empty_value_apply" <<'YAML'
+substitutions:
+  phase_4b_default:
+    value: ""
+    reason: empty string shouldn't propagate either
+YAML
+if override_substitution_for "$empty_value_apply" "phase_4b_default" >/dev/null 2>&1; then
+  fail "override_substitution_for should return non-zero for empty value"
+else
+  pass "override_substitution_for treats empty .value as no override"
+fi
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

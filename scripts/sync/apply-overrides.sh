@@ -120,6 +120,19 @@ override_substitution_for() {
   # contract). Return only the `.value` field — the `.reason` is for
   # audit / human-readers and is enforced by validate-overrides.sh, not
   # consumed at propagation time.
-  YQ_MARKER="$marker" yq eval '.substitutions[strenv(YQ_MARKER)].value' "$overrides_file" 2>/dev/null
+  #
+  # Treat null / empty / missing `.value` as "no override" (return
+  # non-zero so the caller falls back to the manifest default).
+  # Without this guard, a malformed entry would propagate a literal
+  # `null` or empty string into rendered output. The validator
+  # rejects such entries on every PR (Rule 7), but this is defensive
+  # belt-and-suspenders for already-merged or pre-validated cases.
+  # CodeRabbit ⚠️ Major on PR #228 round 4.
+  local value
+  value=$(YQ_MARKER="$marker" yq eval '.substitutions[strenv(YQ_MARKER)].value' "$overrides_file" 2>/dev/null || true)
+  if [ -z "$value" ] || [ "$value" = "null" ]; then
+    return 1
+  fi
+  printf '%s\n' "$value"
   return 0
 }
