@@ -33,16 +33,6 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
-run_wizard() {
-  # Wrapper for the test environment: skip every preflight check that
-  # depends on real on-disk state, drive prompts via flags, auto-confirm.
-  BOOTSTRAP_SKIP_TOOL_CHECK=1 \
-  BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
-  BOOTSTRAP_AUTO_CONFIRM=1 \
-  BOOTSTRAP_AUTO_PROMPT=skip \
-    "$SCRIPT" "$@"
-}
-
 # ---------------------------------------------------------------------------
 # Test 1: --help renders without crashing.
 # ---------------------------------------------------------------------------
