@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# scripts/ci/check_bootstrap_wizard — CI entry point for #156 sub-A tests.
+#
+# Wraps tests/test_bootstrap_wizard.sh so the repo_lint workflow's
+# "run all scripts/ci/check_*" loop picks it up. Mirrors the
+# pattern used by check_sync_overrides and the other check_*
+# scripts.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_bootstrap_wizard.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  # Missing test script is a hard error (silent skip would let an
+  # accidental delete/rename disable this check). Matches the
+  # tightening applied to check_sync_overrides in #228 round 5.
+  echo "check_bootstrap_wizard: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
