@@ -81,6 +81,12 @@ paths:
   - path: scripts/request-label-removal.sh
     type: canonical
     consumers: all
+  - path: scripts/gh-as-author.sh
+    type: canonical
+    consumers: all
+  - path: scripts/gh-as-reviewer.sh
+    type: canonical
+    consumers: all
   - path: scripts/hooks/gh-pr-guard.sh
     type: canonical
     consumers: all
