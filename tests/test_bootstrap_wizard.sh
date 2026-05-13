@@ -160,9 +160,9 @@ echo "$out" | grep -q "Starting stage: github-infra" \
 echo "$out" | grep -q "firebase-and-codereview (sub-D stub)" \
   && pass "stage D stub ran" \
   || fail "stage D stub didn't run"
-echo "$out" | grep -q "board-and-summary (sub-E stub)" \
-  && pass "stage E stub ran" \
-  || fail "stage E stub didn't run"
+echo "$out" | grep -q "Starting stage: board-and-summary" \
+  && pass "stage E ran" \
+  || fail "stage E didn't run"
 
 # ---------------------------------------------------------------------------
 # Test 11: Resume mechanism. Pre-seed the state file with the first
@@ -194,7 +194,7 @@ echo "$resume_out" | grep -q "skip github-infra (already completed)" \
 echo "$resume_out" | grep -q "firebase-and-codereview (sub-D stub)" \
   && pass "resume ran firebase-and-codereview" \
   || fail "resume did not run firebase-and-codereview"
-echo "$resume_out" | grep -q "board-and-summary (sub-E stub)" \
+echo "$resume_out" | grep -q "Starting stage: board-and-summary" \
   && pass "resume ran board-and-summary" \
   || fail "resume did not run board-and-summary"
 
@@ -228,7 +228,10 @@ echo "$ex_out" | grep -q "Starting stage: template-mirror" \
   || pass "explicit-resume correctly skipped pre-target stages"
 
 # ---------------------------------------------------------------------------
-# Test 13: --skip-board skips stage E.
+# Test 13: --skip-board suppresses the Project v2 board sub-step but
+# the stage still runs (summary + PRD/spec/plan scaffolds are too
+# valuable to gate on whether the operator wanted a board). The
+# stage's internal skip logs "project board skipped (--skip-board)".
 # ---------------------------------------------------------------------------
 skip_board_target="$WORKDIR/skip-board-target"
 mkdir -p "$skip_board_target"
@@ -243,9 +246,13 @@ sb_ec=$?
 set -e
 [ "$sb_ec" -eq 0 ] && pass "--skip-board exits 0" \
                    || fail "--skip-board should exit 0; got $sb_ec"
-echo "$sb_out" | grep -q "skip board-and-summary (--skip-board)" \
-  && pass "--skip-board skipped board-and-summary" \
-  || fail "--skip-board should skip board-and-summary; got: $sb_out"
+echo "$sb_out" | grep -q "project board skipped (--skip-board)" \
+  && pass "--skip-board skipped the Project v2 board sub-step" \
+  || fail "--skip-board should skip project board sub-step; got: $sb_out"
+# Stage E itself still runs (banner + summary).
+echo "$sb_out" | grep -q "Starting stage: board-and-summary" \
+  && pass "--skip-board still runs the rest of stage E (summary)" \
+  || fail "--skip-board should still run stage E for the summary; got: $sb_out"
 
 # ---------------------------------------------------------------------------
 # Test 14: --skip-firebase implies --firebase=none.
@@ -451,6 +458,43 @@ set -e
 echo "$ip_ok_out" | grep -q "project: *7" \
   && pass "interactive '7' captured as project=7" \
   || fail "expected 'project: 7' summary; got: $ip_ok_out"
+
+# ---------------------------------------------------------------------------
+# Test 21: Env-provided BOOTSTRAP_INPUT_* preserved across prompt path
+# (Codex P2 round 1 on #246). Pre-set BOOTSTRAP_INPUT_PROJECT=7 with
+# NO --project flag and NO BOOTSTRAP_AUTO_PROMPT=skip. Before the fix,
+# the FROM_FLAG_PROJECT sentinel was empty so prompt_for_inputs()
+# would prompt and overwrite the env value (default "new" on empty
+# input). After the fix, the env-pre-set value seeds the sentinel
+# and the prompt is skipped. We pipe an empty line to confirm the
+# prompt is NOT consumed; if the fix regressed, project would be
+# captured as "new" instead of "7".
+# ---------------------------------------------------------------------------
+env_proj_target="$WORKDIR/env-proj-target"
+mkdir -p "$env_proj_target"
+set +e
+# stdin closed (`</dev/null`) so any errant `read -r` would fail
+# immediately rather than block. With the fix, no read should fire
+# for the project prompt.
+env_proj_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 \
+               BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+               BOOTSTRAP_INPUT_PROJECT=7 \
+               "$SCRIPT" my-new-repo \
+               --target-dir "$env_proj_target" \
+               --description d --visibility private --firebase none \
+               --codex-app n --dry-run </dev/null 2>&1)
+env_proj_ec=$?
+set -e
+if [ "$env_proj_ec" -eq 0 ]; then
+  pass "env BOOTSTRAP_INPUT_PROJECT=7 dry-run → exit 0"
+else
+  fail "env BOOTSTRAP_INPUT_PROJECT=7 should succeed; got rc=$env_proj_ec, out: $env_proj_out"
+fi
+if echo "$env_proj_out" | grep -q "project: *7"; then
+  pass "env BOOTSTRAP_INPUT_PROJECT=7 preserved (not overwritten by prompt)"
+else
+  fail "expected 'project: 7' summary; env value was overwritten. out: $env_proj_out"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary
