@@ -1471,6 +1471,13 @@
   // source and we rescale to the target's own range. A re-entry flag
   // prevents the mirrored assignment from re-firing the opposite
   // handler into an infinite loop.
+  //
+  // Either pane can lose its internal scroll range depending on
+  // viewport size and content — most reliably the workspace at the
+  // ≤960px stacked-layout breakpoint. We wire up listeners
+  // unconditionally and let the sMax/tMax guard below no-op when
+  // either side has nothing to scroll. Simpler than attaching and
+  // detaching on resize transitions.
   // ---------------------------------------------------------------------
   function initSyncScroll() {
     const rail = document.querySelector('.rail');
