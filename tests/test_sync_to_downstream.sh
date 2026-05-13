@@ -33,11 +33,19 @@ trap 'rm -rf "$WORKDIR"' EXIT
 # Fixture: a minimal "mergepath" with two canonical files and one kit dir
 # ---------------------------------------------------------------------------
 MP="$WORKDIR/mergepath"
-mkdir -p "$MP/scripts/hooks" "$MP/scripts/ci" "$MP/.github/workflows"
+mkdir -p "$MP/scripts/hooks" "$MP/scripts/ci" "$MP/scripts/sync" "$MP/.github/workflows"
 echo "canonical-script-v1" >"$MP/scripts/keep-in-sync.sh"
 echo "canonical-hook-v1"   >"$MP/scripts/hooks/the-hook.sh"
 echo "kit-file-1" >"$MP/scripts/ci/check_one"
 echo "kit-file-2" >"$MP/scripts/ci/check_two"
+
+# sync-to-downstream.sh sources scripts/sync/apply-overrides.sh from
+# its MERGEPATH_ROOT at startup (#199 integration). Mirror the real
+# library into the synthetic fixture so the source line resolves
+# instead of failing with "No such file or directory" — that
+# regression would surface as the audit block tests above failing
+# their existence check on the consumer-header line.
+cp "$ROOT/scripts/sync/apply-overrides.sh" "$MP/scripts/sync/apply-overrides.sh"
 
 cat >"$MP/.mergepath-sync.yml" <<'EOF'
 version: 1
@@ -233,7 +241,8 @@ echo "$hostile_output" | grep -qE "it is a symbolic link|resolves outside MERGEP
 # ---------------------------------------------------------------------------
 sync_workdir="$WORKDIR/sync"
 SYNC_MP="$sync_workdir/mergepath"
-mkdir -p "$SYNC_MP/scripts/hooks" "$SYNC_MP/scripts/ci" "$SYNC_MP/.github"
+mkdir -p "$SYNC_MP/scripts/hooks" "$SYNC_MP/scripts/ci" "$SYNC_MP/scripts/sync" "$SYNC_MP/.github"
+cp "$ROOT/scripts/sync/apply-overrides.sh" "$SYNC_MP/scripts/sync/apply-overrides.sh"
 cat >"$SYNC_MP/.mergepath-sync.yml" <<'YAML'
 version: 1
 consumers:
@@ -342,7 +351,8 @@ set -e
 # ---------------------------------------------------------------------------
 guard_workdir="$WORKDIR/guard"
 GUARD_MP="$guard_workdir/mergepath"
-mkdir -p "$GUARD_MP/scripts" "$GUARD_MP/.github"
+mkdir -p "$GUARD_MP/scripts" "$GUARD_MP/scripts/sync" "$GUARD_MP/.github"
+cp "$ROOT/scripts/sync/apply-overrides.sh" "$GUARD_MP/scripts/sync/apply-overrides.sh"
 cat >"$GUARD_MP/.mergepath-sync.yml" <<'YAML'
 version: 1
 consumers:
@@ -442,9 +452,85 @@ grep -q 'mktemp -d -t "mergepath-sync' "$SCRIPT" \
   && fail "mktemp invocation still uses the BSD-specific '-t literal-prefix' form (not GNU portable)"
 
 # ---------------------------------------------------------------------------
+# --files alias for --paths (#199): both should normalize to FILTER_PATHS
+# and produce equivalent filter behavior in dry-run sync.
+# ---------------------------------------------------------------------------
+files_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run --files "scripts/hooks/the-hook.sh" 2>&1)
+paths_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run --paths "scripts/hooks/the-hook.sh" 2>&1)
+[ "$files_out" = "$paths_out" ] \
+  || fail "--files and --paths should produce identical output"
+echo "$files_out" | grep -q "scripts/hooks/the-hook.sh" \
+  || fail "--files did not honor the path filter"
+
+# ---------------------------------------------------------------------------
+# Sync-mode-only flags rejected in --audit (#199).
+# ---------------------------------------------------------------------------
+for flag in --no-pr --recreate-existing --verbose; do
+  set +e
+  out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+    "$SCRIPT" --audit "$flag" 2>&1)
+  ec=$?
+  set -e
+  [ "$ec" -eq 2 ] || fail "expected exit 2 when $flag combined with --audit; got $ec ($out)"
+  echo "$out" | grep -q "sync-mode-only" \
+    || fail "expected 'sync-mode-only' diagnostic for $flag; got: $out"
+done
+
+# ---------------------------------------------------------------------------
+# Mutex: --no-pr + --recreate-existing rejected.
+# ---------------------------------------------------------------------------
+set +e
+mutex_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --no-pr --recreate-existing 2>&1)
+mutex_ec=$?
+set -e
+[ "$mutex_ec" -eq 2 ] || fail "expected exit 2 for --no-pr + --recreate-existing; got $mutex_ec"
+echo "$mutex_out" | grep -q "incompatible" \
+  || fail "expected 'incompatible' diagnostic; got: $mutex_out"
+
+# ---------------------------------------------------------------------------
+# --verbose dry-run: emits per-file diff hunks for affected targets.
+# ---------------------------------------------------------------------------
+verbose_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run --verbose 2>&1)
+echo "$verbose_out" | grep -q "+ scripts/hooks/the-hook.sh" \
+  || fail "--verbose dry-run should still emit + path lines"
+# A real diff hunk includes `@@` for context — that's the cheapest signal
+# the verbose diff actually rendered. We don't pin to exact diff content
+# (commit subjects/hashes vary) but the hunk header is deterministic.
+echo "$verbose_out" | grep -qE "^\s+@@" \
+  || fail "--verbose dry-run should include diff hunk headers; got: $verbose_out"
+
+# Without --verbose the same dry-run should NOT include the diff hunks
+# (just the summary path lines).
+plain_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run 2>&1)
+echo "$plain_out" | grep -qE "^\s+@@" \
+  && fail "non-verbose dry-run should NOT include diff hunks"
+
+# ---------------------------------------------------------------------------
+# --no-pr + --dry-run still works (just exercises the parser; dry-run
+# means we never actually reach the push-or-create code).
+# ---------------------------------------------------------------------------
+nopr_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" "$SCRIPT" "$sha_A" --dry-run --no-pr 2>&1)
+echo "$nopr_out" | grep -q "would open PR" \
+  || fail "--no-pr in dry-run should still produce a plan; got: $nopr_out"
+
+# ---------------------------------------------------------------------------
+# Library source check: sync-to-downstream.sh must source
+# scripts/sync/apply-overrides.sh (#199 integration). Source-grep
+# assertion since the live integration path runs only in non-dry-run
+# mode.
+# ---------------------------------------------------------------------------
+grep -q '\. "\$MERGEPATH_ROOT/scripts/sync/apply-overrides.sh"' "$SCRIPT" \
+  || fail "sync-to-downstream.sh is missing the apply-overrides.sh source line"
+grep -q 'override_should_skip_path "\$consumer_overrides"' "$SCRIPT" \
+  || fail "sync_open_pr is missing the override_should_skip_path filter on canonical targets"
+
+# ---------------------------------------------------------------------------
 # --version / --help smoke
 # ---------------------------------------------------------------------------
 "$SCRIPT" --version | grep -q "sync-to-downstream.sh" || fail "--version output unexpected"
 "$SCRIPT" --help    | grep -q "Usage:"                || fail "--help output unexpected"
+"$SCRIPT" --help    | grep -q "no-pr"                 || fail "--help missing --no-pr documentation"
+"$SCRIPT" --help    | grep -q "recreate-existing"     || fail "--help missing --recreate-existing documentation"
+"$SCRIPT" --help    | grep -q "verbose"               || fail "--help missing --verbose documentation"
 
 echo "test_sync_to_downstream: PASS"
