@@ -29,30 +29,54 @@
 # Usage:
 #   scripts/sync-to-downstream.sh --audit [--repos r1,r2] [--paths glob]
 #   scripts/sync-to-downstream.sh <commit-ish> [--dry-run] [--repos r1,r2] [--paths glob]
+#                                 [--no-pr] [--skip-existing|--recreate-existing] [--verbose]
 #   scripts/sync-to-downstream.sh --help
 #   scripts/sync-to-downstream.sh --version
 #
 # Flags:
-#   --audit            Read-only drift detection. Exit 0 (clean), 1 (drift),
-#                      2 (script/usage error), 3 (consumer fetch error).
-#   --dry-run          Sync mode only. Print the per-consumer plan
-#                      (branch name, files) without cloning, committing,
-#                      pushing, or creating PRs. Idempotency check is
-#                      skipped because it probes the consumer repo via
-#                      `gh api`; a dry-run plan may show "would open PR"
-#                      even when a PR already exists, but the live run
-#                      will catch and skip it.
-#   --repos r1,r2      Restrict to a comma-separated subset of consumer names.
-#   --paths glob       Restrict to manifest paths matching the glob (e.g.
-#                      "scripts/*", ".github/workflows/agent-review.yml").
-#   --no-clone         Audit only: don't clone-on-demand; only audit
-#                      consumers with a local sibling worktree under
-#                      MERGEPATH_SIBLINGS_DIR.
-#   --no-refresh       Audit only: don't `git fetch` cached consumer clones
-#                      before comparing. Useful for offline/sandboxed
-#                      audits; may report stale results if the cache is old.
-#   --help, -h         Show this help.
-#   --version          Print version info.
+#   --audit              Read-only drift detection. Exit 0 (clean), 1 (drift),
+#                        2 (script/usage error), 3 (consumer fetch error).
+#   --dry-run            Sync mode only. Print the per-consumer plan
+#                        (branch name, files) without cloning, committing,
+#                        pushing, or creating PRs. Idempotency check is
+#                        skipped because it probes the consumer repo via
+#                        `gh api`; a dry-run plan may show "would open PR"
+#                        even when a PR already exists, but the live run
+#                        will catch and skip it.
+#   --repos r1,r2        Restrict to a comma-separated subset of consumer names.
+#   --paths glob         Restrict to manifest paths matching the glob (e.g.
+#                        "scripts/*", ".github/workflows/agent-review.yml").
+#                        `--files <glob>` is accepted as an alias.
+#   --files <glob>       Alias for --paths (matches #199 spec; --paths predates).
+#   --no-pr              Sync mode only. Push branches but skip the
+#                        `gh pr create` step. Useful for staging the
+#                        propagation across N consumers; human inspects
+#                        the pushed branches before deciding whether to
+#                        open PRs (manually or by re-running without
+#                        --no-pr).
+#   --skip-existing      Sync mode only. Explicit form of the default
+#                        behavior: skip any consumer where a PR already
+#                        exists for the commit oid. Mutually exclusive
+#                        with --recreate-existing.
+#   --recreate-existing  Sync mode only. Close the existing PR (with a
+#                        pointer comment) and recreate it on the same
+#                        branch with a fresh synthesized body. Use when
+#                        a manifest change requires the propagation PR
+#                        body to be regenerated. Mutually exclusive
+#                        with --skip-existing.
+#   --verbose, -v        Sync mode dry-run only. Append per-file diff
+#                        hunks (Mergepath parent → commit) to each
+#                        affected target line in the plan, so the human
+#                        sees the change set that would propagate.
+#   --no-clone           Audit only: don't clone-on-demand; only audit
+#                        consumers with a local sibling worktree under
+#                        MERGEPATH_SIBLINGS_DIR.
+#   --no-refresh         Audit only: don't `git fetch` cached consumer
+#                        clones before comparing. Useful for offline /
+#                        sandboxed audits; may report stale results if
+#                        the cache is old.
+#   --help, -h           Show this help.
+#   --version            Print version info.
 #
 # Environment:
 #   MERGEPATH_SIBLINGS_DIR  Default: $HOME/GitHub. If a `.git` entry at
@@ -89,16 +113,25 @@ set -euo pipefail
 
 # --- constants --------------------------------------------------------------
 
-SCRIPT_VERSION="0.2.0-layer3-canonical"
+SCRIPT_VERSION="0.3.0-layer3-overrides-and-flags"
 SUPPORTED_MANIFEST_VERSION=1
 MANIFEST_PATH=".mergepath-sync.yml"
 SYNC_BRANCH_PREFIX="mergepath-sync"
+OVERRIDES_PATH=".sync-overrides.yml"
 
 # Resolve the Mergepath worktree root from the script's location (works
 # regardless of cwd). Two `dirname`s: scripts/sync-to-downstream.sh →
 # scripts/ → repo root. Tests can override with MERGEPATH_ROOT_OVERRIDE
 # to point the script at a synthetic fixture worktree.
 MERGEPATH_ROOT="${MERGEPATH_ROOT_OVERRIDE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+
+# Per-repo override library (#200). Provides override_should_skip_path
+# and override_substitution_for helpers; sync_open_pr filters its
+# target list through override_should_skip_path so a downstream's
+# documented divergences are respected on every sync. Sourced once at
+# startup so individual sync_open_pr invocations don't reload.
+# shellcheck source=scripts/sync/apply-overrides.sh
+. "$MERGEPATH_ROOT/scripts/sync/apply-overrides.sh"
 
 # --- logging ----------------------------------------------------------------
 
@@ -641,6 +674,14 @@ sync_one_consumer() {
   local branch
   branch=$(sync_branch_name "$sha")
 
+  # Deferred destructive recreate: populated below when
+  # SYNC_RECREATE_EXISTING=1 + an existing open PR is detected.
+  # Passed to sync_open_pr so the close+delete fires AFTER the
+  # replacement commit is built and BEFORE the push. Stays empty
+  # in the no-recreate case so sync_open_pr knows to skip the
+  # destructive step.
+  local recreate_existing_pr_num=""
+
   local targets
   targets=$(sync_consumer_canonical_targets "$consumer_name" "$changed_files" "$manifest")
 
@@ -676,10 +717,37 @@ sync_one_consumer() {
     }
     case "$pr_state" in
       open:*)
-        printf "  · %s already in flight (PR #%s on branch %s)\n" \
-          "$consumer_name" "${pr_state#open:}" "$branch"
-        SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
-        return 0
+        local existing_pr_num="${pr_state#open:}"
+        if [ "${SYNC_RECREATE_EXISTING:-0}" = "1" ]; then
+          # --recreate-existing escape hatch. The destructive close +
+          # branch-delete is DEFERRED to sync_open_pr, executed only
+          # AFTER the replacement commit is built locally and right
+          # BEFORE the push.
+          #
+          # Rationale (CodeRabbit #231 round 2 caught this): the
+          # original layering closed the PR and deleted the branch
+          # here, before clone/materialize/commit. If any later step
+          # fails (auth, network, no diff after copy, materialize
+          # error) the consumer is left with NO open propagation PR
+          # at all — strictly worse than the pre-recreate state.
+          # Building the replacement first, then collapsing the
+          # destructive step to the moment before push, keeps the
+          # live PR available until we have something concrete to
+          # replace it with.
+          #
+          # The PR number is threaded into sync_open_pr as a 9th
+          # positional arg below; passing as an arg (rather than
+          # exporting a global) keeps cross-consumer state isolated
+          # since sync_one_consumer is called once per consumer.
+          recreate_existing_pr_num="$existing_pr_num"
+          # Fall through to sync_open_pr — clone/commit FIRST, then
+          # close + delete + push.
+        else
+          printf "  · %s already in flight (PR #%s on branch %s)\n" \
+            "$consumer_name" "$existing_pr_num" "$branch"
+          SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+          return 0
+        fi
         ;;
       closed:*)
         printf "  · %s already done (PR #%s closed/merged on branch %s)\n" \
@@ -699,6 +767,21 @@ sync_one_consumer() {
     while IFS= read -r p; do
       [ -z "$p" ] && continue
       printf "      + %s\n" "$p"
+      # --verbose dry-run: emit the per-file diff hunk against the
+      # current Mergepath worktree at $sha vs the parent. This is the
+      # change set that WOULD be propagated; consumers don't have a
+      # local clone in dry-run, so we show the upstream-side diff
+      # rather than the downstream effective diff. The latter requires
+      # a live clone (sync_open_pr does it; this is the cheap planning
+      # view).
+      if [ "${SYNC_VERBOSE:-0}" = "1" ]; then
+        local parent_sha
+        parent_sha=$(git -C "$MERGEPATH_ROOT" rev-parse "${sha}^" 2>/dev/null || echo "")
+        if [ -n "$parent_sha" ]; then
+          git -C "$MERGEPATH_ROOT" --no-pager diff --no-color "$parent_sha" "$sha" -- "$p" 2>/dev/null \
+            | sed 's/^/        /' || true
+        fi
+      fi
     done <<< "$targets"
     if [ "$kit_count" -gt 0 ] || [ "$templated_count" -gt 0 ]; then
       printf "      (deferred this slice: kit=%s templated=%s)\n" \
@@ -709,8 +792,11 @@ sync_one_consumer() {
   fi
 
   # Live mode: clone, branch, commit, push, PR.
+  # 9th arg: existing PR number to close+delete just before push,
+  # used by --recreate-existing. Empty means "no destructive step".
   if ! sync_open_pr "$consumer_name" "$consumer_repo" "$sha" "$commit_subject" \
-                    "$branch" "$targets" "$kit_list" "$templated_list"; then
+                    "$branch" "$targets" "$kit_list" "$templated_list" \
+                    "$recreate_existing_pr_num"; then
     SYNC_FAILED=$((SYNC_FAILED + 1))
     return 0
   fi
@@ -733,6 +819,11 @@ sync_open_pr() {
   local targets=$6  # newline-separated paths
   local kit_list=$7
   local templated_list=$8
+  # 9th arg: existing PR number to close + branch-delete just
+  # before push, only when --recreate-existing fired. Empty when
+  # no destructive step is needed. See sync_one_consumer for why
+  # this is deferred to the moment-before-push and not done upfront.
+  local recreate_existing_pr_num=${9:-}
   local short_sha=${sha:0:7}
 
   # Portable mktemp: `-t TEMPLATE` semantics differ between BSD (macOS)
@@ -754,6 +845,51 @@ sync_open_pr() {
   if ! gh repo clone "$consumer_repo" "$workspace/repo" -- --depth=10 --quiet >&2; then
     err "$consumer_name: gh repo clone failed for $consumer_repo"
     return 1
+  fi
+
+  # Per-repo override filter (#200 integration). Each consumer can carry
+  # a `.sync-overrides.yml` at its repo root declaring `skip_paths` —
+  # canonical/kit paths the propagation script must NOT overwrite for
+  # this repo, with a documented `reason` for each. Filter the target
+  # list through `override_should_skip_path` BEFORE the materialize
+  # loop runs, so the diff/commit/push reflects only paths the consumer
+  # has not opted out of. The reason text is logged for audit-trail.
+  #
+  # An absent overrides file means "no overrides" (the helper returns
+  # non-zero for every path). A malformed file is the consumer's CI
+  # concern (validate-overrides.sh blocks the consumer's merge); this
+  # script treats it conservatively (no skip), which is safer than
+  # silently propagating past what may have been a documented divergence.
+  local consumer_overrides="$workspace/repo/$OVERRIDES_PATH"
+  local filtered_targets=""
+  local override_skip_count=0
+  while IFS= read -r target; do
+    [ -z "$target" ] && continue
+    if override_should_skip_path "$consumer_overrides" "$target"; then
+      printf "  · %s skip %s (per .sync-overrides.yml: %s)\n" \
+        "$consumer_name" "$target" "$OVERRIDE_SKIP_REASON"
+      override_skip_count=$((override_skip_count + 1))
+      continue
+    fi
+    if [ -z "$filtered_targets" ]; then
+      filtered_targets="$target"
+    else
+      filtered_targets+=$'\n'"$target"
+    fi
+  done <<< "$targets"
+  targets="$filtered_targets"
+
+  if [ -z "$targets" ]; then
+    if [ "$override_skip_count" -gt 0 ]; then
+      printf "  ⊘ %s — all canonical targets skipped per .sync-overrides.yml (%d entries)\n" \
+        "$consumer_name" "$override_skip_count"
+      SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+      SYNC_PR_OPENED=$((SYNC_PR_OPENED - 1))  # pre-decrement to offset the caller's post-success increment
+      return 0
+    fi
+    # No-targets case without overrides should already have been
+    # caught upstream; treat as a no-op return rather than an error.
+    return 0
   fi
 
   # Materialize Mergepath's $sha worktree state for the target files.
@@ -859,6 +995,67 @@ EOF
     return 1
   fi
 
+  # --recreate-existing destructive step. Deferred from
+  # sync_one_consumer to here so the live PR stays open until we
+  # have a replacement commit in hand. By the time we reach this
+  # point: the clone succeeded, materialize succeeded, the diff is
+  # non-empty (we just committed), so closing the live PR + deleting
+  # its branch is safe — failure between here and the next two
+  # lines (close, delete, push) is the only window where we could
+  # be left with no PR, and all three failures are loudly logged.
+  if [ -n "$recreate_existing_pr_num" ]; then
+    printf "  ⤷ %s — closing existing PR #%s for --recreate-existing\n" \
+      "$consumer_name" "$recreate_existing_pr_num"
+    if ! gh pr close "$recreate_existing_pr_num" --repo "$consumer_repo" \
+          --comment "Closed by \`scripts/sync-to-downstream.sh --recreate-existing\`. Reopening with a fresh synthesized body on a recreated \`$branch\`." >&2; then
+      err "$consumer_name: gh pr close failed for #$recreate_existing_pr_num"
+      return 1
+    fi
+    # Delete the remote branch so the subsequent push is a fresh-
+    # branch create (not a non-fast-forward update against the
+    # branch HEAD the closed PR pointed at — Codex #231 P1 caught
+    # the original missing-delete bug).
+    #
+    # Use --include to capture the HTTP status line and switch on
+    # it explicitly. Only 204 (success) and 404/422 (already-absent)
+    # are safe to swallow; everything else (401/403 auth, 5xx, etc.)
+    # must surface as a hard failure rather than be confused for
+    # "already absent" (CodeRabbit #231 round 2 caught the too-
+    # permissive fallback that masked any failed probe).
+    printf "  ⤷ %s — deleting remote branch %s for --recreate-existing\n" \
+      "$consumer_name" "$branch"
+    local _del_response _del_status _del_rc=0
+    _del_response=$(gh api --include -X DELETE "repos/${consumer_repo}/git/refs/heads/${branch}" 2>&1) || _del_rc=$?
+    _del_status=$(printf '%s\n' "$_del_response" | awk '
+      /^HTTP\/[0-9.]+[[:space:]]+[0-9]+/ {
+        match($0, /[0-9]+/)
+        # The first numeric run in an HTTP status line is the
+        # protocol minor version (e.g. "HTTP/1.1") or status code.
+        # Walk the line, take the second numeric run.
+        n = split($0, parts, /[^0-9]+/)
+        for (i = 1; i <= n; i++) {
+          if (parts[i] != "" && parts[i] != "1" && parts[i] != "2" && length(parts[i]) == 3) {
+            print parts[i]; exit
+          }
+        }
+        # Fallback: print the last numeric run (the status code is
+        # always 3 digits at the end of the status line preamble).
+        for (i = n; i >= 1; i--) if (parts[i] ~ /^[0-9]{3}$/) { print parts[i]; exit }
+      }')
+    case "$_del_status" in
+      204)
+        :  # ok, branch deleted
+        ;;
+      404|422)
+        printf "    · branch %s already absent on remote (status=%s, ok)\n" "$branch" "$_del_status"
+        ;;
+      *)
+        err "$consumer_name: failed to delete remote branch $branch (status=${_del_status:-unknown}, rc=$_del_rc); refusing to push to avoid non-fast-forward"
+        return 1
+        ;;
+    esac
+  fi
+
   # Push. The active gh keyring account ('gh config get -h github.com user')
   # is what gh uses for write operations. The author identity is what
   # commits and PR creation should attribute to. Per the active-account
@@ -871,6 +1068,16 @@ EOF
   if ! git -C "$workspace/repo" push -q -u origin "$branch" 2>&1; then
     err "$consumer_name: git push failed"
     return 1
+  fi
+
+  # --no-pr (#199): push the branch but stop here. Useful for staging
+  # the propagation across N consumers and inspecting branches before
+  # committing to PR creation. The branch still gets pushed under the
+  # standard active-account convention; only the `gh pr create` step
+  # is skipped.
+  if [ "${SYNC_NO_PR:-0}" = "1" ]; then
+    printf "  ✓ %s — pushed branch %s (--no-pr; no PR opened)\n" "$consumer_name" "$branch"
+    return 0
   fi
 
   # Open the PR.
@@ -988,6 +1195,10 @@ run_sync() {
 MODE=""
 SYNC_COMMIT_ISH=""
 SYNC_DRY_RUN=0
+SYNC_NO_PR=0
+SYNC_SKIP_EXISTING=0
+SYNC_RECREATE_EXISTING=0
+SYNC_VERBOSE=0
 FILTER_REPOS=""
 FILTER_PATHS=""
 
@@ -1002,8 +1213,11 @@ while [ $# -gt 0 ]; do
       FILTER_REPOS="$2"
       shift 2
       ;;
-    --paths)
-      [ -z "${2:-}" ] && { err "missing argument for --paths"; usage; exit 2; }
+    --paths|--files)
+      # `--files` is an alias for `--paths` (#199 spec uses --files;
+      # the script grew up with --paths and downstream callers may
+      # already pin to it). Accept both, normalized into FILTER_PATHS.
+      [ -z "${2:-}" ] && { err "missing argument for $1"; usage; exit 2; }
       FILTER_PATHS="$2"
       shift 2
       ;;
@@ -1017,6 +1231,46 @@ while [ $# -gt 0 ]; do
       ;;
     --dry-run)
       SYNC_DRY_RUN=1
+      shift
+      ;;
+    --no-pr)
+      # Push branches but skip the `gh pr create` step. Useful for
+      # staging the propagation as branches that a human can inspect
+      # (or open PRs against manually) before committing to PR
+      # creation across N consumers.
+      SYNC_NO_PR=1
+      shift
+      ;;
+    --skip-existing)
+      # Default-behavior alias: skipping when a PR already exists for
+      # the commit oid is the policy encoded in `sync_check_existing_pr`.
+      # The flag exists for callers who want to be explicit about the
+      # intent (e.g., in a documented re-run script). It must be
+      # mutually exclusive with --recreate-existing — CodeRabbit
+      # caught the silent-loss-of-mutex on PR #231 round 2 where the
+      # flag was a true no-op and `--skip-existing --recreate-existing`
+      # silently flipped to recreate. Track the bit and reject the
+      # combo at the post-parse validation step below.
+      SYNC_SKIP_EXISTING=1
+      shift
+      ;;
+    --recreate-existing)
+      # Escape hatch for the rare case a maintainer needs to close +
+      # recreate an existing propagation PR (e.g., the branch's commit
+      # got force-pushed past, or the original PR body needs an
+      # updated synthesized form after a manifest change). The script
+      # closes the existing PR with a comment pointing at the new one,
+      # then proceeds with the standard flow.
+      SYNC_RECREATE_EXISTING=1
+      shift
+      ;;
+    --verbose|-v)
+      # Per-file diff output in sync mode. Default is summary lines
+      # only. Without --verbose the dry-run plan is one line per
+      # affected consumer + a `+ <path>` list; with --verbose, the
+      # plan additionally prints the file-by-file diff against the
+      # consumer's current HEAD for each affected path.
+      SYNC_VERBOSE=1
       shift
       ;;
     --help|-h)
@@ -1052,6 +1306,42 @@ if [ -z "$MODE" ]; then
   usage
   exit 2
 fi
+
+# Validate flag combinations before doing any I/O.
+if [ "$SYNC_NO_PR" = "1" ] && [ "$SYNC_RECREATE_EXISTING" = "1" ]; then
+  err "--no-pr is incompatible with --recreate-existing (one stops at push, the other closes-and-recreates a PR)"
+  exit 2
+fi
+if [ "$SYNC_SKIP_EXISTING" = "1" ] && [ "$SYNC_RECREATE_EXISTING" = "1" ]; then
+  # The CLI contract documents these as mutually exclusive (the --help
+  # text reads "--skip-existing|--recreate-existing"). Before this
+  # check landed, --skip-existing was parsed as a true no-op, so the
+  # combo silently fell through as recreate — confusing and potentially
+  # destructive. Reject explicitly. (CodeRabbit #231 round 2.)
+  err "--skip-existing is incompatible with --recreate-existing (mutually exclusive policies for an in-flight PR on this oid)"
+  exit 2
+fi
+if [ "$SYNC_SKIP_EXISTING" = "1" ] && [ "$MODE" = "audit" ]; then
+  err "--skip-existing is a sync-mode-only flag; remove it from --audit invocations"
+  exit 2
+fi
+if [ "$SYNC_NO_PR" = "1" ] && [ "$MODE" = "audit" ]; then
+  err "--no-pr is a sync-mode-only flag; remove it from --audit invocations"
+  exit 2
+fi
+if [ "$SYNC_RECREATE_EXISTING" = "1" ] && [ "$MODE" = "audit" ]; then
+  err "--recreate-existing is a sync-mode-only flag; remove it from --audit invocations"
+  exit 2
+fi
+if [ "$SYNC_VERBOSE" = "1" ] && [ "$MODE" = "audit" ]; then
+  err "--verbose is currently sync-mode-only (audit output is always per-consumer summary); remove it from --audit invocations"
+  exit 2
+fi
+# Export the sync-mode flags so the helper functions see them via the
+# environment under `set -u`. (They're already set as bash variables
+# above, but several helpers reference them with `${VAR:-0}` for
+# defensive defaulting — make sure they exist.)
+export SYNC_NO_PR SYNC_SKIP_EXISTING SYNC_RECREATE_EXISTING SYNC_VERBOSE
 
 require_yq
 require_manifest
