@@ -385,10 +385,12 @@ mkdir -p "$fb_defer_target"
 # --firebase none, the deferred check should pass with exit 0.
 empty_path_dir="$WORKDIR/empty-path-dir"
 mkdir -p "$empty_path_dir"
-# Symlink the bootstrap-required tools into the manufactured PATH dir
-# so preflight's gh/op/git check passes; firebase/gcloud are
-# deliberately absent.
-for tool in bash gh op git; do
+# Symlink the bootstrap-required tools into the manufactured PATH
+# dir so preflight's tool check passes; firebase/gcloud are
+# deliberately absent. yq + rsync became required in round 3 of
+# #233 (Codex P1: stage-B must fail-closed when yq is unavailable),
+# so they're part of the minimum set now.
+for tool in bash gh op git yq rsync; do
   src=$(command -v "$tool" || true)
   if [ -n "$src" ]; then ln -sf "$src" "$empty_path_dir/$tool"; fi
 done

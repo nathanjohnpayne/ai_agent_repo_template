@@ -236,13 +236,27 @@ bootstrap::_clean_repo_template_yml() {
   local rtc="$target/.repo-template.yml"
 
   if [ ! -f "$rtc" ]; then
+    # Absent file is a legitimate skip — the source mergepath may not
+    # have a .repo-template.yml in some fixture scenarios. There's
+    # nothing to clean up.
     bootstrap::log "no .repo-template.yml to clean up at $rtc"
     return 0
   fi
 
+  # yq is REQUIRED here, not optional. Codex round 3 P1 on #233 caught
+  # the original soft-skip-with-warning: if yq was unavailable the
+  # stage returned 0 + recorded completion despite NOT cleaning the
+  # playground spec_test_map. The subsequent substitution step would
+  # then rename `mergepath_playground` → `<new-repo>_playground`,
+  # baking stale template metadata into the new repo permanently.
+  #
+  # The wizard's preflight step 1 now requires yq globally — but we
+  # keep this defense-in-depth check so a regression in preflight or
+  # a stage invoked outside the wizard (e.g., a future re-use as a
+  # standalone library) still fails closed.
   if ! command -v yq >/dev/null 2>&1; then
-    bootstrap::warn "yq not available; skipping .repo-template.yml cleanup"
-    return 0
+    bootstrap::err "yq is required for .repo-template.yml cleanup but is not on PATH. Install via 'brew install yq' (mikefarah/yq, v4+). Refusing to record stage completion with stale playground metadata."
+    return 2
   fi
 
   bootstrap::run "drop mergepath-specific .repo-template.yml entries" \

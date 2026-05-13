@@ -479,6 +479,100 @@ else
   pass "failed stage NOT recorded in state file (resume can retry)"
 fi
 
+# --- assertion 13: stage fails closed when yq is unavailable
+# (Codex round 3 P1 on #233). Before the fix the stage logged a
+# warning and returned 0 + recorded completion — shipping a target
+# repo whose .repo-template.yml still carried `mergepath_playground`
+# (later renamed to `<new-repo>_playground` by substitution).
+#
+# Simulate by invoking the cleanup helper directly with yq absent
+# from PATH. Use the stage's helper via source rather than going
+# through the whole wizard, so the test is fast + isolated.
+# ---------------------------------------------------------------------------
+# Set up a target with a real .repo-template.yml so the missing-file
+# fast-path doesn't fire.
+no_yq_target="$WORKDIR/no-yq-target"
+mkdir -p "$no_yq_target"
+cat >"$no_yq_target/.repo-template.yml" <<'EOF'
+spec_test_map:
+  mergepath_playground:
+    - tests/test_mergepath_playground.sh
+extra_top_level_dirs: [mergepath, packaging]
+EOF
+# Manufactured PATH with no yq.
+no_yq_path="$WORKDIR/no-yq-path"
+mkdir -p "$no_yq_path"
+for tool in bash sed awk mktemp; do
+  src=$(command -v "$tool" || true)
+  if [ -n "$src" ]; then ln -sf "$src" "$no_yq_path/$tool"; fi
+done
+set +e
+# Source the libs + invoke the helper directly under the stripped PATH.
+no_yq_out=$(PATH="$no_yq_path:/usr/bin:/bin" bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$no_yq_target"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/substitute.sh"
+  . "$ROOT/scripts/bootstrap/template-mirror.sh"
+  # The libs set `set -euo pipefail`; defeat -e here so we can
+  # capture the helper rc into a variable and echo it. -u + pipefail
+  # are still desirable safety nets but -e would exit the subshell
+  # before reaching the echo on a non-zero rc.
+  set +e
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_LOG_FILE=""
+  bootstrap::_clean_repo_template_yml "$TARGET"
+  echo "RC=$?"
+' 2>&1)
+no_yq_ec=$?
+set -e
+# The helper should return non-zero (rc=2 per the impl) AND emit a
+# diagnostic mentioning yq.
+echo "$no_yq_out" | grep -q "yq is required" \
+  && pass "_clean_repo_template_yml errors with 'yq is required' diagnostic when yq missing" \
+  || fail "expected 'yq is required' diagnostic; got: $no_yq_out"
+echo "$no_yq_out" | grep -q "RC=2" \
+  && pass "_clean_repo_template_yml returns rc=2 when yq missing (fails closed)" \
+  || fail "expected RC=2 in subshell; got: $no_yq_out"
+# Verify the .repo-template.yml content is UNCHANGED (the helper
+# returned before yq -i could run; nothing got modified).
+grep -q "mergepath_playground" "$no_yq_target/.repo-template.yml" \
+  && pass ".repo-template.yml left untouched when yq missing (no half-write)" \
+  || fail ".repo-template.yml was modified despite missing yq"
+
+# --- assertion 14: wizard preflight rejects missing yq (Codex round 3
+# P1 — the fail-closed defense is paired with a hard preflight gate
+# so the operator gets a clear message at the top instead of mid-stage).
+# Manufacture a PATH with all required tools EXCEPT yq, and verify
+# the wizard exits non-zero with a clear yq error.
+# ---------------------------------------------------------------------------
+preflight_target="$WORKDIR/preflight-noyq-target"
+mkdir -p "$preflight_target"
+preflight_path="$WORKDIR/preflight-noyq-path"
+mkdir -p "$preflight_path"
+for tool in bash gh op git rsync; do
+  src=$(command -v "$tool" || true)
+  if [ -n "$src" ]; then ln -sf "$src" "$preflight_path/$tool"; fi
+done
+set +e
+pf_out=$(PATH="$preflight_path:/usr/bin:/bin" \
+         BOOTSTRAP_MERGEPATH_ROOT="$FAKE_MP" \
+         BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+         BOOTSTRAP_AUTO_CONFIRM=1 \
+         BOOTSTRAP_AUTO_PROMPT=skip \
+         "$SCRIPT" my-new-repo \
+           --target-dir "$preflight_target" \
+           --description d --visibility private \
+           --firebase none --codex-app n --project new --dry-run 2>&1)
+pf_ec=$?
+set -e
+[ "$pf_ec" -ne 0 ] \
+  && pass "wizard preflight rejects missing yq (rc=$pf_ec)" \
+  || fail "wizard should reject missing yq; got rc=$pf_ec, out: $pf_out"
+echo "$pf_out" | grep -q "missing required dependency: yq" \
+  && pass "wizard preflight emits 'missing required dependency: yq' diagnostic" \
+  || fail "expected 'missing required dependency: yq'; got: $pf_out"
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"

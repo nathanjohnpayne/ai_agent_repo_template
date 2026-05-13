@@ -325,13 +325,37 @@ preflight() {
   # 1. Required CLI tools on PATH. Tests may set BOOTSTRAP_SKIP_TOOL_CHECK=1
   #    to bypass this (e.g., a CI runner that doesn't have firebase /
   #    gcloud installed but is still exercising the wizard's flag parser).
+  #
+  #    `yq` is required by:
+  #      - stage B's `bootstrap::_clean_repo_template_yml` (drops
+  #        mergepath-specific .repo-template.yml entries before
+  #        substitution renames the keys to e.g. `<new-repo>_playground`
+  #        — see Codex round 3 P1 on #233);
+  #      - rsync also propagates `.mergepath-sync.yml` which downstream
+  #        sync tooling parses via yq.
+  #    Treating a missing yq as a soft warning inside the stage was
+  #    unsafe: the stage would return 0 + record completion and ship
+  #    a target with stale playground metadata.
+  #
+  #    `rsync` is required by stage B's `_rsync_template`. Preinstalled
+  #    on macOS and most Linux distros, but we gate explicitly so a
+  #    minimal CI image fails preflight instead of failing mid-stage.
   if [ "${BOOTSTRAP_SKIP_TOOL_CHECK:-0}" != "1" ]; then
-    for tool in gh op git; do
+    for tool in gh op git yq rsync; do
       if ! command -v "$tool" >/dev/null 2>&1; then
         bootstrap::wizard_err "missing required dependency: $tool"
         violations=$((violations + 1))
       fi
     done
+    # mikefarah/yq vs. kislyuk/yq mismatch detection. The latter is a
+    # Python wrapper around jq with a completely different syntax;
+    # accepting it here would surface as a cryptic parse error
+    # downstream. Mirror the check sync-to-downstream.sh runs.
+    if command -v yq >/dev/null 2>&1 \
+         && ! yq --version 2>&1 | grep -q "mikefarah/yq"; then
+      bootstrap::wizard_err "detected non-mikefarah yq (yq --version: $(yq --version 2>&1 | head -1)); the bootstrap wizard requires the Go binary from brew install yq"
+      violations=$((violations + 1))
+    fi
     # Firebase / gcloud check is deferred to preflight_firebase_deps()
     # which runs AFTER prompts populate BOOTSTRAP_INPUT_FIREBASE. Codex
     # P1 on PR #232 round 1 caught the gap: when the user hasn't
