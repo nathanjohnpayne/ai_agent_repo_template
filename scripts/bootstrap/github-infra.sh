@@ -84,11 +84,55 @@ bootstrap::stage_github_infra() {
   # (same pattern as stage B sub-#233 round 4).
   local step_rc=0
 
+  # ----- author-identity switch-around (stage scope) -----
+  # All write-path gh calls in this stage (repo create, label,
+  # collaborator invite, secret set) must run under the author
+  # identity (default nathanjohnpayne) per CLAUDE.md § Active-account
+  # convention. CodeRabbit Major on #239 round 1 caught the gap:
+  # without the wrap, every write attributed to whatever agent
+  # identity was active, breaking the audit trail.
+  #
+  # One switch-pair covers all of stage C's writes — cheaper +
+  # clearer than wrapping each call. The restore ALWAYS runs (even
+  # on stage failure), via an explicit handler at every return path.
+  #
+  # Skip via BOOTSTRAP_SKIP_AUTHOR_SWITCH=1 (tests). Also skipped in
+  # dry-run since we don't want to side-effect the keyring while
+  # printing a plan.
+  local author_identity="${BOOTSTRAP_AUTHOR_IDENTITY:-nathanjohnpayne}"
+  local prior_active=""
+  if [ "${BOOTSTRAP_SKIP_AUTHOR_SWITCH:-0}" != "1" ] \
+     && [ "${BOOTSTRAP_DRY_RUN:-0}" != "1" ]; then
+    prior_active=$(gh config get -h github.com user 2>/dev/null || echo "")
+    if [ -z "$prior_active" ]; then
+      bootstrap::warn "github-infra: could not determine prior active gh account; writes will run under whatever is currently active"
+    else
+      bootstrap::run "switch active gh account to $author_identity for stage writes" \
+        gh auth switch -u "$author_identity" || step_rc=$?
+      if [ "$step_rc" -ne 0 ]; then
+        bootstrap::err "github-infra: gh auth switch to $author_identity failed (rc=$step_rc); aborting before any writes to preserve the prior active account"
+        return "$step_rc"
+      fi
+    fi
+  fi
+
+  # Helper: run a sub-step and ALWAYS-restore prior_active on stage
+  # exit. Used by every return-on-failure path below so the keyring
+  # state never leaks past this stage.
+  bootstrap::_restore_active_if_needed() {
+    if [ -n "$prior_active" ]; then
+      bootstrap::run "restore active gh account to $prior_active" \
+        gh auth switch -u "$prior_active" \
+        || bootstrap::warn "github-infra: failed to restore active gh account to $prior_active; manual fix may be needed via 'gh auth switch -u $prior_active'"
+    fi
+  }
+
   # Step 1: create the remote + push the bootstrap commit.
   bootstrap::_create_remote_and_push \
     "$full_repo" "$visibility" "$description" "$target" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
     bootstrap::err "github-infra: gh repo create / push failed (rc=$step_rc)"
+    bootstrap::_restore_active_if_needed
     return "$step_rc"
   fi
 
@@ -96,6 +140,7 @@ bootstrap::stage_github_infra() {
   bootstrap::_seed_labels "$full_repo" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
     bootstrap::err "github-infra: label seeding failed (rc=$step_rc)"
+    bootstrap::_restore_active_if_needed
     return "$step_rc"
   fi
 
@@ -103,6 +148,7 @@ bootstrap::stage_github_infra() {
   bootstrap::_invite_reviewers "$full_repo" "$reviewers" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
     bootstrap::err "github-infra: reviewer invitations failed (rc=$step_rc)"
+    bootstrap::_restore_active_if_needed
     return "$step_rc"
   fi
 
@@ -127,6 +173,9 @@ bootstrap::stage_github_infra() {
       step_rc=0
     fi
   fi
+
+  # ----- end author-identity wrap: always-restore -----
+  bootstrap::_restore_active_if_needed
 
   bootstrap::record_stage "github-infra"
   return 0
@@ -207,10 +256,19 @@ bootstrap::_invite_reviewers() {
   local full_repo=$1 reviewers_csv=$2
   local agent login
 
-  # Split CSV into individual agent names.
-  local IFS=','
+  # Split CSV into individual agent names. Use a glob-safe split:
+  # `set -f` disables pathname expansion so an agent name that
+  # happened to contain `*` or `?` (unlikely but possible) doesn't
+  # get word-globbed into matching paths. IFS is scoped via local
+  # and restored explicitly after the split. (CodeRabbit Minor on
+  # #239 round 1 + ShellCheck SC2086 caught the unprotected split.)
+  local old_ifs="$IFS"
+  set -f
+  IFS=','
+  # shellcheck disable=SC2086 # intentional word-split under -f
   set -- $reviewers_csv
-  unset IFS
+  set +f
+  IFS="$old_ifs"
 
   for agent in "$@"; do
     agent=$(printf '%s' "$agent" | tr -d ' ')
@@ -287,18 +345,22 @@ bootstrap::_provision_reviewer_assignment_token() {
     fi
   fi
 
-  # Set the repo secret. `gh secret set` reads stdin when --body is
-  # omitted, so we pipe the PAT in to avoid putting it on the
-  # command line (where it could show in process listings + the
-  # bootstrap log transcript).
+  # Set the repo secret. `gh secret set` reads stdin only when
+  # `--body` is OMITTED entirely — passing `--body -` makes `-` the
+  # literal body value (the dash isn't a stdin sentinel for gh's
+  # secret subcommand). Codex P1 on #239 round 1 caught the bug:
+  # the original code piped the PAT but also set `--body -`, so the
+  # piped value was discarded and `-` would have been stored as
+  # the secret. Strip --body entirely for the stdin path.
   if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
-    bootstrap::run "set REVIEWER_ASSIGNMENT_TOKEN secret" \
-      gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" --body "<redacted-len=${#pat}>"
+    bootstrap::run "set REVIEWER_ASSIGNMENT_TOKEN secret (stdin pipe; len=${#pat})" \
+      gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo"
     return 0
   fi
-  printf '%s' "$pat" | gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" --body - >&2
+  printf '%s' "$pat" | gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" >&2
   local set_rc=$?
   if [ "$set_rc" -ne 0 ]; then
+    bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: gh secret set failed (rc=$set_rc)"
     return "$set_rc"
   fi
   bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN set on $full_repo (len=${#pat})"
@@ -314,6 +376,11 @@ bootstrap::_provision_llm_secrets() {
     "ANTHROPIC_API_KEY:Anthropic API key for Claude calls (sk-ant-...)"
     "OPENAI_API_KEY:OpenAI API key for Codex / Cursor calls (sk-...)"
   )
+
+  # Accumulate failure across the loop so a single LLM secret failure
+  # doesn't abort the rest, but the function still returns non-zero
+  # for the caller's accounting (CodeRabbit Major on #239 round 1).
+  local any_fail=0
 
   local secret
   for secret in "${llm_secrets[@]}"; do
@@ -335,7 +402,18 @@ bootstrap::_provision_llm_secrets() {
       bootstrap::log "LLM secret $name: skipped"
       continue
     fi
-    printf '%s' "$value" | gh secret set "$name" --repo "$full_repo" --body - >&2
+    # Same --body fix as REVIEWER_ASSIGNMENT_TOKEN: omit --body so
+    # gh reads from stdin instead of storing literal `-`. Codex P1
+    # on #239 round 1 caught the bug for both secret paths.
+    local set_rc=0
+    printf '%s' "$value" | gh secret set "$name" --repo "$full_repo" >&2 || set_rc=$?
+    if [ "$set_rc" -ne 0 ]; then
+      bootstrap::warn "LLM secret $name: gh secret set failed (rc=$set_rc); continuing with remaining secrets"
+      any_fail=1
+      continue
+    fi
     bootstrap::log "$name set on $full_repo (len=${#value})"
   done
+
+  return "$any_fail"
 }

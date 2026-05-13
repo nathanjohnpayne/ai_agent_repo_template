@@ -205,9 +205,17 @@ for agent in claude cursor codex; do
 done
 
 # --- assertion 4: REVIEWER_ASSIGNMENT_TOKEN secret set via inline PAT ---
-grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/test-repo --body -$" "$SHIM_LOG" \
-  && pass "REVIEWER_ASSIGNMENT_TOKEN secret set via stdin pipe" \
+# The `--body -` arg was removed in round 1 because gh treats it as
+# a literal value, not a stdin signal — stdin is only consumed when
+# --body is OMITTED entirely. Codex P1 on #239 caught this.
+grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/test-repo\$" "$SHIM_LOG" \
+  && pass "REVIEWER_ASSIGNMENT_TOKEN secret set via stdin (no --body arg)" \
   || fail "REVIEWER_ASSIGNMENT_TOKEN secret-set not logged correctly; log: $(grep secret "$SHIM_LOG")"
+# Regression guard: --body must NOT appear in the recorded secret-set
+# command (would mean the bug regressed).
+grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN .* --body" "$SHIM_LOG" \
+  && fail "secret set command carries --body (regression of Codex #239 P1 line 299)" \
+  || pass "secret set command omits --body (Codex #239 P1 fixed)"
 
 # --- assertion 5: stage records completion in state file ---
 [ -f "$TARGET/.bootstrap-state" ] \
@@ -227,6 +235,38 @@ awk '
 ' "$TARGET/.bootstrap-state" \
   && pass "template-mirror recorded before github-infra in state file" \
   || fail "state-file ordering broken"
+
+# --- assertion 7a: author-identity switch-around wraps stage writes
+# (CodeRabbit Major on #239 round 1). The stage must switch to
+# nathanjohnpayne before any writes, run all the writes, and switch
+# back after — exactly once per stage run.
+# ---------------------------------------------------------------------------
+auth_switches=$(grep -c "^gh auth switch -u" "$SHIM_LOG")
+# Expect TWO switches: one TO nathanjohnpayne, one back to the prior
+# (nathanpayne-claude per the shim's gh config get response).
+[ "$auth_switches" -eq 2 ] \
+  && pass "stage performs exactly 2 auth switches (to author, back to prior)" \
+  || fail "expected 2 auth switches, got $auth_switches; log: $(grep 'auth switch' "$SHIM_LOG")"
+grep -q "^gh auth switch -u nathanjohnpayne\$" "$SHIM_LOG" \
+  && pass "stage switches to nathanjohnpayne for writes" \
+  || fail "no switch to nathanjohnpayne; log: $(grep 'auth switch' "$SHIM_LOG")"
+grep -q "^gh auth switch -u nathanpayne-claude\$" "$SHIM_LOG" \
+  && pass "stage restores prior active gh account after writes" \
+  || fail "no switch back to nathanpayne-claude; log: $(grep 'auth switch' "$SHIM_LOG")"
+# Ordering: switch-to-nathanjohnpayne must come BEFORE any write call,
+# and switch-back must come AFTER. Use awk to pin the line numbers.
+awk '
+  /^gh auth switch -u nathanjohnpayne$/    { saw_to = NR }
+  /^gh repo create /                       { saw_write = NR }
+  /^gh auth switch -u nathanpayne-claude$/ { saw_back = NR }
+  END {
+    if (!saw_to || !saw_write || !saw_back) { print "missing markers"; exit 1 }
+    if (saw_to > saw_write) { print "switch-to must precede writes"; exit 1 }
+    if (saw_write > saw_back) { print "switch-back must follow writes"; exit 1 }
+  }
+' "$SHIM_LOG" \
+  && pass "auth switch-around ordering correct (to → writes → back)" \
+  || fail "auth switch-around ordering wrong"
 
 # --- assertion 7: secret skip works with BOOTSTRAP_SKIP_SECRETS=1 ---
 : >"$SHIM_LOG"
