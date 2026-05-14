@@ -1,0 +1,27 @@
+{
+  "description": "Round-1 CHANGES_REQUESTED on stale SHA from reviewer A + round-2 APPROVED on HEAD from reviewer B (the PR #256 scenario from #259). No live disagreement.",
+  "headSha": "abc222headcurrentsha22222222222222222222",
+  "hasLabel": false,
+  "reviewerAccounts": [
+    "nathanpayne-claude",
+    "nathanpayne-codex",
+    "nathanpayne-cursor"
+  ],
+  "expected_decision": "noop",
+  "reviews": [
+    {
+      "id": 1,
+      "state": "CHANGES_REQUESTED",
+      "commit_id": "fb0821000000000000000000000000000000fb08",
+      "submitted_at": "2026-05-10T10:00:00Z",
+      "user": { "login": "nathanpayne-codex" }
+    },
+    {
+      "id": 2,
+      "state": "APPROVED",
+      "commit_id": "abc222headcurrentsha22222222222222222222",
+      "submitted_at": "2026-05-12T11:00:00Z",
+      "user": { "login": "nathanpayne-cursor" }
+    }
+  ]
+}

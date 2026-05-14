@@ -21,6 +21,7 @@ Local scripts:
 - `check_eslint_config_present` — enforces the ESLint flat-config policy (`rules/repo_rules.md` § ESLint policy). If a root `package.json` exists, `eslint.config.js` must exist at the repo root and parse under `node --check`. Repos without a root `package.json` (mergepath itself) pass via an early-out. See #250.
 - `check_eslint_config_policy` — runs `tests/test_eslint_policy_check.sh` (unit tests for the policy check).
 - `check_sweep_unresolved_feedback` — runs unit tests for the #236 weekly feedback sweep pipeline (`scripts/sweep-unresolved-feedback/enumerate.sh`, `render.sh`). PATH-shims `gh` against synthetic fixtures; hermetic.
+- `check_disagreement_detector` — runs `tests/test_disagreement_detector.sh` against fixtures under `scripts/ci/fixtures/disagreement-detector/`. Exercises `scripts/disagreement-detector.js`, the decision function extracted from `.github/workflows/agent-review.yml`'s `detect-disagreement` job so the workflow and the test share one implementation. Asserts the workflow still `require()`s the module. See #259.
 
 Inline in `repo_lint.yml` (no local script):
 

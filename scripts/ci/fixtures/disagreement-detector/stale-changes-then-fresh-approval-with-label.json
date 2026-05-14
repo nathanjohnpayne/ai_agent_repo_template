@@ -1,0 +1,27 @@
+{
+  "description": "Same as stale-changes-then-fresh-approval but label was previously applied — should remove (auto-clear after the disagreement is resolved on a fresher HEAD).",
+  "headSha": "abc222headcurrentsha22222222222222222222",
+  "hasLabel": true,
+  "reviewerAccounts": [
+    "nathanpayne-claude",
+    "nathanpayne-codex",
+    "nathanpayne-cursor"
+  ],
+  "expected_decision": "remove",
+  "reviews": [
+    {
+      "id": 1,
+      "state": "CHANGES_REQUESTED",
+      "commit_id": "fb0821000000000000000000000000000000fb08",
+      "submitted_at": "2026-05-10T10:00:00Z",
+      "user": { "login": "nathanpayne-codex" }
+    },
+    {
+      "id": 2,
+      "state": "APPROVED",
+      "commit_id": "abc222headcurrentsha22222222222222222222",
+      "submitted_at": "2026-05-12T11:00:00Z",
+      "user": { "login": "nathanpayne-cursor" }
+    }
+  ]
+}
