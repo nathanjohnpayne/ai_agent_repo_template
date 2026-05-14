@@ -20,6 +20,10 @@
 #   8. Malformed PR_NUMBER → exit 2.
 #   9. Missing GH_TOKEN → exit 2.
 #   10. >100 review threads → exit 2 (pagination not supported in v1).
+#   11. enabled knob absent from config → default false → exit 0.
+#   12. PR_NUMBER + REPO supplied via env (no positional args) →
+#       same behavior as positional. Covers the scheduled-sweep /
+#       workflow_dispatch invocation shape added in #257.
 #
 # Bash 3.2 portable.
 
@@ -546,6 +550,61 @@ if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 0"; then
   pass "missing p1_gate block → defaults to disabled → exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 12: PR_NUMBER + REPO via env (no positional args). Covers the
+#          scheduled-sweep / workflow_dispatch invocation shape.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 12: PR_NUMBER + REPO via env"
+SCRATCH=$(make_scratch_with_config true)
+HEAD_SHA="abc123def456"
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_THREADS=$(make_threads_fixture '[]')
+set +e
+OUT=$(
+  cd "$SCRATCH" && \
+    PATH="$STUB_DIR:$PATH" \
+    GH_TOKEN="dummy-token" \
+    GH_CALLS_LOG="$WORKDIR/gh-calls.log" \
+    PR_NUMBER=99 \
+    REPO=owner/repo \
+    FIXTURE_PR="$FIXTURE_PR" \
+    FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+    FIXTURE_THREADS="$FIXTURE_THREADS" \
+    "$SCRIPT" 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 0"; then
+  pass "env-only PR_NUMBER + REPO → exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 13: Missing PR_NUMBER entirely (no positional, no env) → exit 2.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 13: missing PR_NUMBER (positional + env both unset)"
+SCRATCH=$(make_scratch_with_config true)
+set +e
+OUT=$(
+  cd "$SCRATCH" && \
+    PATH="$STUB_DIR:$PATH" \
+    GH_TOKEN="dummy-token" \
+    "$SCRIPT" 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && echo "$OUT" | grep -qi "PR_NUMBER required"; then
+  pass "missing PR_NUMBER → exit 2"
+else
+  fail "expected rc=2 with 'PR_NUMBER required'; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 

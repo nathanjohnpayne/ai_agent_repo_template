@@ -12,14 +12,22 @@
 #
 # Usage:
 #   scripts/codex-p1-gate.sh <PR_NUMBER> [REPO]
+#   scripts/codex-p1-gate.sh                       # env-only mode
 #
 # Arguments:
-#   PR_NUMBER  Required. The pull request number (integer).
-#   REPO       Optional. "owner/repo". Defaults to the current repo via
-#              `gh repo view`.
+#   PR_NUMBER  Required (positional or via $PR_NUMBER env). Integer.
+#   REPO       Optional. "owner/repo". Falls back to $REPO env, then
+#              to the current repo via `gh repo view`.
 #
 # Environment:
 #   GH_TOKEN   Required. Needs pull_requests:read.
+#   PR_NUMBER  Optional fallback for the positional arg. The
+#              scheduled-sweep job in .github/workflows/codex-p1-
+#              gate.yml passes PR_NUMBER positionally per iteration,
+#              but other callers (workflow_dispatch, ad-hoc CLI use,
+#              CI matrix jobs) may find it easier to set it as env.
+#   REPO       Optional fallback for the positional REPO arg. Same
+#              motivation as PR_NUMBER above.
 #
 # Algorithm:
 #   1. Read .github/review-policy.yml `codex.p1_gate.enabled`. If false
@@ -73,18 +81,26 @@ set -euo pipefail
 
 # --- argument parsing -------------------------------------------------------
 
-if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "Usage: $0 <PR_NUMBER> [REPO]" >&2
+if [ $# -gt 2 ]; then
+  echo "Usage: $0 [PR_NUMBER] [REPO]" >&2
+  echo "       PR_NUMBER and REPO may also be set via env." >&2
   exit 2
 fi
 
-PR_NUMBER=$1
+# Positional args take precedence; env fallbacks support the
+# workflow_dispatch / scheduled-sweep paths where it's more
+# ergonomic to set env than to build a positional arg list.
+PR_NUMBER=${1:-${PR_NUMBER:-}}
+if [ -z "$PR_NUMBER" ]; then
+  echo "ERROR: PR_NUMBER required (positional arg or \$PR_NUMBER env)" >&2
+  exit 2
+fi
 if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
   echo "ERROR: PR_NUMBER must be an integer; got '$PR_NUMBER'" >&2
   exit 2
 fi
 
-REPO=${2:-}
+REPO=${2:-${REPO:-}}
 if [ -z "$REPO" ]; then
   REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
   if [ -z "$REPO" ]; then

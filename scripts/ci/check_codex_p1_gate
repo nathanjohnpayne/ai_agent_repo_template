@@ -48,21 +48,52 @@ if [ ! -f "$WORKFLOW" ]; then
   FAILED=1
 fi
 
-# Workflow must subscribe to the events required for UI-override
-# re-runs to fire the gate (#257). pull_request_review only covers
-# review-submission/edit/dismiss webhooks — clicking "Resolve
-# conversation" on a P1 thread dispatches the
-# pull_request_review_thread webhook (`resolved` / `unresolved`),
-# which requires a dedicated trigger. Without it, the gate stays red
-# after a UI resolve until someone pushes or manually re-runs jobs.
+# Workflow trigger shape (#257 codex CR). GitHub Actions does NOT
+# document `pull_request_review_thread` as a workflow trigger — it
+# exists as a webhook event for Apps, but the Actions
+# events-that-trigger-workflows reference omits it, and adding it to
+# `on:` is a no-op (the gate would NEVER re-fire on UI resolves).
+# The corrected shape is:
+#   - pull_request + pull_request_review + pull_request_review_comment
+#     for the event-driven path.
+#   - schedule (cron) as the safety net for UI "Resolve conversation"
+#     clicks, which produce no Actions event.
+# Additionally, the workflow MUST NOT list pull_request_review_thread —
+# its presence is misleading (suggests we have UI-resolve coverage
+# when we don't) and is the regression this PR closes.
 if [ -f "$WORKFLOW" ]; then
-  for trigger in pull_request pull_request_review pull_request_review_comment pull_request_review_thread; do
+  for trigger in pull_request pull_request_review pull_request_review_comment schedule; do
     if ! grep -qE "^[[:space:]]*${trigger}:" "$WORKFLOW"; then
       echo "FAIL: $WORKFLOW missing required trigger: $trigger"
-      echo "      The gate must fire on push, review submission, inline-comment, AND thread-resolution events."
+      echo "      The gate must fire on push, review submission, inline-comment, AND on a periodic schedule (UI-resolve safety net)."
       FAILED=1
     fi
   done
+
+  # Forbid the misleading pull_request_review_thread trigger.
+  if grep -qE "^[[:space:]]*pull_request_review_thread:" "$WORKFLOW"; then
+    echo "FAIL: $WORKFLOW lists pull_request_review_thread as a workflow trigger."
+    echo "      That event is a webhook payload for GitHub Apps, NOT a documented Actions workflow trigger."
+    echo "      See https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows"
+    echo "      Use schedule (cron) for the UI-resolve safety net instead. See PR #257."
+    FAILED=1
+  fi
+
+  # Schedule cron must be present in the on: block. Loose check —
+  # the value just has to mention */N or a cron string under
+  # schedule:.
+  if ! awk '
+    /^on:/ {in_on=1; next}
+    in_on && /^[^[:space:]#]/ {in_on=0}
+    in_on && /^[[:space:]]+schedule:/ {in_sched=1; next}
+    in_sched && /^[[:space:]]+- cron:/ {found=1; exit}
+    in_sched && /^[[:space:]]+[a-z]/ {in_sched=0}
+    END {exit (found ? 0 : 1)}
+  ' "$WORKFLOW"; then
+    echo "FAIL: $WORKFLOW schedule: block missing a 'cron:' entry."
+    echo "      The schedule trigger needs a cron expression (e.g. '*/15 * * * *')."
+    FAILED=1
+  fi
 fi
 
 if [ "$FAILED" -ne 0 ]; then
