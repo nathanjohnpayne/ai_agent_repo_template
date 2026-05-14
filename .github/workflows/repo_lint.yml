@@ -66,6 +66,9 @@ jobs:
       - name: check_auto_clear_workflow
         run: ./scripts/ci/check_auto_clear_workflow
 
+      - name: check_sweep_unresolved_feedback
+        run: ./scripts/ci/check_sweep_unresolved_feedback
+
       - name: install_yq_for_sync_manifest
         # mikefarah/yq is needed by check_sync_manifest. Pin a recent v4
         # release; bumped opportunistically. The official ubuntu-latest

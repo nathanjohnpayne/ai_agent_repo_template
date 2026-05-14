@@ -1,0 +1,136 @@
+name: Weekly unresolved-feedback sweep
+
+# Runs the unresolved-feedback enumeration + rollup pipeline weekly.
+# Closes the 2026-05-13 toil that produced #234 (209 backlogged
+# review threads across 9 repos). See #236 for the full design.
+#
+# Auth model:
+#   - The enumeration READS pull-request data from every target repo
+#     in scripts/sweep-unresolved-feedback/target-repos.txt. The default
+#     GITHUB_TOKEN only has access to THIS repo, so the workflow needs
+#     a cross-repo PAT for the read step. We use
+#     secrets.REVIEWER_ASSIGNMENT_TOKEN (the nathanpayne-claude PAT
+#     already wired for cross-repo writes elsewhere).
+#   - The rollup writes to this repo only (issue create / comment).
+#     GITHUB_TOKEN would technically work, but using the same PAT
+#     keeps the workflow self-consistent and lets the issue byline
+#     show the agent identity instead of `github-actions[bot]`.
+#
+# Idempotency: render.sh detects the existing rollup issue by label +
+# title prefix and either no-ops, updates the body, or posts a delta
+# comment. Re-running on the same day produces no new noise.
+
+on:
+  schedule:
+    # Mondays 09:00 UTC. Picked to land before the human's weekly
+    # planning window. Cron is UTC; cron-cron syntax.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'Closed-PR lookback window (days)'
+        required: false
+        default: '90'
+
+permissions:
+  # Issue create + comment on THIS repo. The cross-repo READS use the
+  # PAT, not GITHUB_TOKEN, so we don't need to widen this further.
+  contents: read
+  issues: write
+
+jobs:
+  sweep:
+    name: Enumerate + render rollup
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Ensure jq + gh present
+        run: |
+          for dep in gh jq; do
+            if ! command -v "$dep" >/dev/null 2>&1; then
+              echo "ERROR: $dep not installed on runner" >&2
+              exit 1
+            fi
+          done
+
+      - name: Enumerate unresolved threads
+        env:
+          # Cross-repo READ path. REVIEWER_ASSIGNMENT_TOKEN is the
+          # nathanpayne-claude PAT — see CLAUDE.md § 1Password Reviewer
+          # PAT Lookup. Required-secrets check happens before the
+          # script is invoked; if missing, fail loudly so a silent
+          # no-results sweep never gets confused with "all clean".
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          SWEEP_LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '90' }}
+          SWEEP_OUTPUT: ${{ github.workspace }}/findings.ndjson
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN secret is empty. Sweep cannot run without cross-repo read access." >&2
+            echo "       Set the secret in repo Settings → Secrets and variables → Actions." >&2
+            exit 1
+          fi
+          chmod +x scripts/sweep-unresolved-feedback/enumerate.sh
+          ./scripts/sweep-unresolved-feedback/enumerate.sh
+
+      - name: Report enumeration size
+        run: |
+          if [ -f findings.ndjson ]; then
+            echo "Enumerated $(wc -l < findings.ndjson | tr -d ' ') findings"
+            head -3 findings.ndjson || true
+          else
+            echo "WARN: findings.ndjson not produced"
+          fi
+
+      - name: Render + post rollup
+        env:
+          # Issue create/comment writes here. Using REVIEWER_ASSIGNMENT_TOKEN
+          # so the byline matches the read step. GITHUB_TOKEN would
+          # also work for the same repo but byline would be
+          # github-actions[bot].
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+        run: |
+          chmod +x scripts/sweep-unresolved-feedback/render.sh
+          ./scripts/sweep-unresolved-feedback/render.sh findings.ndjson
+
+      - name: Upload enumeration as artifact (debug aid)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sweep-findings-${{ github.run_id }}
+          path: findings.ndjson
+          if-no-files-found: ignore
+          retention-days: 14
+
+  notify-on-failure:
+    name: Open issue on workflow failure
+    needs: sweep
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Open failure-tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create \
+            --title "Weekly feedback sweep workflow failed ($(date -u '+%Y-%m-%d'))" \
+            --label automation,post-review \
+            --body "$(cat <<EOF
+          The scheduled \`weekly-feedback-sweep\` workflow failed.
+
+          Run: ${RUN_URL}
+
+          The sweep is the defense-in-depth catch-net for review
+          feedback that slipped past the merge gate (#236). A failure
+          here means the rollup will go stale; please diagnose
+          before next Monday.
+          EOF
+          )"
