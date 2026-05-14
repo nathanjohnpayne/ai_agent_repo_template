@@ -17,6 +17,25 @@ flag the conflict before proceeding.
 - No new top-level directories without justification documented in
   AGENTS.md or a plans/ entry.
 
+## ESLint policy
+
+Any repo with a root `package.json` MUST ship an `eslint.config.js`
+flat config at the repo root with at least the `@eslint/js`
+recommended ruleset, plus framework plugins appropriate to the stack
+(e.g., `typescript-eslint` for TypeScript, `eslint-plugin-astro` for
+Astro, `eslint-plugin-react` + `eslint-plugin-react-hooks` for React).
+
+Repos without a root `package.json` (Mergepath itself is shell-only,
+for example) are exempt. The CI check
+(`scripts/ci/check_eslint_config_present`) early-outs with a
+not-applicable log line in that case.
+
+Use the flat config format (`eslint.config.js`); legacy
+`.eslintrc.*` formats do not satisfy this rule. A starter config that
+covers JS + TS + Astro + React lives at `examples/eslint.config.js`.
+See `docs/agents/code-modification-rules.md` § ESLint flat-config
+policy for the rationale and the per-framework setup notes.
+
 ## Forbidden Patterns
 
 - Never push directly to `main`. All changes must go through a
@@ -45,3 +64,5 @@ All checks must pass before merge.
 - check_review_policy_exists (inline in repo_lint.yml): .github/review-policy.yml and REVIEW_POLICY.md must both exist
 - check_codex_scripts: `scripts/codex-review-request.sh` and `scripts/codex-review-check.sh` must exist and be executable in every repo. Required for `CLAUDE.md` step 8 Phase 4a (automated external review via the OpenAI Codex GitHub App) — missing either script silently forces callers to Phase 4b fallback.
 - check_gh_as_author: `tests/test_gh_as_author.sh` and `tests/test_gh_pr_guard.sh` must exist and pass. Covers the #241 wrapper (`scripts/gh-as-author.sh`) and the identity-check addition to `scripts/hooks/gh-pr-guard.sh` that prevent the gh keyring active-identity glitch from landing a PR under the wrong account.
+- check_eslint_config_present: enforces the ESLint policy above. If `package.json` exists at the repo root, `eslint.config.js` must exist at the repo root and parse cleanly under `node --check`. Repos without a root `package.json` pass with a log line.
+- check_eslint_config_policy: runs `tests/test_eslint_policy_check.sh` — unit tests for the policy check itself.
