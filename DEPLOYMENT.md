@@ -69,9 +69,16 @@ The full bootstrap loop runs across each consumer repo. Current consumers:
 Run the bootstrap script across all of them:
 
 ```bash
-cd ~/Documents/GitHub
+# Resolve the repo list FIRST (while pwd is anywhere), THEN cd. The
+# awk lookup must point at mergepath's DEPLOYMENT.md explicitly —
+# `cd ~/Documents/GitHub` doesn't put us inside mergepath, so a bare
+# `DEPLOYMENT.md` arg would silently expand to nothing and the loop
+# would no-op. See #252 (Codex P1).
+repos=$(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' \
+        ~/Documents/GitHub/mergepath/DEPLOYMENT.md | grep '^- ' | sed 's/^- //')
 
-for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' DEPLOYMENT.md | grep '^- ' | sed 's/^- //'); do
+cd ~/Documents/GitHub
+for repo in $repos; do
   git clone "https://github.com/nathanjohnpayne/$repo.git" 2>/dev/null || (cd "$repo" && git pull)
   cd "$repo"
   ./scripts/bootstrap.sh    # restores .env.local from 1Password via op inject
@@ -90,7 +97,10 @@ The bootstrap script for each repo:
 # Quick check that each repo's local config was restored.
 # Iterates over the consumer list defined above (§ 4). Repos that don't
 # carry .env files no-op via the fallback echo.
-for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' DEPLOYMENT.md | grep '^- ' | sed 's/^- //'); do
+# Explicit path to mergepath/DEPLOYMENT.md — pwd may not be the
+# mergepath repo (see #252 Codex P1).
+for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' \
+              ~/Documents/GitHub/mergepath/DEPLOYMENT.md | grep '^- ' | sed 's/^- //'); do
   echo "=== $repo ==="
   ls ~/Documents/GitHub/$repo/.env* 2>/dev/null || echo "  (no env files expected)"
 done
@@ -107,8 +117,12 @@ When you return from a temporary machine, tell your agent:
 ### 1. On the temporary machine (before leaving)
 
 ```bash
+# Resolve repo list before cd-ing away from mergepath (see #252 Codex P1).
+repos=$(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' \
+        ~/Documents/GitHub/mergepath/DEPLOYMENT.md | grep '^- ' | sed 's/^- //')
+
 cd ~/Documents/GitHub
-for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' DEPLOYMENT.md | grep '^- ' | sed 's/^- //'); do
+for repo in $repos; do
   cd "$repo"
   # Push any local config changes to 1Password
   ./scripts/bootstrap.sh --sync
@@ -121,8 +135,12 @@ done
 ### 2. On the main machine (when you return)
 
 ```bash
+# Resolve repo list before cd-ing away from mergepath (see #252 Codex P1).
+repos=$(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' \
+        ~/Documents/GitHub/mergepath/DEPLOYMENT.md | grep '^- ' | sed 's/^- //')
+
 cd ~/Documents/GitHub
-for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' DEPLOYMENT.md | grep '^- ' | sed 's/^- //'); do
+for repo in $repos; do
   cd "$repo"
   git pull                          # get code changes from the temp machine
   ./scripts/bootstrap.sh --force    # re-resolve .env.tpl from 1Password (latest values)
