@@ -4,20 +4,40 @@
 # Validates .coderabbit.yml — the CodeRabbit configuration shipped
 # with the Mergepath template and propagated to consumer repos via
 # the wizard's template-mirror bootstrap (scripts/bootstrap/
-# firebase-and-codereview.sh). See #237 for the nit-collapse change
-# this check enforces.
+# template-mirror.sh). See #237 for the nit-collapse change this
+# check enforces.
 #
-# Checks:
+# Scoping (per Codex P2 on #256):
+#
+#   This check enforces reviews.profile == "chill" — but the
+#   "override per-repo" guarantee documented in #237 requires that
+#   consumers be free to set reviews.profile: assertive locally
+#   without their CI also failing. Because template-mirror copies
+#   .github/workflows/repo_lint.yml verbatim into newly bootstrapped
+#   consumer repos, the gate would otherwise fire on every consumer
+#   too. The fix is to only enforce the profile value in the
+#   Mergepath template repo itself; consumers retain the parse +
+#   existence checks (so a malformed .coderabbit.yml still fails
+#   their CI) but their profile choice is their own.
+#
+# Checks (all repos):
 #
 #   1. .coderabbit.yml exists at repo root.
 #   2. The file parses as YAML.
+#
+# Additional check (Mergepath template repo only):
+#
 #   3. reviews.profile is set to "chill" — switching to "assertive"
 #      re-enables 🧹 Nitpick comments per CodeRabbit's documented
 #      profile semantics, which #237 explicitly disabled at the
-#      template level. A consumer repo may still override this
-#      locally (the template-mirror only seeds the file on first
-#      bootstrap, not on every sync wave), but the template itself
-#      must stay on chill so new repos inherit the quieter posture.
+#      template level. The template must stay on chill so new
+#      bootstrapped repos inherit the quieter posture.
+#
+# Template-repo detection prefers CI signals (GITHUB_REPOSITORY,
+# which Actions always sets, matched against `*/mergepath`) and
+# falls back to the origin remote URL for local runs. An override
+# env var (MERGEPATH_TEMPLATE_CHECK=force|skip) is provided for
+# tests and edge cases.
 #
 # This check is read-only and does not contact CodeRabbit's API.
 
@@ -41,6 +61,58 @@ if ! yq '.' "$CONFIG" >/dev/null 2>&1; then
   echo "FAIL: .coderabbit.yml does not parse as YAML"
   yq '.' "$CONFIG" || true
   exit 1
+fi
+
+# --- template-repo detection ------------------------------------------------
+#
+# Returns 0 if this repo is the Mergepath template (where the profile
+# gate applies), 1 otherwise. Order of precedence:
+#
+#   1. MERGEPATH_TEMPLATE_CHECK=force  → treat as template (run gate)
+#   2. MERGEPATH_TEMPLATE_CHECK=skip   → treat as consumer (skip gate)
+#   3. GITHUB_REPOSITORY (CI)          → match *.mergepath suffix
+#   4. git remote get-url origin       → match mergepath repo basename
+#   5. unknown                         → skip the gate (fail-open for
+#                                        the override-friendly direction)
+#
+# The basename match accepts both `mergepath` and `mergepath.git` so
+# SSH-style remotes (`git@github.com:OWNER/mergepath.git`) work.
+is_mergepath_template() {
+  case "${MERGEPATH_TEMPLATE_CHECK:-}" in
+    force) return 0 ;;
+    skip)  return 1 ;;
+  esac
+
+  if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+    case "$GITHUB_REPOSITORY" in
+      */mergepath) return 0 ;;
+      *)           return 1 ;;
+    esac
+  fi
+
+  local remote_url
+  if remote_url=$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null); then
+    # Strip a trailing .git, then take the last path component. Works
+    # for both https://host/owner/mergepath.git and
+    # git@host:owner/mergepath.git.
+    local basename_no_git="${remote_url%.git}"
+    basename_no_git="${basename_no_git##*/}"
+    basename_no_git="${basename_no_git##*:}"
+    case "$basename_no_git" in
+      mergepath) return 0 ;;
+      *)         return 1 ;;
+    esac
+  fi
+
+  # No CI env var, no origin remote. Fail-open: skip the gate. A
+  # malformed YAML or missing file still failed the earlier checks;
+  # only the profile-value enforcement is template-scoped.
+  return 1
+}
+
+if ! is_mergepath_template; then
+  echo "check_coderabbit_config: PASS (parse OK; profile gate skipped — not the Mergepath template repo)"
+  exit 0
 fi
 
 profile=$(yq -r '.reviews.profile // ""' "$CONFIG")
