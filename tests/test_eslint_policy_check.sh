@@ -15,6 +15,22 @@
 #      parse-error tempfile (no fixed /tmp path)     → both fail with
 #                                                       distinct error
 #                                                       output
+#   7. package.json + config that ONLY references
+#      `@eslint/js` and `.configs.recommended` from
+#      inside a `//` comment                         → exit 1 (fail)
+#                                                       — codex CR
+#                                                       comment-bypass
+#   8. package.json + config that references the
+#      tokens from inside a `/* … */` block comment  → exit 1 (fail)
+#                                                       — codex CR
+#                                                       block-comment
+#                                                       bypass
+#   9. package.json + config that imports `@eslint/js`
+#      and spreads `js.configs.recommended` in the
+#      exported array (no comment noise)             → exit 0 (pass)
+#                                                       — sanity case
+#                                                       for the
+#                                                       comment-stripper
 #
 # We invoke the check against a synthetic REPO_ROOT by symlinking the
 # real script into a temp tree — the script computes REPO_ROOT from
@@ -208,6 +224,97 @@ if [ -e "${TMPDIR:-/tmp}/eslint_config_parse.err" ]; then
   fail "fixed-name tempfile ${TMPDIR:-/tmp}/eslint_config_parse.err still in use"
 else
   pass "no fixed-name parse-error tempfile leftover"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 7: package.json + parseable eslint.config.js where the @eslint/js
+# import and the `.configs.recommended` token appear ONLY inside `//`
+# line comments → fail. Regression guard for the codex CR comment-
+# bypass on #253: before the fix, the grep matched comment text and
+# returned PASS, even though the exported config didn't actually use
+# the recommended ruleset.
+# ---------------------------------------------------------------------------
+T7="$WORKDIR/case7-pkg-comment-bypass-line"
+make_fake_repo "$T7"
+echo '{"name":"t7","version":"0.0.0","type":"module"}' >"$T7/package.json"
+cat >"$T7/eslint.config.js" <<'EOF'
+// Reproduces the codex CR comment-bypass: tokens appear ONLY in
+// comments. The exported config does not actually apply the
+// recommended ruleset.
+// import js from "@eslint/js";
+// using ...tseslint.configs.recommended in the future
+export default [
+  {
+    rules: {
+      "no-unused-vars": "warn",
+    },
+  },
+];
+EOF
+rc=$(run_check "$T7")
+if [ "$rc" -eq 1 ] && grep -q "@eslint/js recommended" "$WORKDIR/out.txt"; then
+  pass "comment-only @eslint/js tokens (// line comments) → exits 1"
+else
+  fail "expected exit 1 + '@eslint/js recommended' message, got rc=$rc / output:"
+  sed 's/^/    /' "$WORKDIR/out.txt" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 8: same as Test 7 but the tokens are inside a `/* … */` block
+# comment. The comment-stripper must handle both line and block forms.
+# ---------------------------------------------------------------------------
+T8="$WORKDIR/case8-pkg-comment-bypass-block"
+make_fake_repo "$T8"
+echo '{"name":"t8","version":"0.0.0","type":"module"}' >"$T8/package.json"
+cat >"$T8/eslint.config.js" <<'EOF'
+/*
+ * Reproduces the codex CR bypass via block comment.
+ * import js from "@eslint/js";
+ * spreads ...tseslint.configs.recommended somewhere
+ */
+export default [
+  {
+    rules: {
+      "no-unused-vars": "warn",
+    },
+  },
+];
+EOF
+rc=$(run_check "$T8")
+if [ "$rc" -eq 1 ] && grep -q "@eslint/js recommended" "$WORKDIR/out.txt"; then
+  pass "comment-only @eslint/js tokens (/* */ block comments) → exits 1"
+else
+  fail "expected exit 1 + '@eslint/js recommended' message, got rc=$rc / output:"
+  sed 's/^/    /' "$WORKDIR/out.txt" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 9: legitimate flat config with `@eslint/js` imported and
+# `js.configs.recommended` spread in the exported array → pass. This
+# is the positive sanity case for the comment-stripper — confirms the
+# stripper doesn't accidentally strip real code positions when the
+# file legitimately uses the policy floor.
+# ---------------------------------------------------------------------------
+T9="$WORKDIR/case9-pkg-real-recommended"
+make_fake_repo "$T9"
+echo '{"name":"t9","version":"0.0.0","type":"module"}' >"$T9/package.json"
+cat >"$T9/eslint.config.js" <<'EOF'
+import js from "@eslint/js";
+export default [
+  js.configs.recommended,
+  {
+    rules: {
+      "no-unused-vars": "warn",
+    },
+  },
+];
+EOF
+rc=$(run_check "$T9")
+if [ "$rc" -eq 0 ] && grep -q "PASS" "$WORKDIR/out.txt"; then
+  pass "import + js.configs.recommended spread → exits 0"
+else
+  fail "expected exit 0, got rc=$rc / output:"
+  sed 's/^/    /' "$WORKDIR/out.txt" >&2
 fi
 
 # ---------------------------------------------------------------------------
