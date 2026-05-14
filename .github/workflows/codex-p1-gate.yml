@@ -76,16 +76,16 @@ jobs:
     if: github.event_name != 'schedule'
     steps:
       - name: Checkout repo (for scripts/codex-p1-gate.sh)
+        # actions/checkout's default for pull_request events checks
+        # out the PR's HEAD ref, which is what this read-only gate
+        # wants — the gate script evolves alongside the PR diff.
+        # No `with:` block needed; actionlint/CodeRabbit rejects an
+        # empty `with:` (round-2 #257 fix).
+        # Unlike auto-clear-blocking-labels.yml (which writes labels
+        # and pins to main's TRUSTED copy to defend against a
+        # malicious PR editing the gate logic), this workflow is
+        # strictly read-only and can't be weaponized.
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          # Always run the TRUSTED copy of the gate script from the
-          # PR's HEAD ref. Unlike auto-clear-blocking-labels.yml (which
-          # writes labels and must defend against a malicious PR
-          # editing the gate logic), this workflow is strictly
-          # read-only — it can't be weaponized to escalate beyond
-          # reading public-or-permitted PR data. Pulling the PR's own
-          # version lets the gate script evolve alongside the PR diff
-          # rather than always running main's version.
 
       - name: Resolve PR number
         id: pr
