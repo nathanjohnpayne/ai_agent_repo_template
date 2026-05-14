@@ -288,6 +288,32 @@ codex:
   # See nathanjohnpayne/mergepath#218.
   allow_phase_4b_substitute: true
 
+  # Codex P1 merge gate (nathanjohnpayne/mergepath#235).
+  #
+  # When enabled, scripts/codex-p1-gate.sh runs as the required CI check
+  # `Codex P1 Gate / Codex P1 unresolved threads` and blocks merge if
+  # any Codex P1 inline-finding thread on the current HEAD is
+  # unresolved. The override path is the standard GitHub UI "Resolve
+  # conversation" button (or the GraphQL `resolveReviewThread`
+  # mutation) — same mechanism the author or any collaborator already
+  # uses to clear other review threads. Resolving a thread that
+  # legitimately doesn't apply (already-fixed in a later commit,
+  # rejected with documented rationale, moot, deferred to a follow-up
+  # issue) clears the gate.
+  #
+  # Default everywhere except mergepath: false. The narrow-start
+  # strategy of #235 enables this in mergepath first to shake out the
+  # override pattern before propagating via .mergepath-sync.yml to
+  # downstream consumers.
+  #
+  # Context: the 2026-05-13 sweep (#234) found 62 unresolved Codex P1
+  # findings sitting on closed/merged PRs across 9 repos. P1 is
+  # Codex's blocking-severity tag; 62 of them riding through to merge
+  # is direct evidence the label was advisory, not enforced. This
+  # knob flips it to enforced.
+  p1_gate:
+    enabled: true
+
 # ---------------------------------------------------------------------------
 # Phase 4b proactive triggers (#158)
 # ---------------------------------------------------------------------------

@@ -63,6 +63,7 @@ All checks must pass before merge.
 - check_duplicate_docs
 - check_review_policy_exists (inline in repo_lint.yml): .github/review-policy.yml and REVIEW_POLICY.md must both exist
 - check_codex_scripts: `scripts/codex-review-request.sh` and `scripts/codex-review-check.sh` must exist and be executable in every repo. Required for `CLAUDE.md` step 8 Phase 4a (automated external review via the OpenAI Codex GitHub App) — missing either script silently forces callers to Phase 4b fallback.
+- check_codex_p1_gate: `scripts/codex-p1-gate.sh` + `.github/workflows/codex-p1-gate.yml` + `tests/test_codex_p1_gate.sh` must exist and the fixture-driven test suite must pass. Enforces the Codex P1 unresolved-thread merge gate from #235. Gate is OFF by default (`codex.p1_gate.enabled: false`) everywhere except mergepath, which sets it `true` as the v1 narrow-start enforcement target.
 - check_gh_as_author: `tests/test_gh_as_author.sh` and `tests/test_gh_pr_guard.sh` must exist and pass. Covers the #241 wrapper (`scripts/gh-as-author.sh`) and the identity-check addition to `scripts/hooks/gh-pr-guard.sh` that prevent the gh keyring active-identity glitch from landing a PR under the wrong account.
 - check_eslint_config_present: enforces the ESLint policy above. If `package.json` exists at the repo root, `eslint.config.js` must exist at the repo root and parse cleanly under `node --check`. Repos without a root `package.json` pass with a log line.
 - check_eslint_config_policy: runs `tests/test_eslint_policy_check.sh` — unit tests for the policy check itself.

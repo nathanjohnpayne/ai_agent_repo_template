@@ -75,6 +75,9 @@ paths:
   - path: scripts/phase-4b-classifier.sh
     type: canonical
     consumers: all
+  - path: scripts/codex-p1-gate.sh
+    type: canonical
+    consumers: all
   - path: scripts/resolve-pr-threads.sh
     type: canonical
     consumers: all
@@ -109,6 +112,9 @@ paths:
     type: canonical
     consumers: all
   - path: .github/workflows/pr-audit.yml
+    type: canonical
+    consumers: all
+  - path: .github/workflows/codex-p1-gate.yml
     type: canonical
     consumers: all
 
