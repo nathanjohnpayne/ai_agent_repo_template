@@ -77,9 +77,19 @@ awk '
       dir = cur_path
       sub(/\/$/, "", dir)
       print dir "/**"
-    } else {
+    } else if (line == "canonical" || line == "templated") {
       # canonical / templated = exact file path.
       print cur_path
+    } else {
+      # Unknown type — a typo (e.g. "canoncial") or a future
+      # unsupported type. Do NOT emit it: silently widening the
+      # propagation-lane allow-list to an unvalidated path could
+      # let a PR skip external review for a path that is not
+      # guaranteed propagation surface (Codex P2 on #268). Warn
+      # loudly to stderr and drop the entry. check_sync_manifest
+      # is the hard gate that rejects unknown types outright; this
+      # is the defense-in-depth in the parser the lane trusts.
+      printf "parse_manifest_paths.sh: WARNING: dropping path %s with unknown type %s (expected canonical/kit/templated)\n", cur_path, line > "/dev/stderr"
     }
     cur_path = ""
   }

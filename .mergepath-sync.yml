@@ -122,6 +122,14 @@ paths:
   - path: tests/test_gh_as_reviewer.sh
     type: canonical
     consumers: all
+  # Pairs with scripts/workflow/verify-propagation-pr.sh (under the
+  # scripts/workflow/ kit below). The verifier is security-load-bearing
+  # for the propagation-PR review lane; its test travels with it so a
+  # consumer that runs scripts/ci/check_verify_propagation_pr exercises
+  # the matching suite. See #264 / #268.
+  - path: tests/test_verify_propagation_pr.sh
+    type: canonical
+    consumers: all
 
   # Canonical workflows — review policy + automation surfaces that
   # should be lockstep across all consumers.
