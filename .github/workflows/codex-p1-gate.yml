@@ -13,11 +13,16 @@ name: Codex P1 Gate
 # source). Downstream consumers default to false until the override
 # pattern is shaken out here (per #235's "start narrow" recommendation).
 #
-# Re-runs on every push to a PR AND on every review submission, so a
-# human who clicks "Resolve conversation" on a P1 thread sees the gate
-# go green within the next event without needing a push. The
-# pull_request_review trigger is what makes this gate UI-overrideable
-# without a force-push dance.
+# Re-runs on every push to a PR AND on every review-related event, so
+# a human who clicks "Resolve conversation" on a P1 thread sees the
+# gate go green within the next event without needing a push. The
+# pull_request_review_thread trigger (activity types `resolved` /
+# `unresolved`) is what makes UI "Resolve conversation" clicks
+# re-fire this gate — pull_request_review only fires on review
+# submissions/edits/dismissals (per GitHub's event docs), not on
+# thread-resolution webhooks. Without the dedicated trigger, the gate
+# would stay red after a reviewer cleared findings via the UI until
+# someone pushed or manually re-ran the job.
 
 on:
   pull_request:
@@ -29,6 +34,13 @@ on:
   # posts a new P1 mid-review without a fresh review-submission event.
   pull_request_review_comment:
     types: [created, edited, deleted]
+  # pull_request_review_thread fires when a review thread is resolved
+  # or unresolved via the GitHub UI. Without this, the canonical
+  # override path ("click Resolve conversation on a Codex P1 thread")
+  # would not re-fire the gate, leaving a required check stuck red
+  # even after the underlying P1 was cleared. See PR #257.
+  pull_request_review_thread:
+    types: [resolved, unresolved]
 
 permissions:
   contents: read
@@ -61,7 +73,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
-            pull_request|pull_request_review|pull_request_review_comment)
+            pull_request|pull_request_review|pull_request_review_comment|pull_request_review_thread)
               pr=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
               ;;
             *)

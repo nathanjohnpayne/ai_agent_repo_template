@@ -48,6 +48,23 @@ if [ ! -f "$WORKFLOW" ]; then
   FAILED=1
 fi
 
+# Workflow must subscribe to the events required for UI-override
+# re-runs to fire the gate (#257). pull_request_review only covers
+# review-submission/edit/dismiss webhooks — clicking "Resolve
+# conversation" on a P1 thread dispatches the
+# pull_request_review_thread webhook (`resolved` / `unresolved`),
+# which requires a dedicated trigger. Without it, the gate stays red
+# after a UI resolve until someone pushes or manually re-runs jobs.
+if [ -f "$WORKFLOW" ]; then
+  for trigger in pull_request pull_request_review pull_request_review_comment pull_request_review_thread; do
+    if ! grep -qE "^[[:space:]]*${trigger}:" "$WORKFLOW"; then
+      echo "FAIL: $WORKFLOW missing required trigger: $trigger"
+      echo "      The gate must fire on push, review submission, inline-comment, AND thread-resolution events."
+      FAILED=1
+    fi
+  done
+fi
+
 if [ "$FAILED" -ne 0 ]; then
   echo "check_codex_p1_gate: FAIL (pre-flight)"
   exit 1
