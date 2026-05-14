@@ -7,31 +7,39 @@
 # template-mirror.sh). See #237 for the nit-collapse change this
 # check enforces.
 #
-# Scoping (per Codex P2 on #256):
+# Scoping (per Codex P2 on #256 round 1, then CR on round 2):
 #
-#   This check enforces reviews.profile == "chill" — but the
-#   "override per-repo" guarantee documented in #237 requires that
-#   consumers be free to set reviews.profile: assertive locally
-#   without their CI also failing. Because template-mirror copies
-#   .github/workflows/repo_lint.yml verbatim into newly bootstrapped
-#   consumer repos, the gate would otherwise fire on every consumer
-#   too. The fix is to only enforce the profile value in the
-#   Mergepath template repo itself; consumers retain the parse +
-#   existence checks (so a malformed .coderabbit.yml still fails
-#   their CI) but their profile choice is their own.
+#   Round 1 scoped the profile-value gate to the Mergepath template
+#   repo so consumers may run reviews.profile: assertive locally
+#   without their CI failing.
 #
-# Checks (all repos):
+#   Round 2 (this revision) further scopes the existence requirement
+#   to repos that actually have CodeRabbit enabled. The sub-D
+#   wizard (PR #248) intentionally deletes .coderabbit.yml when a
+#   private consumer repo is bootstrapped — CodeRabbit's free tier is
+#   public-only, so the wizard flips `coderabbit.enabled: false` in
+#   `.github/review-policy.yml` AND removes the now-pointless file.
+#   The previous "must exist" hard requirement therefore fired on
+#   every private consumer and reported FAIL on an intentional state.
 #
-#   1. .coderabbit.yml exists at repo root.
-#   2. The file parses as YAML.
+# Existence behavior:
 #
-# Additional check (Mergepath template repo only):
+#   File present:
+#     parse the YAML; if this is the Mergepath template repo,
+#     enforce reviews.profile == "chill".
 #
-#   3. reviews.profile is set to "chill" — switching to "assertive"
-#      re-enables 🧹 Nitpick comments per CodeRabbit's documented
-#      profile semantics, which #237 explicitly disabled at the
-#      template level. The template must stay on chill so new
-#      bootstrapped repos inherit the quieter posture.
+#   File absent + review-policy.yml's `coderabbit.enabled` is false:
+#     PASS (intentional disable per sub-D's private-repo bootstrap;
+#     see #248).
+#
+#   File absent + `coderabbit.enabled` is true / unset / no policy
+#   file:
+#     FAIL (config drift on a repo that says it wants CodeRabbit;
+#     the template itself also lands here when its .coderabbit.yml
+#     has wandered off).
+#
+# The profile gate (`reviews.profile == "chill"`) only fires when
+# .coderabbit.yml exists AND this is the Mergepath template repo.
 #
 # Template-repo detection prefers CI signals (GITHUB_REPOSITORY,
 # which Actions always sets, matched against `*/mergepath`) and
@@ -45,6 +53,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONFIG="$REPO_ROOT/.coderabbit.yml"
+REVIEW_POLICY="$REPO_ROOT/.github/review-policy.yml"
 EXPECTED_PROFILE="chill"
 
 if ! command -v yq >/dev/null 2>&1; then
@@ -52,8 +61,35 @@ if ! command -v yq >/dev/null 2>&1; then
   exit 2
 fi
 
+# Resolve whether this repo expects CodeRabbit to be active. The
+# canonical signal is `.github/review-policy.yml`'s `coderabbit.enabled`
+# field — sub-D (#248) flips this to `false` and deletes .coderabbit.yml
+# in one transaction when bootstrapping a private repo. Treat the
+# absence of the policy file (or the absence of the coderabbit key)
+# as "enabled" so the template's own CI keeps catching a missing
+# .coderabbit.yml.
+#
+# Note: `yq -r '.x // "unset"' …` treats the YAML literal `false` as
+# a missing value and substitutes the default — exactly the wrong
+# behavior here. Read the key directly (yq emits `null` for missing
+# keys, `false`/`true` for the literal booleans) and pattern-match
+# the raw output instead.
+coderabbit_enabled="true"
+if [ -f "$REVIEW_POLICY" ]; then
+  raw=$(yq -r '.coderabbit.enabled' "$REVIEW_POLICY" 2>/dev/null || echo "null")
+  case "$raw" in
+    false) coderabbit_enabled="false" ;;
+    *)     coderabbit_enabled="true"  ;;
+  esac
+fi
+
 if [ ! -f "$CONFIG" ]; then
-  echo "FAIL: .coderabbit.yml is missing at repo root"
+  if [ "$coderabbit_enabled" = "false" ]; then
+    echo "check_coderabbit_config: PASS (.coderabbit.yml absent; coderabbit.enabled=false in review-policy.yml — private-repo bootstrap path per #248)"
+    exit 0
+  fi
+  echo "FAIL: .coderabbit.yml is missing at repo root (coderabbit.enabled is not false in $REVIEW_POLICY)"
+  echo "      If this repo intentionally disables CodeRabbit, set 'coderabbit.enabled: false' in .github/review-policy.yml."
   exit 1
 fi
 

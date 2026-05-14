@@ -158,7 +158,9 @@ assert_contains() {
   esac
 }
 
-# Universal: missing file fails everywhere.
+# Universal: missing file with no policy signal (or coderabbit.enabled
+# not flipped to false) fails everywhere. This covers the template's
+# own CI catching a wandered-off .coderabbit.yml.
 case_root="$WORKDIR/missing_file_fails"
 mkdir -p "$case_root/scripts/ci"
 cp "$CHECK" "$case_root/scripts/ci/check_coderabbit_config"
@@ -170,6 +172,94 @@ out=$(
     "$case_root/scripts/ci/check_coderabbit_config" 2>&1
 ) || missing_rc=$?
 assert_contains "missing_file_fails" "$missing_rc" 1 "$out" "missing at repo root"
+
+# --- Private-repo path (sub-D / #248) regression cases ---------------
+#
+# These are the cases nathanpayne-codex flagged on round 2 of #256:
+# the wizard intentionally deletes .coderabbit.yml AND flips
+# `coderabbit.enabled: false` in review-policy.yml when bootstrapping
+# a private repo. The check must read that combined state and PASS,
+# even though the file is absent.
+
+# 1. .coderabbit.yml absent + coderabbit.enabled=false → PASS.
+case_root="$WORKDIR/private_disabled_passes"
+mkdir -p "$case_root/scripts/ci" "$case_root/.github"
+cp "$CHECK" "$case_root/scripts/ci/check_coderabbit_config"
+chmod +x "$case_root/scripts/ci/check_coderabbit_config"
+printf 'coderabbit:\n  enabled: false\n' > "$case_root/.github/review-policy.yml"
+pd_rc=0
+out=$(
+  unset GITHUB_REPOSITORY
+  MERGEPATH_TEMPLATE_CHECK=skip \
+    "$case_root/scripts/ci/check_coderabbit_config" 2>&1
+) || pd_rc=$?
+assert_contains "private_disabled_passes" "$pd_rc" 0 "$out" "private-repo bootstrap path"
+
+# 1b. Same as above, but verify the template-detection signal is not
+# bypassed (template + private-disable should still PASS — a template
+# that someone disabled CodeRabbit on doesn't need the file either).
+case_root="$WORKDIR/template_disabled_passes"
+mkdir -p "$case_root/scripts/ci" "$case_root/.github"
+cp "$CHECK" "$case_root/scripts/ci/check_coderabbit_config"
+chmod +x "$case_root/scripts/ci/check_coderabbit_config"
+printf 'coderabbit:\n  enabled: false\n' > "$case_root/.github/review-policy.yml"
+td_rc=0
+out=$(
+  unset GITHUB_REPOSITORY
+  MERGEPATH_TEMPLATE_CHECK=force \
+    "$case_root/scripts/ci/check_coderabbit_config" 2>&1
+) || td_rc=$?
+assert_contains "template_disabled_passes" "$td_rc" 0 "$out" "private-repo bootstrap path"
+
+# 2. .coderabbit.yml absent + coderabbit.enabled=true → FAIL (config
+# drift on a repo that says it wants CodeRabbit).
+case_root="$WORKDIR/enabled_missing_fails"
+mkdir -p "$case_root/scripts/ci" "$case_root/.github"
+cp "$CHECK" "$case_root/scripts/ci/check_coderabbit_config"
+chmod +x "$case_root/scripts/ci/check_coderabbit_config"
+printf 'coderabbit:\n  enabled: true\n' > "$case_root/.github/review-policy.yml"
+em_rc=0
+out=$(
+  unset GITHUB_REPOSITORY
+  MERGEPATH_TEMPLATE_CHECK=skip \
+    "$case_root/scripts/ci/check_coderabbit_config" 2>&1
+) || em_rc=$?
+assert_contains "enabled_missing_fails" "$em_rc" 1 "$out" "missing at repo root"
+
+# 3. .coderabbit.yml absent + review-policy.yml present but
+# coderabbit key entirely absent → FAIL (treat unset as enabled, so
+# the template's own CI keeps catching a wandered-off file).
+case_root="$WORKDIR/policy_no_coderabbit_key_fails"
+mkdir -p "$case_root/scripts/ci" "$case_root/.github"
+cp "$CHECK" "$case_root/scripts/ci/check_coderabbit_config"
+chmod +x "$case_root/scripts/ci/check_coderabbit_config"
+printf 'external_review_threshold: 200\n' > "$case_root/.github/review-policy.yml"
+nk_rc=0
+out=$(
+  unset GITHUB_REPOSITORY
+  MERGEPATH_TEMPLATE_CHECK=force \
+    "$case_root/scripts/ci/check_coderabbit_config" 2>&1
+) || nk_rc=$?
+assert_contains "policy_no_coderabbit_key_fails" "$nk_rc" 1 "$out" "missing at repo root"
+
+# 4. File present + coderabbit.enabled=false → still parses and
+# (per template detection) still profile-checks. This guards against
+# a regression where the disable-shortcut accidentally swallows a
+# malformed file on a public repo that has the wizard mid-flip.
+case_root="$WORKDIR/file_present_disabled_template"
+mkdir -p "$case_root/scripts/ci" "$case_root/.github"
+cp "$CHECK" "$case_root/scripts/ci/check_coderabbit_config"
+chmod +x "$case_root/scripts/ci/check_coderabbit_config"
+printf 'coderabbit:\n  enabled: false\n' > "$case_root/.github/review-policy.yml"
+printf 'reviews:\n  profile: assertive\n' > "$case_root/.coderabbit.yml"
+fp_rc=0
+out=$(
+  unset GITHUB_REPOSITORY
+  MERGEPATH_TEMPLATE_CHECK=force \
+    "$case_root/scripts/ci/check_coderabbit_config" 2>&1
+) || fp_rc=$?
+assert_contains "file_present_disabled_template_still_enforces_profile" \
+  "$fp_rc" 1 "$out" "FAIL: reviews.profile is 'assertive'"
 
 # GITHUB_REPOSITORY-based detection: */mergepath → template scope.
 case_root="$WORKDIR/github_repository_mergepath"
