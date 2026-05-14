@@ -7,10 +7,24 @@
 #   v1 (PR #215):
 #     --audit            Read-only drift detector across all consumers.
 #
-#   v2 (this PR — Layer 3 first slice):
+#   v2 (PR #217 — Layer 3 first slice):
 #     <commit-ish>       Open propagation PRs for canonical files changed
 #                        at the given commit. Kit and templated paths are
 #                        skipped with a warning (deferred to slice 2/3).
+#
+#   v3 (this PR — Layer 3 steady-state reconcile):
+#     --sync-all         Propagate the CURRENT HEAD state of EVERY
+#                        canonical + kit path in the manifest to every
+#                        consumer — ignoring the "changed at commit X"
+#                        filter. Use this to bring consumers that are
+#                        far behind to a clean steady state in one shot
+#                        rather than replaying every historical commit.
+#                        Honors .sync-overrides.yml per-consumer (an
+#                        intentional divergence is never clobbered),
+#                        kit allow-extras semantics, and a distinct
+#                        branch-name scheme (mergepath-sync/sync-all-<sha>)
+#                        so it doesn't collide with per-commit branches.
+#                        Templated paths are still deferred (Layer 5).
 #
 #   future:
 #     --from-pr <N>      Resolve PR N's merge commit and propagate
@@ -18,8 +32,6 @@
 #     templated paths    Three-way merge for review-policy.yml; substitution
 #                        rules for AGENTS.md / CLAUDE.md (Layer 5, shared
 #                        with bootstrap-new-repo.sh #156).
-#     kit paths          Directory mirror with allow-extras semantics in
-#                        sync mode (slice 2 — already supported in audit).
 #
 # The manifest at .mergepath-sync.yml declares which paths are canonical
 # (byte-identical) or kit (directory mirror with allow-extras), and which
@@ -30,19 +42,41 @@
 #   scripts/sync-to-downstream.sh --audit [--repos r1,r2] [--paths glob]
 #   scripts/sync-to-downstream.sh <commit-ish> [--dry-run] [--repos r1,r2] [--paths glob]
 #                                 [--no-pr] [--skip-existing|--recreate-existing] [--verbose]
+#   scripts/sync-to-downstream.sh --sync-all [--dry-run] [--repos r1,r2] [--paths glob]
+#                                 [--no-pr] [--skip-existing|--recreate-existing] [--verbose]
 #   scripts/sync-to-downstream.sh --help
 #   scripts/sync-to-downstream.sh --version
 #
 # Flags:
 #   --audit              Read-only drift detection. Exit 0 (clean), 1 (drift),
 #                        2 (script/usage error), 3 (consumer fetch error).
-#   --dry-run            Sync mode only. Print the per-consumer plan
-#                        (branch name, files) without cloning, committing,
-#                        pushing, or creating PRs. Idempotency check is
-#                        skipped because it probes the consumer repo via
-#                        `gh api`; a dry-run plan may show "would open PR"
-#                        even when a PR already exists, but the live run
-#                        will catch and skip it.
+#   --sync-all           Bulk steady-state reconcile. Propagate the current
+#                        HEAD state of EVERY canonical + kit path in the
+#                        manifest to every consumer, ignoring the
+#                        "changed at commit X" filter. One PR per consumer,
+#                        branched from the consumer's main. Honors
+#                        .sync-overrides.yml per-consumer (a documented
+#                        divergence is never overwritten), kit allow-extras
+#                        semantics (consumer-only files are kept), and the
+#                        manifest's consumer opt-in. Uses a distinct branch
+#                        scheme (mergepath-sync/sync-all-<sha>) so it can't
+#                        collide with per-commit propagation branches.
+#                        Mutually exclusive with --audit and a positional
+#                        <commit-ish>. Honors the same sync-mode flags
+#                        below (--dry-run, --repos, --paths/--files,
+#                        --no-pr, --skip-existing/--recreate-existing,
+#                        --verbose). Templated paths are still deferred
+#                        (Layer 5).
+#   --dry-run            Sync / sync-all mode only. Print the per-consumer
+#                        plan (branch name, files) without cloning,
+#                        committing, pushing, or creating PRs. For
+#                        --sync-all the plan lists every consumer ×
+#                        every canonical/kit path, with override-skips
+#                        noted. Idempotency check is skipped because it
+#                        probes the consumer repo via `gh api`; a dry-run
+#                        plan may show "would open PR" even when a PR
+#                        already exists, but the live run will catch and
+#                        skip it.
 #   --repos r1,r2        Restrict to a comma-separated subset of consumer names.
 #   --paths glob         Restrict to manifest paths matching the glob (e.g.
 #                        "scripts/*", ".github/workflows/agent-review.yml").
@@ -113,7 +147,7 @@ set -euo pipefail
 
 # --- constants --------------------------------------------------------------
 
-SCRIPT_VERSION="0.3.0-layer3-overrides-and-flags"
+SCRIPT_VERSION="0.4.0-layer3-sync-all"
 SUPPORTED_MANIFEST_VERSION=1
 MANIFEST_PATH=".mergepath-sync.yml"
 SYNC_BRANCH_PREFIX="mergepath-sync"
@@ -578,6 +612,83 @@ sync_consumer_canonical_targets() {
   done
 }
 
+# --- sync-all target enumeration -------------------------------------------
+#
+# These two helpers back --sync-all. They differ from
+# sync_consumer_canonical_targets / sync_consumer_skipped_targets above
+# in one way only: there is NO "changed at commit" intersection. Every
+# manifest path of the given type that the consumer opts in to (and
+# passes the --paths filter) is a target. The .sync-overrides.yml
+# per-consumer filter is applied later, in sync_open_pr, exactly as in
+# the per-commit path — so an intentional divergence is honored
+# identically whether the sync was triggered by a commit or by
+# --sync-all.
+
+# Echo every canonical manifest path the consumer opts in to (one per
+# line), after the --paths filter. No changed-files intersection.
+sync_all_consumer_canonical_targets() {
+  local consumer_name=$1
+  local manifest=$2
+
+  yq -r '
+    .paths[]
+    | select(.type == "canonical")
+    | (.path + "\t"
+       + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
+  ' "$manifest" | while IFS=$'\t' read -r mp_path mp_consumers; do
+    if ! in_path_filter "$mp_path"; then continue; fi
+    if [ "$mp_consumers" != "all" ]; then
+      local re=",$mp_consumers,"
+      [[ "$re" != *",$consumer_name,"* ]] && continue
+    fi
+    echo "$mp_path"
+  done
+}
+
+# Echo every kit manifest path the consumer opts in to (one per line),
+# after the --paths filter. No changed-files intersection.
+sync_all_consumer_kit_targets() {
+  local consumer_name=$1
+  local manifest=$2
+
+  yq -r '
+    .paths[]
+    | select(.type == "kit")
+    | (.path + "\t"
+       + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
+  ' "$manifest" | while IFS=$'\t' read -r mp_path mp_consumers; do
+    if ! in_path_filter "$mp_path"; then continue; fi
+    if [ "$mp_consumers" != "all" ]; then
+      local re=",$mp_consumers,"
+      [[ "$re" != *",$consumer_name,"* ]] && continue
+    fi
+    echo "$mp_path"
+  done
+}
+
+# Echo every templated manifest path the consumer opts in to (one per
+# line), after the --paths filter. --sync-all defers templated paths
+# (Layer 5) but names them in the plan / PR body so the human sees
+# they were intentionally not synced.
+sync_all_consumer_templated_targets() {
+  local consumer_name=$1
+  local manifest=$2
+
+  yq -r '
+    .paths[]
+    | select(.type == "templated")
+    | (.path + "\t"
+       + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
+  ' "$manifest" | while IFS=$'\t' read -r mp_path mp_consumers; do
+    if ! in_path_filter "$mp_path"; then continue; fi
+    if [ "$mp_consumers" != "all" ]; then
+      local re=",$mp_consumers,"
+      [[ "$re" != *",$consumer_name,"* ]] && continue
+    fi
+    echo "$mp_path"
+  done
+}
+
 # Count manifest paths skipped (kit + templated) so the summary can name
 # them. Echoes "kit_count\ttemplated_count\tkit_paths\ttemplated_paths".
 sync_consumer_skipped_targets() {
@@ -625,6 +736,18 @@ sync_consumer_skipped_targets() {
 sync_branch_name() {
   local sha=$1
   echo "${SYNC_BRANCH_PREFIX}/${sha:0:7}"
+}
+
+# Branch name for --sync-all runs. Keyed to mergepath HEAD at run time,
+# with a distinct `sync-all-` infix so a bulk reconcile branch can never
+# collide with a per-commit propagation branch (mergepath-sync/<sha>) —
+# even in the degenerate case where the per-commit sha and the sync-all
+# HEAD sha share a 7-char prefix. The distinct scheme also makes the
+# idempotency probe (sync_check_existing_pr) meaningful: a prior
+# --sync-all PR is found, a prior per-commit PR is not mistaken for one.
+sync_all_branch_name() {
+  local sha=$1
+  echo "${SYNC_BRANCH_PREFIX}/sync-all-${sha:0:7}"
 }
 
 # Idempotency check: does a PR already exist on this consumer's repo from
@@ -839,7 +962,12 @@ sync_open_pr() {
     err "could not create workspace tmpdir"
     return 1
   }
-  trap "rm -rf '$workspace'" RETURN
+  # Single-quote the trap body so $workspace is expanded when the trap
+  # FIRES (RETURN), not when it's installed — a single quote in TMPDIR
+  # or a consumer name can't then break the cleanup command or inject
+  # shell syntax. $workspace is function-local but still in scope at
+  # RETURN time.
+  trap 'rm -rf "$workspace"' RETURN
 
   printf "  ⤷ %s — cloning %s\n" "$consumer_name" "$consumer_repo"
   if ! gh repo clone "$consumer_repo" "$workspace/repo" -- --depth=10 --quiet >&2; then
@@ -944,7 +1072,13 @@ sync_open_pr() {
   # Sanity: did the copy actually change anything? If the consumer was
   # already in sync (someone hand-propagated it before us, or a prior
   # sync ran but the PR was never opened), don't push an empty commit.
-  if ! git -C "$workspace/repo" diff --quiet HEAD --; then
+  # `git status --porcelain` (not `git diff HEAD`) so the no-op check
+  # also catches BRAND-NEW files: a consumer missing a whole canonical
+  # or kit file gets it materialized as an untracked file, which
+  # `git diff --quiet HEAD` would not see — it would false-negative as
+  # "already in sync" and skip a real propagation. Porcelain reports
+  # tracked modifications AND untracked additions.
+  if [ -n "$(git -C "$workspace/repo" status --porcelain)" ]; then
     :
   else
     printf "  · %s already in sync at HEAD (no diff after copy)\n" "$consumer_name"
@@ -1113,6 +1247,594 @@ EOF
   printf "  ✓ %s — opened %s\n" "$consumer_name" "$pr_url"
 }
 
+# --- sync-all live PR-open --------------------------------------------------
+#
+# The --sync-all sibling of sync_open_pr. Structurally parallel — same
+# clone-into-tmpdir, same .sync-overrides.yml filter, same mktemp
+# portability form, same --recreate-existing destructive-step ordering
+# (commit FIRST, then close+delete+push) — but with two differences
+# the per-commit path doesn't need:
+#
+#   1. It materializes the CURRENT HEAD state of canonical paths
+#      (`git show HEAD:<path>`) AND kit directories (recursive file
+#      copy with allow-extras — consumer-only files are NOT deleted),
+#      rather than the changed-at-a-commit subset.
+#   2. The commit / PR body wording says "bulk sync to mergepath@<sha>"
+#      and lists both canonical and kit paths plus any override-skipped
+#      paths, instead of pointing at a single source commit.
+#
+# It is deliberately a separate function rather than a parameterized
+# sync_open_pr: the per-commit path is pinned by an awk ordering test
+# (destructive-recreate step placement) and a fragile signature change
+# there risks regressing #231's fix. Mirroring the structure keeps both
+# paths independently verifiable.
+#
+# Args:
+#   $1 consumer_name
+#   $2 consumer_repo
+#   $3 sha               mergepath HEAD sha at run time
+#   $4 branch            sync-all branch name (mergepath-sync/sync-all-<sha>)
+#   $5 canonical_targets newline-separated canonical paths
+#   $6 kit_targets       newline-separated kit paths (dir mirrors)
+#   $7 templated_list    comma-joined templated paths (deferred; display only)
+#   $8 recreate_existing_pr_num  optional; close+delete just before push
+#
+# Returns 0 on success, non-zero on failure (caller increments
+# SYNC_FAILED). Stdout: human-readable progress lines.
+sync_all_open_pr() {
+  local consumer_name=$1
+  local consumer_repo=$2
+  local sha=$3
+  local branch=$4
+  local canonical_targets=$5  # newline-separated
+  local kit_targets=$6        # newline-separated
+  local templated_list=$7     # comma-joined, display only
+  local recreate_existing_pr_num=${8:-}
+  local short_sha=${sha:0:7}
+
+  local tmp_root=${TMPDIR:-/tmp}
+  local workspace
+  workspace=$(mktemp -d "$tmp_root/mergepath-sync-${consumer_name}.XXXXXX") || {
+    err "could not create workspace tmpdir"
+    return 1
+  }
+  # Single-quote the trap body so $workspace is expanded when the trap
+  # FIRES (RETURN), not when it's installed — a single quote in TMPDIR
+  # or a consumer name can't then break the cleanup command or inject
+  # shell syntax. $workspace is function-local but still in scope at
+  # RETURN time.
+  trap 'rm -rf "$workspace"' RETURN
+
+  printf "  ⤷ %s — cloning %s\n" "$consumer_name" "$consumer_repo"
+  if ! gh repo clone "$consumer_repo" "$workspace/repo" -- --depth=10 --quiet >&2; then
+    err "$consumer_name: gh repo clone failed for $consumer_repo"
+    return 1
+  fi
+
+  # Per-repo override filter (#200 integration) — load-bearing for
+  # --sync-all. A consumer's .sync-overrides.yml `skip_paths` declares
+  # canonical/kit paths the propagation script must NOT overwrite for
+  # that repo. --sync-all replays the FULL manifest, so without this
+  # filter a bulk reconcile would clobber every documented divergence
+  # in one shot — strictly worse than no --sync-all at all. The filter
+  # runs against BOTH the canonical target list and the kit target
+  # list, identically to the per-commit path's canonical-only filter.
+  local consumer_overrides="$workspace/repo/$OVERRIDES_PATH"
+  local override_skip_count=0
+  local override_skipped_list=""
+
+  local filtered_canonical=""
+  local target
+  while IFS= read -r target; do
+    [ -z "$target" ] && continue
+    if override_should_skip_path "$consumer_overrides" "$target"; then
+      printf "  · %s skip %s (per .sync-overrides.yml: %s)\n" \
+        "$consumer_name" "$target" "$OVERRIDE_SKIP_REASON"
+      override_skip_count=$((override_skip_count + 1))
+      if [ -z "$override_skipped_list" ]; then
+        override_skipped_list="$target"
+      else
+        override_skipped_list+=",$target"
+      fi
+      continue
+    fi
+    if [ -z "$filtered_canonical" ]; then
+      filtered_canonical="$target"
+    else
+      filtered_canonical+=$'\n'"$target"
+    fi
+  done <<< "$canonical_targets"
+  canonical_targets="$filtered_canonical"
+
+  local filtered_kit=""
+  while IFS= read -r target; do
+    [ -z "$target" ] && continue
+    if override_should_skip_path "$consumer_overrides" "$target"; then
+      printf "  · %s skip %s (per .sync-overrides.yml: %s)\n" \
+        "$consumer_name" "$target" "$OVERRIDE_SKIP_REASON"
+      override_skip_count=$((override_skip_count + 1))
+      if [ -z "$override_skipped_list" ]; then
+        override_skipped_list="$target"
+      else
+        override_skipped_list+=",$target"
+      fi
+      continue
+    fi
+    if [ -z "$filtered_kit" ]; then
+      filtered_kit="$target"
+    else
+      filtered_kit+=$'\n'"$target"
+    fi
+  done <<< "$kit_targets"
+  kit_targets="$filtered_kit"
+
+  if [ -z "$canonical_targets" ] && [ -z "$kit_targets" ]; then
+    if [ "$override_skip_count" -gt 0 ]; then
+      printf "  ⊘ %s — all canonical+kit targets skipped per .sync-overrides.yml (%d entries)\n" \
+        "$consumer_name" "$override_skip_count"
+      SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+      SYNC_PR_OPENED=$((SYNC_PR_OPENED - 1))  # offset caller's eager increment
+      return 0
+    fi
+    # No targets at all and no overrides — caller should have caught
+    # this; treat as a no-op return.
+    return 0
+  fi
+
+  # Materialize canonical paths verbatim from mergepath HEAD. Same
+  # ls-tree-then-show logic as sync_open_pr, including delete
+  # propagation (a manifest path absent at HEAD → rm the consumer
+  # copy) and executable-bit mirroring.
+  while IFS= read -r target; do
+    [ -z "$target" ] && continue
+    local consumer_target="$workspace/repo/$target"
+    local src_mode
+    src_mode=$(git -C "$MERGEPATH_ROOT" ls-tree "$sha" -- "$target" | awk '{print $1}')
+
+    if [ -z "$src_mode" ]; then
+      if [ -e "$consumer_target" ]; then
+        rm -f "$consumer_target"
+      fi
+      continue
+    fi
+
+    mkdir -p "$(dirname "$consumer_target")"
+    if ! git -C "$MERGEPATH_ROOT" show "$sha:$target" >"$consumer_target" 2>/dev/null; then
+      err "$consumer_name: could not read $target from mergepath@$short_sha"
+      return 1
+    fi
+    case "$src_mode" in
+      100755) chmod +x "$consumer_target" ;;
+      100644) chmod -x "$consumer_target" ;;
+      *)
+        err "$consumer_name: unexpected git mode '$src_mode' for $target at $short_sha"
+        return 1
+        ;;
+    esac
+  done <<< "$canonical_targets"
+
+  # Materialize kit directories with allow-extras semantics: copy every
+  # file Mergepath has under the kit path into the consumer, but do NOT
+  # delete consumer-only extras. This is the same semantic compare_kit
+  # uses for audit (consumer-only files are ignored, not flagged) and
+  # the documented kit contract in .mergepath-sync.yml.
+  #
+  # `git ls-tree -r --name-only HEAD <kitpath>` enumerates the kit's
+  # tracked files at HEAD; per-file `git show` materializes each one
+  # verbatim with its mode mirrored. A kit path absent at HEAD entirely
+  # is a no-op (nothing to copy; we never delete the consumer's dir).
+  while IFS= read -r target; do
+    [ -z "$target" ] && continue
+    local kit_dir="${target%/}"
+    local kit_files
+    kit_files=$(git -C "$MERGEPATH_ROOT" ls-tree -r --name-only "$sha" -- "$kit_dir" 2>/dev/null || true)
+    if [ -z "$kit_files" ]; then
+      # Kit path has no tracked files at HEAD — nothing to mirror.
+      # Allow-extras means we never delete the consumer's copy, so
+      # this is simply a no-op for this kit path.
+      continue
+    fi
+    while IFS= read -r kit_file; do
+      [ -z "$kit_file" ] && continue
+      local consumer_kit_target="$workspace/repo/$kit_file"
+      local kit_mode
+      kit_mode=$(git -C "$MERGEPATH_ROOT" ls-tree "$sha" -- "$kit_file" | awk '{print $1}')
+      [ -z "$kit_mode" ] && continue
+      mkdir -p "$(dirname "$consumer_kit_target")"
+      if ! git -C "$MERGEPATH_ROOT" show "$sha:$kit_file" >"$consumer_kit_target" 2>/dev/null; then
+        err "$consumer_name: could not read $kit_file from mergepath@$short_sha"
+        return 1
+      fi
+      case "$kit_mode" in
+        100755) chmod +x "$consumer_kit_target" ;;
+        100644) chmod -x "$consumer_kit_target" ;;
+        *)
+          err "$consumer_name: unexpected git mode '$kit_mode' for $kit_file at $short_sha"
+          return 1
+          ;;
+      esac
+    done <<< "$kit_files"
+  done <<< "$kit_targets"
+
+  # Sanity: did the copy actually change anything? A consumer already
+  # at HEAD state (hand-propagated, or a prior --sync-all PR merged)
+  # should not get an empty commit / PR.
+  # `git status --porcelain` (not `git diff HEAD`) so the no-op check
+  # also catches BRAND-NEW files: a consumer missing a whole canonical
+  # or kit file gets it materialized as an untracked file, which
+  # `git diff --quiet HEAD` would not see — it would false-negative as
+  # "already in sync" and skip a real propagation. Porcelain reports
+  # tracked modifications AND untracked additions.
+  if [ -n "$(git -C "$workspace/repo" status --porcelain)" ]; then
+    :
+  else
+    printf "  · %s already in sync at HEAD (no diff after copy)\n" "$consumer_name"
+    SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+    SYNC_PR_OPENED=$((SYNC_PR_OPENED - 1))  # caller incremented eagerly
+    return 0
+  fi
+
+  if ! git -C "$workspace/repo" checkout -q -b "$branch"; then
+    err "$consumer_name: git checkout -b $branch failed"
+    return 1
+  fi
+  git -C "$workspace/repo" add -A
+
+  # Build the path lists for the commit / PR body.
+  local canonical_lines kit_lines
+  canonical_lines=$(while IFS= read -r p; do [ -z "$p" ] && continue; echo "  - $p"; done <<< "$canonical_targets")
+  kit_lines=$(while IFS= read -r p; do [ -z "$p" ] && continue; echo "  - $p (kit, allow-extras)"; done <<< "$kit_targets")
+  [ -z "$canonical_lines" ] && canonical_lines="  (none)"
+  [ -z "$kit_lines" ] && kit_lines="  (none)"
+
+  local override_note=""
+  if [ -n "$override_skipped_list" ]; then
+    override_note="
+Override-skipped (per the consumer's .sync-overrides.yml — intentional
+divergences left untouched):
+  ${override_skipped_list}
+"
+  fi
+  local templated_note=""
+  if [ -n "$templated_list" ]; then
+    templated_note="
+Deferred (templated paths land in Layer 5, #168):
+  ${templated_list}
+"
+  fi
+
+  if ! git -C "$workspace/repo" commit -q -m "$(cat <<EOF
+bulk sync to mergepath@${short_sha} — verbatim canonical/kit mirror per .mergepath-sync.yml
+
+Source: https://github.com/nathanjohnpayne/mergepath/commit/${sha}
+Canonical paths synced:
+${canonical_lines}
+Kit paths synced:
+${kit_lines}
+${override_note}${templated_note}
+Authoring-Agent: claude
+
+## Self-Review
+- Correctness: mirrors mergepath@${short_sha} HEAD state verbatim per .mergepath-sync.yml; .sync-overrides.yml honored per-consumer
+- Regression risk: low; verbatim mirror, kit paths use allow-extras (consumer-only files kept)
+- Style: N/A (verbatim mirror)
+- Test coverage: relies on the consumer repo CI
+- Security: no new attack surface
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+EOF
+)"; then
+    err "$consumer_name: git commit failed"
+    return 1
+  fi
+
+  # --recreate-existing destructive step. Deferred to here (after the
+  # replacement commit is built) for the same reason as sync_open_pr:
+  # the live PR stays open until we have something concrete to replace
+  # it with. Close → delete remote branch → push, all loudly logged.
+  if [ -n "$recreate_existing_pr_num" ]; then
+    printf "  ⤷ %s — closing existing PR #%s for --recreate-existing\n" \
+      "$consumer_name" "$recreate_existing_pr_num"
+    if ! gh pr close "$recreate_existing_pr_num" --repo "$consumer_repo" \
+          --comment "Closed by \`scripts/sync-to-downstream.sh --sync-all --recreate-existing\`. Reopening with a fresh synthesized body on a recreated \`$branch\`." >&2; then
+      err "$consumer_name: gh pr close failed for #$recreate_existing_pr_num"
+      return 1
+    fi
+    printf "  ⤷ %s — deleting remote branch %s for --recreate-existing\n" \
+      "$consumer_name" "$branch"
+    local _del_response _del_status _del_rc=0
+    _del_response=$(gh api --include -X DELETE "repos/${consumer_repo}/git/refs/heads/${branch}" 2>&1) || _del_rc=$?
+    _del_status=$(printf '%s\n' "$_del_response" | awk '
+      /^HTTP\/[0-9.]+[[:space:]]+[0-9]+/ {
+        n = split($0, parts, /[^0-9]+/)
+        for (i = 1; i <= n; i++) {
+          if (parts[i] != "" && parts[i] != "1" && parts[i] != "2" && length(parts[i]) == 3) {
+            print parts[i]; exit
+          }
+        }
+        for (i = n; i >= 1; i--) if (parts[i] ~ /^[0-9]{3}$/) { print parts[i]; exit }
+      }')
+    case "$_del_status" in
+      204)
+        :
+        ;;
+      404|422)
+        printf "    · branch %s already absent on remote (status=%s, ok)\n" "$branch" "$_del_status"
+        ;;
+      *)
+        err "$consumer_name: failed to delete remote branch $branch (status=${_del_status:-unknown}, rc=$_del_rc); refusing to push to avoid non-fast-forward"
+        return 1
+        ;;
+    esac
+  fi
+
+  printf "  ⤷ %s — pushing branch %s\n" "$consumer_name" "$branch"
+  if ! git -C "$workspace/repo" push -q -u origin "$branch" 2>&1; then
+    err "$consumer_name: git push failed"
+    return 1
+  fi
+
+  if [ "${SYNC_NO_PR:-0}" = "1" ]; then
+    printf "  ✓ %s — pushed branch %s (--no-pr; no PR opened)\n" "$consumer_name" "$branch"
+    return 0
+  fi
+
+  printf "  ⤷ %s — opening PR\n" "$consumer_name"
+  local pr_url
+  pr_url=$(gh pr create --repo "$consumer_repo" --base main --head "$branch" \
+    --title "sync: bulk reconcile to mergepath@${short_sha}" \
+    --body "$(cat <<EOF
+Bulk sync to [mergepath@${short_sha}](https://github.com/nathanjohnpayne/mergepath/commit/${sha}) — verbatim canonical/kit mirror per \`.mergepath-sync.yml\`.
+
+Opened by \`scripts/sync-to-downstream.sh --sync-all\` (v${SCRIPT_VERSION}, see [#168](https://github.com/nathanjohnpayne/mergepath/issues/168)). Unlike a per-commit propagation PR, this replays the **current HEAD state of every canonical + kit path** so a consumer that has fallen behind reaches a clean steady state in one shot.
+
+## Canonical paths synced
+${canonical_lines}
+
+## Kit paths synced
+${kit_lines}
+${override_note}${templated_note}
+Authoring-Agent: claude
+
+## Self-Review
+- Correctness: mirrors mergepath@${short_sha} HEAD state verbatim per the manifest. Each path was already reviewed in its upstream PR.
+- Regression risk: low. Verbatim mirror; kit paths use allow-extras semantics so consumer-only files are kept.
+- Style: N/A (mirror).
+- Test coverage: relies on the consumer repo CI. No test changes shipped.
+- Security: no new attack surface; \`.sync-overrides.yml\` was honored per-consumer so documented divergences are untouched.
+EOF
+)" 2>&1) || {
+    err "$consumer_name: gh pr create failed: $pr_url"
+    return 1
+  }
+  printf "  ✓ %s — opened %s\n" "$consumer_name" "$pr_url"
+}
+
+# Per-consumer --sync-all orchestration. Mirrors sync_one_consumer:
+# enumerate full canonical + kit target sets, idempotency-probe (skipped
+# in dry-run), then dry-run plan OR live sync_all_open_pr. Sets
+# SYNC_PR_OPENED / SYNC_SKIPPED / SYNC_FAILED in the parent.
+sync_all_one_consumer() {
+  local consumer_name=$1
+  local consumer_repo=$2
+  local sha=$3
+  local short_sha=${sha:0:7}
+  local dry_run=${4:-0}
+  local manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
+
+  local branch
+  branch=$(sync_all_branch_name "$sha")
+
+  local recreate_existing_pr_num=""
+
+  local canonical_targets kit_targets templated_targets
+  canonical_targets=$(sync_all_consumer_canonical_targets "$consumer_name" "$manifest")
+  kit_targets=$(sync_all_consumer_kit_targets "$consumer_name" "$manifest")
+  templated_targets=$(sync_all_consumer_templated_targets "$consumer_name" "$manifest")
+  local templated_list
+  templated_list=$(echo "$templated_targets" | grep -v '^$' | paste -sd, - 2>/dev/null || true)
+
+  if [ -z "$canonical_targets" ] && [ -z "$kit_targets" ]; then
+    printf "  · %s (no canonical/kit manifest paths opted in)\n" "$consumer_name"
+    SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+    return 0
+  fi
+
+  # Idempotency check before any write. Skipped in dry-run (probes the
+  # consumer repo via `gh api`; dry-run is meant to be side-effect- and
+  # network-free). Same trade-off as sync_one_consumer's check.
+  if [ "$dry_run" != "1" ]; then
+    local pr_state
+    pr_state=$(sync_check_existing_pr "$consumer_repo" "$branch") || {
+      printf "  ✗ %s — could not query existing PRs from %s\n" "$consumer_name" "$consumer_repo"
+      SYNC_FAILED=$((SYNC_FAILED + 1))
+      return 0
+    }
+    case "$pr_state" in
+      open:*)
+        local existing_pr_num="${pr_state#open:}"
+        if [ "${SYNC_RECREATE_EXISTING:-0}" = "1" ]; then
+          recreate_existing_pr_num="$existing_pr_num"
+          # Fall through — clone/commit FIRST, then close+delete+push.
+        else
+          printf "  · %s already in flight (sync-all PR #%s on branch %s)\n" \
+            "$consumer_name" "$existing_pr_num" "$branch"
+          SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+          return 0
+        fi
+        ;;
+      closed:*)
+        printf "  · %s already done (sync-all PR #%s closed/merged on branch %s)\n" \
+          "$consumer_name" "${pr_state#closed:}" "$branch"
+        SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+        return 0
+        ;;
+    esac
+  fi
+
+  if [ "$dry_run" = "1" ]; then
+    # Override-skips are per-consumer and depend on the consumer's
+    # .sync-overrides.yml, which lives in the consumer repo. The live
+    # path applies the filter inside sync_all_open_pr after cloning;
+    # dry-run does not clone, so for a REMOTE consumer it cannot show
+    # override-skips. For a LOCAL sibling/cache worktree, though, the
+    # overrides file is on disk and we read it directly — so the
+    # dry-run plan reflects the SAME skip decisions the live run would
+    # make. The override-skipped paths are removed from the `+` target
+    # list entirely (not synced) and surfaced as `- ... (SKIPPED ...)`
+    # lines, exactly mirroring the live behavior. This is what makes
+    # `--sync-all --dry-run` an honest preview of override honoring.
+    local local_overrides=""
+    local consumer_root
+    if consumer_root=$(resolve_consumer_worktree "$consumer_name" 2>/dev/null); then
+      if [ -f "$consumer_root/$OVERRIDES_PATH" ]; then
+        local_overrides="$consumer_root/$OVERRIDES_PATH"
+      fi
+    fi
+
+    # Partition canonical + kit targets into synced vs. override-skipped.
+    local plan_canonical="" plan_kit="" plan_skipped=""
+    local p
+    while IFS= read -r p; do
+      [ -z "$p" ] && continue
+      if [ -n "$local_overrides" ] && override_should_skip_path "$local_overrides" "$p"; then
+        plan_skipped+="      - $p (SKIPPED per .sync-overrides.yml: $OVERRIDE_SKIP_REASON)"$'\n'
+        continue
+      fi
+      plan_canonical+="$p"$'\n'
+    done <<< "$canonical_targets"
+    while IFS= read -r p; do
+      [ -z "$p" ] && continue
+      if [ -n "$local_overrides" ] && override_should_skip_path "$local_overrides" "$p"; then
+        plan_skipped+="      - $p (SKIPPED per .sync-overrides.yml: $OVERRIDE_SKIP_REASON)"$'\n'
+        continue
+      fi
+      plan_kit+="$p"$'\n'
+    done <<< "$kit_targets"
+
+    # Count non-empty lines. `grep -c .` exits 1 when there are zero
+    # matches, which under `|| echo 0` would append a SECOND "0" and
+    # corrupt the printf %d below. Use a guard that yields a clean
+    # single integer for the empty case.
+    local canonical_count kit_count
+    if [ -n "${plan_canonical//$'\n'/}" ]; then
+      canonical_count=$(printf '%s' "$plan_canonical" | grep -c .)
+    else
+      canonical_count=0
+    fi
+    if [ -n "${plan_kit//$'\n'/}" ]; then
+      kit_count=$(printf '%s' "$plan_kit" | grep -c .)
+    else
+      kit_count=0
+    fi
+
+    # Zero-target guard — mirror sync_all_open_pr's live behavior. When
+    # the consumer's .sync-overrides.yml filters out every canonical +
+    # kit path, the live path skips the consumer without opening a PR;
+    # the dry-run plan must report it as skipped too, or it overstates
+    # the planned PR count.
+    if [ "$canonical_count" -eq 0 ] && [ "$kit_count" -eq 0 ]; then
+      if [ -n "$plan_skipped" ]; then
+        printf "  ⊘ %s — all canonical+kit targets skipped per .sync-overrides.yml\n" \
+          "$consumer_name"
+        printf '%s' "$plan_skipped"
+      else
+        printf "  ⊘ %s — no canonical+kit targets\n" "$consumer_name"
+      fi
+      SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+      return 0
+    fi
+
+    printf "  ⤷ %s — would open PR on branch %s (%d canonical + %d kit path(s))\n" \
+      "$consumer_name" "$branch" "$canonical_count" "$kit_count"
+    while IFS= read -r p; do
+      [ -z "$p" ] && continue
+      printf "      + %s (canonical)\n" "$p"
+      if [ "${SYNC_VERBOSE:-0}" = "1" ]; then
+        git -C "$MERGEPATH_ROOT" --no-pager show --no-color "$sha:$p" 2>/dev/null \
+          | sed 's/^/        /' || true
+      fi
+    done <<< "$plan_canonical"
+    while IFS= read -r p; do
+      [ -z "$p" ] && continue
+      printf "      + %s (kit, allow-extras)\n" "$p"
+    done <<< "$plan_kit"
+    if [ -n "$plan_skipped" ]; then
+      printf '%s' "$plan_skipped"
+    fi
+    if [ -n "$templated_list" ]; then
+      printf "      (deferred — templated, Layer 5: %s)\n" "$templated_list"
+    fi
+    SYNC_PR_OPENED=$((SYNC_PR_OPENED + 1))
+    return 0
+  fi
+
+  if ! sync_all_open_pr "$consumer_name" "$consumer_repo" "$sha" "$branch" \
+                        "$canonical_targets" "$kit_targets" "$templated_list" \
+                        "$recreate_existing_pr_num"; then
+    SYNC_FAILED=$((SYNC_FAILED + 1))
+    return 0
+  fi
+  SYNC_PR_OPENED=$((SYNC_PR_OPENED + 1))
+}
+
+# Run the --sync-all driver: propagate the current HEAD state of every
+# canonical + kit manifest path to every consumer, ignoring the
+# changed-at-a-commit filter. Mirrors run_sync's structure (active-
+# account guard for live mode, per-consumer loop, summary line).
+run_sync_all() {
+  local dry_run=${1:-0}
+  local manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
+
+  SYNC_PR_OPENED=0
+  SYNC_SKIPPED=0
+  SYNC_FAILED=0
+
+  # mergepath HEAD at run time keys the branch name + the PR body.
+  local sha
+  sha=$(git -C "$MERGEPATH_ROOT" rev-parse --verify "HEAD^{commit}" 2>/dev/null) || {
+    err "could not resolve mergepath HEAD"
+    exit 2
+  }
+  local short_sha=${sha:0:7}
+
+  # Active-account guard for LIVE mode — identical to run_sync's guard.
+  # Without it, a live --sync-all under a reviewer-identity keyring
+  # would open downstream PRs under that identity. Skipped in dry-run.
+  if [ "$dry_run" != "1" ]; then
+    local expected_actor active_actor
+    expected_actor=$(awk '/^author_identity:/ {sub(/^[^:]+:[[:space:]]*/, ""); gsub(/[[:space:]"#].*$/, ""); print; exit}' \
+      "$MERGEPATH_ROOT/.github/review-policy.yml" 2>/dev/null || echo "")
+    expected_actor=${expected_actor:-nathanjohnpayne}
+    expected_actor=${MERGEPATH_SYNC_ACTOR_OVERRIDE:-$expected_actor}
+    active_actor=$(gh config get -h github.com user 2>/dev/null || echo "")
+    if [ "$active_actor" != "$expected_actor" ]; then
+      err "refusing to run live sync — active gh account is '$active_actor', expected '$expected_actor'"
+      err "       Switch first: gh auth switch -u $expected_actor"
+      err "       Then re-run. (Set MERGEPATH_SYNC_ACTOR_OVERRIDE for tests.)"
+      exit 2
+    fi
+  fi
+
+  echo "Sync-all: bulk reconcile to mergepath@${short_sha} (verbatim canonical/kit mirror per .mergepath-sync.yml)"
+  echo "Branch scheme: $(sync_all_branch_name "$sha")"
+  echo
+
+  local consumers
+  consumers=$(yq -r '.consumers[] | (.name + "\t" + .repo)' "$manifest")
+  while IFS=$'\t' read -r consumer_name consumer_repo; do
+    [ -z "$consumer_name" ] && continue
+    if ! in_repo_filter "$consumer_name"; then continue; fi
+    echo "$consumer_name ($consumer_repo)"
+    sync_all_one_consumer "$consumer_name" "$consumer_repo" "$sha" "$dry_run"
+    echo
+  done <<< "$consumers"
+
+  echo "Summary: PRs opened/planned: $SYNC_PR_OPENED  skipped: $SYNC_SKIPPED  failed: $SYNC_FAILED"
+  if [ "$SYNC_FAILED" -gt 0 ]; then return 1; fi
+  return 0
+}
+
 # Run the sync driver against a single Mergepath commit-ish.
 run_sync() {
   local commit_ish=$1
@@ -1194,6 +1916,13 @@ run_sync() {
 
 MODE=""
 SYNC_COMMIT_ISH=""
+# Independent mode-selection trackers so the post-parse mutex check can
+# detect --audit + --sync-all (or --sync-all + a positional commit-ish)
+# regardless of arg order — MODE alone would silently let the last
+# selector win.
+SAW_AUDIT=0
+SAW_SYNC_ALL=0
+SAW_COMMIT_ISH=0
 SYNC_DRY_RUN=0
 SYNC_NO_PR=0
 SYNC_SKIP_EXISTING=0
@@ -1206,6 +1935,16 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --audit)
       MODE="audit"
+      SAW_AUDIT=1
+      shift
+      ;;
+    --sync-all)
+      # Bulk steady-state reconcile. Mutually exclusive with --audit
+      # and with a positional <commit-ish>; the mutex is enforced at
+      # the post-parse validation step below (so the diagnostic can
+      # name whichever mode was already set, regardless of arg order).
+      MODE="sync-all"
+      SAW_SYNC_ALL=1
       shift
       ;;
     --repos)
@@ -1296,7 +2035,13 @@ while [ $# -gt 0 ]; do
         exit 2
       fi
       SYNC_COMMIT_ISH="$1"
-      MODE="sync"
+      SAW_COMMIT_ISH=1
+      # Don't clobber MODE when --sync-all / --audit was already set —
+      # the post-parse mutex check below catches the conflict and emits
+      # a clear diagnostic. Only claim "sync" mode when nothing else did.
+      if [ "$SAW_AUDIT" = "0" ] && [ "$SAW_SYNC_ALL" = "0" ]; then
+        MODE="sync"
+      fi
       shift
       ;;
   esac
@@ -1304,6 +2049,29 @@ done
 
 if [ -z "$MODE" ]; then
   usage
+  exit 2
+fi
+
+# --sync-all mutex: it is its own mode, mutually exclusive with --audit
+# and with a positional <commit-ish>. Reject the combination with a
+# clear diagnostic before any I/O. (Checked via the SAW_* trackers
+# rather than MODE so arg order can't mask the conflict.)
+if [ "$SAW_SYNC_ALL" = "1" ] && [ "$SAW_AUDIT" = "1" ]; then
+  err "--sync-all and --audit are mutually exclusive (one reconciles, the other only reports)"
+  exit 2
+fi
+if [ "$SAW_SYNC_ALL" = "1" ] && [ "$SAW_COMMIT_ISH" = "1" ]; then
+  err "--sync-all and a positional <commit-ish> are mutually exclusive"
+  err "       --sync-all replays the full manifest at HEAD; a <commit-ish> propagates only that commit's changes. Pick one."
+  exit 2
+fi
+# --audit is read-only and takes no commit-ish. A positional arg
+# alongside --audit is a mixed-mode invocation: without this guard the
+# commit-ish is silently dropped and audit runs anyway. Reject it with
+# a usage error rather than doing the wrong thing quietly.
+if [ "$SAW_AUDIT" = "1" ] && [ "$SAW_COMMIT_ISH" = "1" ]; then
+  err "--audit takes no positional <commit-ish> (audit is a read-only drift scan, not a propagation)"
+  err "       Drop the commit-ish for an audit, or drop --audit to propagate that commit."
   exit 2
 fi
 
@@ -1359,6 +2127,12 @@ case "$MODE" in
     ;;
   sync)
     if ! run_sync "$SYNC_COMMIT_ISH" "$SYNC_DRY_RUN"; then
+      exit 1
+    fi
+    exit 0
+    ;;
+  sync-all)
+    if ! run_sync_all "$SYNC_DRY_RUN"; then
       exit 1
     fi
     exit 0

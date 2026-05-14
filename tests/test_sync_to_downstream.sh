@@ -611,6 +611,201 @@ awk '
 ' "$SCRIPT" || fail "sync_one_consumer carries an inline gh pr close — recreate must be deferred to sync_open_pr"
 
 # ---------------------------------------------------------------------------
+# --sync-all mode (#168 Layer 3 steady-state reconcile).
+#
+# Build a fresh Mergepath fixture with two canonical paths, one kit
+# path, one templated path, three consumers. The key fixture detail:
+# one consumer (`gamma`) carries a `.sync-overrides.yml` registering an
+# intentional skip of one canonical path. --sync-all MUST NOT clobber
+# that divergence — proven below by asserting the skipped path is
+# absent from gamma's plan while present in alpha's/beta's.
+# ---------------------------------------------------------------------------
+syncall_workdir="$WORKDIR/syncall"
+SA_MP="$syncall_workdir/mergepath"
+SA_SIBLINGS="$syncall_workdir/siblings"
+mkdir -p "$SA_MP/scripts/hooks" "$SA_MP/scripts/ci" "$SA_MP/scripts/sync" "$SA_MP/.github"
+cp "$ROOT/scripts/sync/apply-overrides.sh" "$SA_MP/scripts/sync/apply-overrides.sh"
+cat >"$SA_MP/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - {name: alpha, repo: example/alpha}
+  - {name: beta,  repo: example/beta}
+  - {name: gamma, repo: example/gamma}
+  - {name: delta, repo: example/delta}
+paths:
+  - {path: scripts/hooks/the-hook.sh,  type: canonical, consumers: all}
+  - {path: scripts/coderabbit-wait.sh, type: canonical, consumers: all}
+  - {path: scripts/ci/,                type: kit,       consumers: all}
+  - {path: AGENTS.md,                  type: templated, consumers: all}
+YAML
+echo "hook-v9"      >"$SA_MP/scripts/hooks/the-hook.sh"
+echo "wait-v9"      >"$SA_MP/scripts/coderabbit-wait.sh"
+echo "ci-one-v9"    >"$SA_MP/scripts/ci/check_one"
+echo "ci-two-v9"    >"$SA_MP/scripts/ci/check_two"
+echo "agents-v9"    >"$SA_MP/AGENTS.md"
+git -C "$SA_MP" init -q
+git -C "$SA_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$SA_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "initial"
+# A second commit so HEAD has a non-root short-sha; --sync-all keys the
+# branch name on HEAD, and we want a realistic 7-char sha.
+echo "hook-v10" >"$SA_MP/scripts/hooks/the-hook.sh"
+git -C "$SA_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$SA_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "bump hook"
+sa_head=$(git -C "$SA_MP" rev-parse HEAD)
+sa_short=${sa_head:0:7}
+
+# Sibling consumers on disk so the dry-run override probe (which reads
+# the LOCAL consumer worktree's .sync-overrides.yml) has something to
+# read. alpha + beta carry no overrides; gamma registers a skip.
+mkdir -p "$SA_SIBLINGS/alpha" "$SA_SIBLINGS/beta" "$SA_SIBLINGS/gamma" "$SA_SIBLINGS/delta"
+git init -q "$SA_SIBLINGS/alpha"
+git init -q "$SA_SIBLINGS/beta"
+git init -q "$SA_SIBLINGS/gamma"
+git init -q "$SA_SIBLINGS/delta"
+cat >"$SA_SIBLINGS/gamma/.sync-overrides.yml" <<'YAML'
+skip_paths:
+  - path: scripts/coderabbit-wait.sh
+    reason: gamma maintains a bespoke coderabbit-wait wrapper
+YAML
+# delta overrides EVERY canonical + kit path — a fully-diverged
+# consumer. --sync-all must report it as skipped, not as a planned PR
+# (the dry-run path must mirror sync_all_open_pr's zero-target guard).
+cat >"$SA_SIBLINGS/delta/.sync-overrides.yml" <<'YAML'
+skip_paths:
+  - path: scripts/hooks/the-hook.sh
+    reason: delta vendors its own hook
+  - path: scripts/coderabbit-wait.sh
+    reason: delta vendors its own coderabbit-wait wrapper
+  - path: scripts/ci/
+    reason: delta maintains a bespoke CI kit
+YAML
+
+# 1) --sync-all --dry-run lists ALL canonical + kit paths for EVERY
+#    consumer (not just changed-at-a-commit ones). All 3 consumers
+#    appear; both canonical paths + the kit path are planned.
+sa_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" MERGEPATH_SIBLINGS_DIR="$SA_SIBLINGS" \
+  "$SCRIPT" --sync-all --dry-run 2>&1)
+[[ "$(echo "$sa_out" | grep -c 'would open PR')" -eq 3 ]] \
+  || fail "--sync-all --dry-run should plan one PR per consumer (3); got: $sa_out"
+echo "$sa_out" | grep -q "scripts/hooks/the-hook.sh (canonical)" \
+  || fail "--sync-all plan missing canonical path scripts/hooks/the-hook.sh"
+echo "$sa_out" | grep -q "scripts/coderabbit-wait.sh (canonical)" \
+  || fail "--sync-all plan missing canonical path scripts/coderabbit-wait.sh"
+echo "$sa_out" | grep -q "scripts/ci/ (kit, allow-extras)" \
+  || fail "--sync-all plan missing kit path scripts/ci/"
+echo "$sa_out" | grep -q "deferred — templated" \
+  || fail "--sync-all plan should note templated paths as deferred"
+
+# 2) --sync-all honors .sync-overrides.yml. gamma registered a skip of
+#    scripts/coderabbit-wait.sh — that path MUST be absent from gamma's
+#    sync set and MUST be marked SKIPPED in gamma's plan. This is the
+#    single most important correctness property of --sync-all: a bulk
+#    reconcile that clobbers an intentional divergence is worse than no
+#    --sync-all at all.
+gamma_block=$(echo "$sa_out" | awk '
+  /^gamma \(/ { in_block=1; next }
+  /^[a-z].* \(/ && in_block { exit }
+  in_block { print }
+')
+echo "$gamma_block" | grep -q "scripts/coderabbit-wait.sh (SKIPPED per .sync-overrides.yml" \
+  || fail "--sync-all did not honor gamma's .sync-overrides.yml skip; gamma block: $gamma_block"
+echo "$gamma_block" | grep -q "+ scripts/coderabbit-wait.sh (canonical)" \
+  && fail "--sync-all listed an override-skipped path as a sync target for gamma; gamma block: $gamma_block"
+# alpha has no overrides — the same path MUST still be a target for it.
+alpha_block=$(echo "$sa_out" | awk '
+  /^alpha \(/ { in_block=1; next }
+  /^[a-z].* \(/ && in_block { exit }
+  in_block { print }
+')
+echo "$alpha_block" | grep -q "+ scripts/coderabbit-wait.sh (canonical)" \
+  || fail "--sync-all should still sync scripts/coderabbit-wait.sh to alpha (no overrides); alpha block: $alpha_block"
+echo "$alpha_block" | grep -q "SKIPPED per .sync-overrides.yml" \
+  && fail "--sync-all marked a path skipped for alpha, which has no overrides; alpha block: $alpha_block"
+
+# 2b) Zero-target guard: delta overrides EVERY canonical + kit path, so
+#     the dry-run plan MUST report it as skipped (⊘) rather than as a
+#     planned PR. A "would open PR" line for delta would overstate the
+#     planned PR count vs. live behavior (sync_all_open_pr skips a
+#     fully-overridden consumer without opening a PR).
+echo "$sa_out" | grep -q "⊘ delta — all canonical+kit targets skipped per .sync-overrides.yml" \
+  || fail "--sync-all dry-run should report fully-overridden delta as skipped; got: $sa_out"
+echo "$sa_out" | grep -qE "⤷ delta — would open PR" \
+  && fail "--sync-all dry-run planned a PR for fully-overridden delta; should be skipped; got: $sa_out"
+# delta's overridden paths must still be surfaced as SKIPPED lines.
+echo "$sa_out" | grep -q "scripts/hooks/the-hook.sh (SKIPPED per .sync-overrides.yml" \
+  || fail "--sync-all dry-run should surface delta's override-skipped paths; got: $sa_out"
+# The "would open PR" count is still 3 — delta is skipped, not planned.
+[[ "$(echo "$sa_out" | grep -c 'would open PR')" -eq 3 ]] \
+  || fail "--sync-all dry-run should still plan exactly 3 PRs (delta skipped); got: $sa_out"
+
+# 3) --sync-all + --audit → exit 2 (mutex).
+set +e
+sa_audit_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" "$SCRIPT" --sync-all --audit 2>&1)
+sa_audit_ec=$?
+set -e
+[[ "$sa_audit_ec" -eq 2 ]] || fail "--sync-all + --audit should exit 2; got $sa_audit_ec"
+echo "$sa_audit_out" | grep -q "mutually exclusive" \
+  || fail "--sync-all + --audit should emit a 'mutually exclusive' diagnostic; got: $sa_audit_out"
+# Order independence: --audit first should also be rejected.
+set +e
+MERGEPATH_ROOT_OVERRIDE="$SA_MP" "$SCRIPT" --audit --sync-all 2>/dev/null
+sa_audit_ec2=$?
+set -e
+[[ "$sa_audit_ec2" -eq 2 ]] || fail "--audit + --sync-all (order swapped) should exit 2; got $sa_audit_ec2"
+
+# 4) --sync-all + positional <commit-ish> → exit 2 (mutex).
+set +e
+sa_commit_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" "$SCRIPT" --sync-all "$sa_head" 2>&1)
+sa_commit_ec=$?
+set -e
+[[ "$sa_commit_ec" -eq 2 ]] || fail "--sync-all + positional commit-ish should exit 2; got $sa_commit_ec"
+echo "$sa_commit_out" | grep -q "mutually exclusive" \
+  || fail "--sync-all + commit-ish should emit a 'mutually exclusive' diagnostic; got: $sa_commit_out"
+# Order independence: commit-ish first then --sync-all.
+set +e
+MERGEPATH_ROOT_OVERRIDE="$SA_MP" "$SCRIPT" "$sa_head" --sync-all 2>/dev/null
+sa_commit_ec2=$?
+set -e
+[[ "$sa_commit_ec2" -eq 2 ]] || fail "commit-ish + --sync-all (order swapped) should exit 2; got $sa_commit_ec2"
+
+# 4b) --audit + positional <commit-ish> → exit 2 (mixed-mode guard).
+#     --audit is a read-only drift scan and takes no commit-ish; before
+#     the SAW_* trackers, the commit-ish was silently dropped and audit
+#     ran anyway. Reject both arg orders with a usage error.
+set +e
+sa_audit_commit_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" "$SCRIPT" --audit "$sa_head" 2>&1)
+sa_audit_commit_ec=$?
+set -e
+[[ "$sa_audit_commit_ec" -eq 2 ]] \
+  || fail "--audit + positional commit-ish should exit 2; got $sa_audit_commit_ec"
+echo "$sa_audit_commit_out" | grep -q "takes no positional" \
+  || fail "--audit + commit-ish should emit a 'takes no positional' diagnostic; got: $sa_audit_commit_out"
+set +e
+MERGEPATH_ROOT_OVERRIDE="$SA_MP" "$SCRIPT" "$sa_head" --audit 2>/dev/null
+sa_audit_commit_ec2=$?
+set -e
+[[ "$sa_audit_commit_ec2" -eq 2 ]] \
+  || fail "commit-ish + --audit (order swapped) should exit 2; got $sa_audit_commit_ec2"
+
+# 5) --sync-all --repos <one> restricts to the named consumer.
+sa_repos_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" MERGEPATH_SIBLINGS_DIR="$SA_SIBLINGS" \
+  "$SCRIPT" --sync-all --dry-run --repos beta 2>&1)
+[[ "$(echo "$sa_repos_out" | grep -c 'would open PR')" -eq 1 ]] \
+  || fail "--sync-all --repos beta should plan exactly one PR; got: $sa_repos_out"
+echo "$sa_repos_out" | grep -q "^beta (" \
+  || fail "--sync-all --repos beta should include beta; got: $sa_repos_out"
+echo "$sa_repos_out" | grep -qE "^(alpha|gamma|delta) \(" \
+  && fail "--sync-all --repos beta leaked a non-filtered consumer; got: $sa_repos_out"
+
+# 6) Branch-name scheme for --sync-all is distinct from per-commit: it
+#    carries the `sync-all-` infix. Per-commit branches are
+#    `mergepath-sync/<sha>`; sync-all is `mergepath-sync/sync-all-<sha>`.
+echo "$sa_out" | grep -q "mergepath-sync/sync-all-${sa_short}" \
+  || fail "--sync-all branch name missing the 'sync-all-' prefix scheme; got: $sa_out"
+echo "$sa_out" | grep -qE "branch mergepath-sync/${sa_short} " \
+  && fail "--sync-all used the bare per-commit branch scheme (mergepath-sync/<sha>); must use sync-all- infix"
+
+# ---------------------------------------------------------------------------
 # --version / --help smoke
 # ---------------------------------------------------------------------------
 "$SCRIPT" --version | grep -q "sync-to-downstream.sh" || fail "--version output unexpected"
@@ -618,5 +813,6 @@ awk '
 "$SCRIPT" --help    | grep -q "no-pr"                 || fail "--help missing --no-pr documentation"
 "$SCRIPT" --help    | grep -q "recreate-existing"     || fail "--help missing --recreate-existing documentation"
 "$SCRIPT" --help    | grep -q "verbose"               || fail "--help missing --verbose documentation"
+"$SCRIPT" --help    | grep -q "sync-all"              || fail "--help missing --sync-all documentation"
 
 echo "test_sync_to_downstream: PASS"
