@@ -712,10 +712,16 @@ fi
 # current branch; with a positional argument it accepts number /
 # URL / branch forms identically to gh pr merge.
 #
-# Output format: a single line `MERGE_STATE|LABELS` (e.g.
-# `CLEAN|`, `BLOCKED|needs-external-review,bug`). The custom
-# `--jq` filter joins the two fields so the hook only has to
-# parse one string.
+# Output format: mergeStateStatus on line 1, then one label name
+# per line (zero or more lines). The `--jq` filter is
+# `.mergeStateStatus, .labels[].name` — jq emits each result on
+# its own line. NEWLINE-delimited, NOT comma-joined: GitHub label
+# names may legally contain commas (and spaces), so a CSV join
+# would make the later exact-match label gate ambiguous — a label
+# literally named `team,needs-external-review` would be parsed as
+# two labels and false-match the real `needs-external-review`
+# gate (CodeRabbit caught this on PR #263). Label names cannot
+# contain newlines, so one-label-per-line is unambiguous.
 #
 # #171 / #170 retrospective: pre-this-change the hook fetched
 # only labels and let `gh pr merge` run even when GitHub's
@@ -726,7 +732,7 @@ fi
 # protection: even if branch protection is misconfigured or
 # disabled for an emergency hotfix, the hook will still refuse
 # to dispatch the merge.
-GH_JQ='"\(.mergeStateStatus)|\([.labels[].name] | join(","))"'
+GH_JQ='.mergeStateStatus, .labels[].name'
 GH_ARGS=(pr view --json labels,mergeStateStatus --jq "$GH_JQ")
 if [ -n "$PR_SELECTOR" ]; then
   GH_ARGS=(pr view "$PR_SELECTOR" --json labels,mergeStateStatus --jq "$GH_JQ")
@@ -738,11 +744,11 @@ fi
 # Capture stdout and stderr separately. Codex P1 on matchline PR
 # #174 r2: a `2>&1` form would prepend ANY non-fatal stderr gh
 # emitted (update notifier, deprecation warnings, etc.) to the
-# stdout payload, then the `${GH_OUTPUT%%|*}` parameter expansion
-# would parse that noise as MERGE_STATE — corrupting a CLEAN PR
-# into the unrecognized-state block path. Routing stderr to a
-# tempfile keeps MERGE_STATE pure. We still surface stderr in the
-# error path for diagnostics.
+# stdout payload, then the line-1 `MERGE_STATE` extraction would
+# parse that noise as MERGE_STATE — corrupting a CLEAN PR into the
+# unrecognized-state block path. Routing stderr to a tempfile
+# keeps MERGE_STATE pure. We still surface stderr in the error
+# path for diagnostics.
 GH_STDERR=$(mktemp)
 # Re-declare the EXIT trap so $GH_STDERR is also cleaned up. The
 # trap call replaces (not appends) any prior trap; keep all three
@@ -764,13 +770,13 @@ if ! GH_OUTPUT=$(gh "${GH_ARGS[@]}" 2>"$GH_STDERR"); then
   exit 2
 fi
 
-# Split on the first `|`. The mergeStateStatus enum values are
-# all uppercase ASCII identifiers without `|`, and the labels
-# are comma-joined (commas, not pipes), so the split is
-# unambiguous. Empty MERGE_STATE (e.g., transient API state)
-# falls into the `*` case below and fails closed.
-MERGE_STATE="${GH_OUTPUT%%|*}"
-LABELS="${GH_OUTPUT#*|}"
+# Line 1 is mergeStateStatus; lines 2..N are label names (one per
+# line, possibly zero). Empty/missing MERGE_STATE (e.g. transient
+# API state) falls into the `*` case below and fails closed.
+# LABELS keeps the newline-delimited remainder for the exact-match
+# gate further down — never re-join it into a delimited string.
+MERGE_STATE=$(printf '%s\n' "$GH_OUTPUT" | sed -n '1p')
+LABELS=$(printf '%s\n' "$GH_OUTPUT" | sed -n '2,$p')
 
 # mergeStateStatus check (#171 layer 2). API enum (full set per
 # GitHub GraphQL `MergeStateStatus`):
@@ -854,17 +860,20 @@ if [ "$ADMIN_REQUESTED" -eq 1 ]; then
   exit 2
 fi
 
-case ",$LABELS," in
-  *,needs-external-review,*)
-    if [ "$EFFECTIVE_CODEX_CLEARED" != "1" ]; then
-      echo "BLOCKED: PR carries 'needs-external-review' and CODEX_CLEARED is not set." >&2
-      echo "  Phase 4a merge gate: run 'scripts/codex-review-check.sh <PR#>' first." >&2
-      echo "  When it exits 0, retry this merge with CODEX_CLEARED=1 (export or inline prefix)." >&2
-      echo "  See REVIEW_POLICY.md § Phase 4a for the full flow." >&2
-      exit 2
-    fi
-    echo "CODEX_CLEARED=1 set; PR is labeled needs-external-review but agent claims merge-gate has passed." >&2
-    ;;
-esac
+# Exact-match the label gate against the newline-delimited LABELS
+# list. `grep -Fxq` = fixed-string, whole-line, quiet — so a label
+# literally named `team,needs-external-review` (commas are legal in
+# GitHub label names) is its own line and does NOT false-match the
+# real `needs-external-review` gate.
+if printf '%s\n' "$LABELS" | grep -Fxq "needs-external-review"; then
+  if [ "$EFFECTIVE_CODEX_CLEARED" != "1" ]; then
+    echo "BLOCKED: PR carries 'needs-external-review' and CODEX_CLEARED is not set." >&2
+    echo "  Phase 4a merge gate: run 'scripts/codex-review-check.sh <PR#>' first." >&2
+    echo "  When it exits 0, retry this merge with CODEX_CLEARED=1 (export or inline prefix)." >&2
+    echo "  See REVIEW_POLICY.md § Phase 4a for the full flow." >&2
+    exit 2
+  fi
+  echo "CODEX_CLEARED=1 set; PR is labeled needs-external-review but agent claims merge-gate has passed." >&2
+fi
 
 exit 0

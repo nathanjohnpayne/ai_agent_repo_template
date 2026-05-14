@@ -57,10 +57,18 @@ case "$1 $2" in
     exit 0
     ;;
   "pr view")
-    # The unified hook fetches labels + mergeStateStatus together and
-    # parses the `MERGE_STATE|LABELS` shape. Default to CLEAN so a
-    # test that only cares about labels doesn't have to set the state.
-    echo "${STUB_MERGE_STATE:-CLEAN}|${STUB_LABELS:-}"
+    # The unified hook fetches labels + mergeStateStatus together with
+    # `--jq '.mergeStateStatus, .labels[].name'` — mergeStateStatus on
+    # line 1, then one label name per line. Default state to CLEAN so a
+    # test that only cares about labels doesn't have to set it.
+    # STUB_LABELS is SEMICOLON-separated here for test-authoring
+    # convenience (NOT comma — a single label name may legally contain
+    # a comma, and a test must be able to pass exactly that); emit one
+    # label per line to match real `gh` output.
+    echo "${STUB_MERGE_STATE:-CLEAN}"
+    if [ -n "${STUB_LABELS:-}" ]; then
+      echo "$STUB_LABELS" | tr ';' '\n'
+    fi
     exit 0
     ;;
   *)
@@ -338,6 +346,23 @@ if [ "$rc" -ne 0 ]; then
   fail "merge CLEAN + needs-external-review + CODEX_CLEARED=1: exit $rc, expected 0; output: $out"
 else
   pass "merge CLEAN + needs-external-review + CODEX_CLEARED=1: allowed"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 16: a label literally NAMED `team,needs-external-review` (commas
+# are legal in GitHub label names) must NOT false-match the real
+# `needs-external-review` gate. Regression net for the CSV-join
+# ambiguity CodeRabbit caught on PR #263 — the gate is now an
+# exact whole-line match, not a substring/CSV-membership test.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh pr merge 123 --squash' "nathanjohnpayne" "0" "CLEAN" "team,needs-external-review" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "label 'team,needs-external-review' does NOT false-match the needs-external-review gate"
+else
+  fail "comma-in-label false-match: exit $rc, expected 0 (the label is not literally 'needs-external-review'); output: $out"
 fi
 
 # ---------------------------------------------------------------------------
