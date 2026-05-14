@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# scripts/ci/check_sweep_unresolved_feedback
+#
+# Runs unit tests for the #236 weekly feedback sweep pipeline:
+#
+#   scripts/sweep-unresolved-feedback/enumerate.sh
+#   scripts/sweep-unresolved-feedback/render.sh
+#
+# The tests stub `gh` via a PATH shim, so this check is hermetic: no
+# network, no real auth. Mirrors the pattern of check_gh_as_author /
+# check_sync_overrides.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+REQUIRED_FILES=(
+  "scripts/sweep-unresolved-feedback/enumerate.sh"
+  "scripts/sweep-unresolved-feedback/render.sh"
+  "scripts/sweep-unresolved-feedback/target-repos.txt"
+  ".github/workflows/weekly-feedback-sweep.yml"
+  "tests/test_sweep_unresolved_feedback.sh"
+)
+
+FAILED=0
+for rel in "${REQUIRED_FILES[@]}"; do
+  full="$REPO_ROOT/$rel"
+  if [ ! -f "$full" ]; then
+    echo "check_sweep_unresolved_feedback: ERROR missing $rel" >&2
+    FAILED=1
+  fi
+done
+
+# Exec bit on the scripts.
+for rel in scripts/sweep-unresolved-feedback/enumerate.sh scripts/sweep-unresolved-feedback/render.sh; do
+  full="$REPO_ROOT/$rel"
+  if [ -f "$full" ] && [ ! -x "$full" ]; then
+    echo "check_sweep_unresolved_feedback: ERROR $rel not executable (chmod +x)" >&2
+    FAILED=1
+  fi
+done
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_sweep_unresolved_feedback: FAIL (file presence)"
+  exit 1
+fi
+
+TEST="$REPO_ROOT/tests/test_sweep_unresolved_feedback.sh"
+echo "check_sweep_unresolved_feedback: running $TEST"
+if ! bash "$TEST"; then
+  echo "check_sweep_unresolved_feedback: FAIL (tests)" >&2
+  exit 1
+fi
+
+echo "check_sweep_unresolved_feedback: PASS"
+exit 0
