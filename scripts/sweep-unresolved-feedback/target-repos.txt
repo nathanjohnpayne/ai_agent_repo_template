@@ -1,0 +1,19 @@
+# scripts/sweep-unresolved-feedback/target-repos.txt
+#
+# One owner/repo per line. Lines starting with `#` and blank lines
+# are ignored. Read by enumerate.sh and render.sh.
+#
+# Seed list is the 9 repos surveyed by the 2026-05-13 manual sweep
+# that produced the 209-item rollup in #234.
+#
+# To onboard a new repo: add a line. No code changes required.
+
+nathanjohnpayne/friends-and-family-billing
+nathanjohnpayne/device-platform-reporting
+nathanjohnpayne/device-source-of-truth
+nathanjohnpayne/swipewatch
+nathanjohnpayne/nathanpaynedotcom
+nathanjohnpayne/overridebroadway
+nathanjohnpayne/matchline
+nathanjohnpayne/tadlockpsychiatry
+nathanjohnpayne/mergepath
