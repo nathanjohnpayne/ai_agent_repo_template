@@ -103,6 +103,26 @@ paths:
     type: canonical
     consumers: all
 
+  # Canonical tests — the suites that exercise the canonical
+  # scripts/hooks above. These MUST travel with the scripts they
+  # test: a consumer that runs the suite (via scripts/ci/
+  # check_gh_as_author, or a repo-local check_hook_tests) against a
+  # freshly-propagated canonical hook needs the matching canonical
+  # test, or the test fails closed on a version mismatch. The
+  # propagation wave's matchline failure (#264) was exactly this —
+  # matchline carried a divergent FORK of the gh-pr-guard test that
+  # drifted from the canonical hook. Pairing each script with its
+  # test in the manifest closes that coupling gap.
+  - path: tests/test_gh_pr_guard.sh
+    type: canonical
+    consumers: all
+  - path: tests/test_gh_as_author.sh
+    type: canonical
+    consumers: all
+  - path: tests/test_gh_as_reviewer.sh
+    type: canonical
+    consumers: all
+
   # Canonical workflows — review policy + automation surfaces that
   # should be lockstep across all consumers.
   - path: .github/workflows/agent-review.yml
