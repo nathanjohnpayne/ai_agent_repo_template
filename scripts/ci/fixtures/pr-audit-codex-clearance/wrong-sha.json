@@ -1,0 +1,16 @@
+{
+  "description": "Codex review present but on an older SHA, not on HEAD → NOT cleared",
+  "expected_cleared": false,
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "reviews": [
+    {
+      "id": 1001,
+      "state": "COMMENTED",
+      "commit_id": "00000000staleshathatisnotcurrenthead0000",
+      "submitted_at": "2026-05-10T10:00:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ],
+  "inline_comments": []
+}
