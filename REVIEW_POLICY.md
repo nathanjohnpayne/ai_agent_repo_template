@@ -767,10 +767,25 @@ ssh -T git@github-claude        # → Hi nathanpayne-claude!
 
 ### Switching all repos to SSH remotes
 
+The SSH-remote-switch covers every repo on the operator's machine (template
++ consumers + docs). Current set:
+
+<!-- bootstrap-loop-list-start -->
+- mergepath
+- swipewatch
+- nathanpaynedotcom
+- device-platform-reporting
+- device-source-of-truth
+- overridebroadway
+- friends-and-family-billing
+- docs
+<!-- bootstrap-loop-list-end -->
+
 ```bash
-for repo in mergepath swipewatch nathanpaynedotcom \
-            device-platform-reporting device-source-of-truth \
-            overridebroadway friends-and-family-billing docs; do
+# Explicit path to mergepath/REVIEW_POLICY.md — pwd may not be the
+# mergepath repo when the operator runs this (see #252 Codex P1).
+for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' \
+              ~/Documents/GitHub/mergepath/REVIEW_POLICY.md | grep '^- ' | sed 's/^- //'); do
   cd ~/Documents/GitHub/$repo
   CURRENT=$(git remote get-url origin)
   if [[ "$CURRENT" == https* ]]; then
