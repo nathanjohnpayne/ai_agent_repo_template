@@ -78,6 +78,9 @@ jobs:
       - name: check_sweep_unresolved_feedback
         run: ./scripts/ci/check_sweep_unresolved_feedback
 
+      - name: check_disagreement_detector
+        run: ./scripts/ci/check_disagreement_detector
+
       - name: install_yq_for_sync_manifest
         # mikefarah/yq is needed by check_sync_manifest. Pin a recent v4
         # release; bumped opportunistically. The official ubuntu-latest

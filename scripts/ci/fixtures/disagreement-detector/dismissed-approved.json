@@ -1,0 +1,34 @@
+{
+  "description": "DISMISSED APPROVED from reviewer A on HEAD + live CHANGES_REQUESTED from reviewer B on HEAD. DISMISSED must not satisfy hasApproval, so this is NOT a disagreement (one-sided CHANGES_REQUESTED only).",
+  "headSha": "feedfacebeef000000000000000000000000feed",
+  "hasLabel": false,
+  "reviewerAccounts": [
+    "nathanpayne-claude",
+    "nathanpayne-codex",
+    "nathanpayne-cursor"
+  ],
+  "expected_decision": "noop",
+  "reviews": [
+    {
+      "id": 30,
+      "state": "APPROVED",
+      "commit_id": "feedfacebeef000000000000000000000000feed",
+      "submitted_at": "2026-05-12T08:00:00Z",
+      "user": { "login": "nathanpayne-cursor" }
+    },
+    {
+      "id": 31,
+      "state": "DISMISSED",
+      "commit_id": "feedfacebeef000000000000000000000000feed",
+      "submitted_at": "2026-05-12T08:30:00Z",
+      "user": { "login": "nathanpayne-cursor" }
+    },
+    {
+      "id": 32,
+      "state": "CHANGES_REQUESTED",
+      "commit_id": "feedfacebeef000000000000000000000000feed",
+      "submitted_at": "2026-05-12T09:00:00Z",
+      "user": { "login": "nathanpayne-codex" }
+    }
+  ]
+}

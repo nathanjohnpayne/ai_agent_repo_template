@@ -1,0 +1,27 @@
+{
+  "description": "Two different reviewers BOTH on current HEAD with conflicting states — the real disagreement case, regression-net. Should apply.",
+  "headSha": "abc333liveheadsha333333333333333333333333",
+  "hasLabel": false,
+  "reviewerAccounts": [
+    "nathanpayne-claude",
+    "nathanpayne-codex",
+    "nathanpayne-cursor"
+  ],
+  "expected_decision": "apply",
+  "reviews": [
+    {
+      "id": 20,
+      "state": "APPROVED",
+      "commit_id": "abc333liveheadsha333333333333333333333333",
+      "submitted_at": "2026-05-12T09:00:00Z",
+      "user": { "login": "nathanpayne-cursor" }
+    },
+    {
+      "id": 21,
+      "state": "CHANGES_REQUESTED",
+      "commit_id": "abc333liveheadsha333333333333333333333333",
+      "submitted_at": "2026-05-12T10:00:00Z",
+      "user": { "login": "nathanpayne-codex" }
+    }
+  ]
+}
