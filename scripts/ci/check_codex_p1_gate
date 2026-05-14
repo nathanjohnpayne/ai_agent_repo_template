@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# check_codex_p1_gate
+#
+# CI wrapper for scripts/codex-p1-gate.sh — the Codex P1 unresolved-
+# thread merge gate (nathanjohnpayne/mergepath#235).
+#
+# Two concerns:
+#   1. The script and its workflow must exist on disk and be executable
+#      (consistent with check_codex_scripts for the Phase 4a helpers).
+#   2. The script's parsing + decision logic must work against fixture
+#      review-comment payloads. We delegate this to
+#      tests/test_codex_p1_gate.sh which PATH-shims `gh` and walks the
+#      script through 11 cases (enabled/disabled, P1 present/absent,
+#      resolved/unresolved, SHA scoping, non-bot authors, mixed
+#      thread state, malformed input, pagination overflow).
+#
+# Invoked by .github/workflows/repo_lint.yml alongside the other
+# scripts/ci/check_* scripts.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+SCRIPT="scripts/codex-p1-gate.sh"
+WORKFLOW=".github/workflows/codex-p1-gate.yml"
+TEST="tests/test_codex_p1_gate.sh"
+
+FAILED=0
+
+# Existence + executability checks.
+for rel in "$SCRIPT" "$TEST"; do
+  if [ ! -f "$rel" ]; then
+    echo "FAIL: Missing required file: $rel"
+    FAILED=1
+    continue
+  fi
+  if [ ! -x "$rel" ]; then
+    echo "FAIL: File is not executable: $rel"
+    echo "      Fix with: chmod +x $rel"
+    FAILED=1
+  fi
+done
+
+# Workflow file exists (not executable; YAML is not a shell script).
+if [ ! -f "$WORKFLOW" ]; then
+  echo "FAIL: Missing required workflow: $WORKFLOW"
+  FAILED=1
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_codex_p1_gate: FAIL (pre-flight)"
+  exit 1
+fi
+
+# Run the fixture-driven test suite.
+if ! bash "$TEST"; then
+  echo "check_codex_p1_gate: FAIL (test suite)"
+  exit 1
+fi
+
+echo "check_codex_p1_gate: PASS"
+exit 0

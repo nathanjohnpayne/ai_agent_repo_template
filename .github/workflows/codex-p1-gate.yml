@@ -1,0 +1,98 @@
+name: Codex P1 Gate
+
+# Enforces nathanjohnpayne/mergepath#235: Codex P1 inline-review findings
+# must be resolved (via the GitHub UI's "Resolve conversation" button or
+# the GraphQL `resolveReviewThread` mutation) before a PR can merge.
+#
+# Reports "Codex P1 unresolved: N" via scripts/codex-p1-gate.sh. The
+# script exits 1 (gate fails) when any Codex P1 thread on the current
+# HEAD is unresolved.
+#
+# Gate ON/OFF is controlled by codex.p1_gate.enabled in
+# .github/review-policy.yml. Mergepath sets it to true (the canonical
+# source). Downstream consumers default to false until the override
+# pattern is shaken out here (per #235's "start narrow" recommendation).
+#
+# Re-runs on every push to a PR AND on every review submission, so a
+# human who clicks "Resolve conversation" on a P1 thread sees the gate
+# go green within the next event without needing a push. The
+# pull_request_review trigger is what makes this gate UI-overrideable
+# without a force-push dance.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  # pull_request_review_comment fires when a reviewer posts (or edits /
+  # deletes) an inline diff comment. Catches the case where Codex
+  # posts a new P1 mid-review without a fresh review-submission event.
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+
+permissions:
+  contents: read
+  pull-requests: read
+  # GraphQL reviewThreads requires the same read scope as pulls; no
+  # write permissions needed (the gate is read-only).
+
+jobs:
+  codex-p1-gate:
+    name: Codex P1 unresolved threads
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (for scripts/codex-p1-gate.sh)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Always run the TRUSTED copy of the gate script from the
+          # PR's HEAD ref. Unlike auto-clear-blocking-labels.yml (which
+          # writes labels and must defend against a malicious PR
+          # editing the gate logic), this workflow is strictly
+          # read-only — it can't be weaponized to escalate beyond
+          # reading public-or-permitted PR data. Pulling the PR's own
+          # version lets the gate script evolve alongside the PR diff
+          # rather than always running main's version.
+
+      - name: Resolve PR number
+        id: pr
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_JSON: ${{ toJSON(github.event) }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request|pull_request_review|pull_request_review_comment)
+              pr=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
+              ;;
+            *)
+              echo "Unsupported event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          if [ -z "$pr" ] || [ "$pr" = "null" ]; then
+            echo "Could not resolve PR number from event payload." >&2
+            exit 1
+          fi
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Run scripts/codex-p1-gate.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The script is the source of truth for what blocks merge.
+          # Exit codes:
+          #   0 = no unresolved P1s on HEAD (or gate disabled)
+          #   1 = unresolved P1s present (gate blocks)
+          #   2 = config / usage error (CI failure, not a gate block)
+          set +e
+          scripts/codex-p1-gate.sh "$PR_NUMBER" "$REPO"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::codex-p1-gate.sh exited 2 (config/usage error)"
+            exit 1
+          fi
+          exit "$rc"
