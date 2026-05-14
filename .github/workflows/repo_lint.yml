@@ -96,6 +96,26 @@ jobs:
       - name: check_sync_manifest
         run: ./scripts/ci/check_sync_manifest
 
+      - name: check_coderabbit_config
+        # Validates the template-level .coderabbit.yml stays on the
+        # nit-suppressing profile (chill). Shares the yq install with
+        # check_sync_manifest above. See #237 for the rationale.
+        #
+        # Scope (per Codex P2 on #256): the profile=chill enforcement
+        # only runs when the executing repo is the Mergepath template
+        # itself, detected via GITHUB_REPOSITORY (always set by Actions).
+        # Consumer repos that inherit this workflow via the template-
+        # mirror bootstrap still get the YAML parse + file-existence
+        # checks but are free to set reviews.profile: assertive locally
+        # without their CI failing.
+        run: ./scripts/ci/check_coderabbit_config
+
+      - name: check_coderabbit_config_tests
+        # Unit tests for check_coderabbit_config itself — covers the
+        # template-vs-consumer detection logic and the assertion paths
+        # added by #256 P2.
+        run: ./scripts/ci/check_coderabbit_config_tests
+
       - name: check_governance_files
         run: |
           MISSING=0

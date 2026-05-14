@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# check_coderabbit_config
+#
+# Validates .coderabbit.yml — the CodeRabbit configuration shipped
+# with the Mergepath template and propagated to consumer repos via
+# the wizard's template-mirror bootstrap (scripts/bootstrap/
+# template-mirror.sh). See #237 for the nit-collapse change this
+# check enforces.
+#
+# Scoping (per Codex P2 on #256 round 1, then CR on round 2):
+#
+#   Round 1 scoped the profile-value gate to the Mergepath template
+#   repo so consumers may run reviews.profile: assertive locally
+#   without their CI failing.
+#
+#   Round 2 (this revision) further scopes the existence requirement
+#   to repos that actually have CodeRabbit enabled. The sub-D
+#   wizard (PR #248) intentionally deletes .coderabbit.yml when a
+#   private consumer repo is bootstrapped — CodeRabbit's free tier is
+#   public-only, so the wizard flips `coderabbit.enabled: false` in
+#   `.github/review-policy.yml` AND removes the now-pointless file.
+#   The previous "must exist" hard requirement therefore fired on
+#   every private consumer and reported FAIL on an intentional state.
+#
+# Existence behavior:
+#
+#   File present:
+#     parse the YAML; if this is the Mergepath template repo,
+#     enforce reviews.profile == "chill".
+#
+#   File absent + review-policy.yml's `coderabbit.enabled` is false:
+#     PASS (intentional disable per sub-D's private-repo bootstrap;
+#     see #248).
+#
+#   File absent + `coderabbit.enabled` is true / unset / no policy
+#   file:
+#     FAIL (config drift on a repo that says it wants CodeRabbit;
+#     the template itself also lands here when its .coderabbit.yml
+#     has wandered off).
+#
+# The profile gate (`reviews.profile == "chill"`) only fires when
+# .coderabbit.yml exists AND this is the Mergepath template repo.
+#
+# Template-repo detection prefers CI signals (GITHUB_REPOSITORY,
+# which Actions always sets, matched against `*/mergepath`) and
+# falls back to the origin remote URL for local runs. An override
+# env var (MERGEPATH_TEMPLATE_CHECK=force|skip) is provided for
+# tests and edge cases.
+#
+# This check is read-only and does not contact CodeRabbit's API.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CONFIG="$REPO_ROOT/.coderabbit.yml"
+REVIEW_POLICY="$REPO_ROOT/.github/review-policy.yml"
+EXPECTED_PROFILE="chill"
+
+if ! command -v yq >/dev/null 2>&1; then
+  echo "FAIL: yq is required (mikefarah/yq v4+). Install via 'brew install yq' or apt."
+  exit 2
+fi
+
+# Reject non-mikefarah yq (kislyuk/yq is a Python wrapper around jq with a
+# completely different syntax — its `//` and `-r` semantics don't match the
+# patterns this script relies on; accepting it surfaces as cryptic downstream
+# parse errors). Mirrors the same check in scripts/sync-to-downstream.sh and
+# scripts/bootstrap-new-repo.sh's preflight. CodeRabbit round-2 minor on #256.
+if ! yq --version 2>&1 | grep -q "mikefarah/yq"; then
+  echo "FAIL: unsupported yq implementation (got: $(yq --version 2>&1 | head -1)); expected mikefarah/yq v4+. Install via 'brew install yq'."
+  exit 2
+fi
+
+# Resolve whether this repo expects CodeRabbit to be active. The
+# canonical signal is `.github/review-policy.yml`'s `coderabbit.enabled`
+# field — sub-D (#248) flips this to `false` and deletes .coderabbit.yml
+# in one transaction when bootstrapping a private repo. Treat the
+# absence of the policy file (or the absence of the coderabbit key)
+# as "enabled" so the template's own CI keeps catching a missing
+# .coderabbit.yml.
+#
+# Note: `yq -r '.x // "unset"' …` treats the YAML literal `false` as
+# a missing value and substitutes the default — exactly the wrong
+# behavior here. Read the key directly (yq emits `null` for missing
+# keys, `false`/`true` for the literal booleans) and pattern-match
+# the raw output instead.
+coderabbit_enabled="true"
+if [ -f "$REVIEW_POLICY" ]; then
+  raw=$(yq -r '.coderabbit.enabled' "$REVIEW_POLICY" 2>/dev/null || echo "null")
+  case "$raw" in
+    false) coderabbit_enabled="false" ;;
+    *)     coderabbit_enabled="true"  ;;
+  esac
+fi
+
+if [ ! -f "$CONFIG" ]; then
+  if [ "$coderabbit_enabled" = "false" ]; then
+    echo "check_coderabbit_config: PASS (.coderabbit.yml absent; coderabbit.enabled=false in review-policy.yml — private-repo bootstrap path per #248)"
+    exit 0
+  fi
+  echo "FAIL: .coderabbit.yml is missing at repo root (coderabbit.enabled is not false in $REVIEW_POLICY)"
+  echo "      If this repo intentionally disables CodeRabbit, set 'coderabbit.enabled: false' in .github/review-policy.yml."
+  exit 1
+fi
+
+if ! yq '.' "$CONFIG" >/dev/null 2>&1; then
+  echo "FAIL: .coderabbit.yml does not parse as YAML"
+  yq '.' "$CONFIG" || true
+  exit 1
+fi
+
+# --- template-repo detection ------------------------------------------------
+#
+# Returns 0 if this repo is the Mergepath template (where the profile
+# gate applies), 1 otherwise. Order of precedence:
+#
+#   1. MERGEPATH_TEMPLATE_CHECK=force  → treat as template (run gate)
+#   2. MERGEPATH_TEMPLATE_CHECK=skip   → treat as consumer (skip gate)
+#   3. GITHUB_REPOSITORY (CI)          → match *.mergepath suffix
+#   4. git remote get-url origin       → match mergepath repo basename
+#   5. unknown                         → skip the gate (fail-open for
+#                                        the override-friendly direction)
+#
+# The basename match accepts both `mergepath` and `mergepath.git` so
+# SSH-style remotes (`git@github.com:OWNER/mergepath.git`) work.
+is_mergepath_template() {
+  case "${MERGEPATH_TEMPLATE_CHECK:-}" in
+    force) return 0 ;;
+    skip)  return 1 ;;
+  esac
+
+  if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+    case "$GITHUB_REPOSITORY" in
+      */mergepath) return 0 ;;
+      *)           return 1 ;;
+    esac
+  fi
+
+  local remote_url
+  if remote_url=$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null); then
+    # Strip a trailing .git, then take the last path component. Works
+    # for both https://host/owner/mergepath.git and
+    # git@host:owner/mergepath.git.
+    local basename_no_git="${remote_url%.git}"
+    basename_no_git="${basename_no_git##*/}"
+    basename_no_git="${basename_no_git##*:}"
+    case "$basename_no_git" in
+      mergepath) return 0 ;;
+      *)         return 1 ;;
+    esac
+  fi
+
+  # No CI env var, no origin remote. Fail-open: skip the gate. A
+  # malformed YAML or missing file still failed the earlier checks;
+  # only the profile-value enforcement is template-scoped.
+  return 1
+}
+
+if ! is_mergepath_template; then
+  echo "check_coderabbit_config: PASS (parse OK; profile gate skipped — not the Mergepath template repo)"
+  exit 0
+fi
+
+profile=$(yq -r '.reviews.profile // ""' "$CONFIG")
+if [ "$profile" != "$EXPECTED_PROFILE" ]; then
+  echo "FAIL: reviews.profile is '$profile', expected '$EXPECTED_PROFILE' (#237 nit-collapse)"
+  echo "      'assertive' re-enables 🧹 Nitpick comments per CodeRabbit's docs."
+  echo "      Keep the template on '$EXPECTED_PROFILE'; consumer repos may override locally."
+  exit 1
+fi
+
+echo "check_coderabbit_config: PASS (reviews.profile=$profile)"
+exit 0

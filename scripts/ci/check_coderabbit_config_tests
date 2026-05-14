@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# scripts/ci/check_coderabbit_config_tests — CI entry point for the
+# check_coderabbit_config unit tests (#256 P2 follow-up to #237).
+#
+# Wraps tests/test_check_coderabbit_config.sh so the repo_lint workflow
+# picks it up alongside the other check_* scripts. Missing test script
+# is a hard error (matches the tightening applied to other check_* CI
+# entry points in #228 round 5).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_check_coderabbit_config.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_coderabbit_config_tests: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
