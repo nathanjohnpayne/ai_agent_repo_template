@@ -962,7 +962,12 @@ sync_open_pr() {
     err "could not create workspace tmpdir"
     return 1
   }
-  trap "rm -rf '$workspace'" RETURN
+  # Single-quote the trap body so $workspace is expanded when the trap
+  # FIRES (RETURN), not when it's installed — a single quote in TMPDIR
+  # or a consumer name can't then break the cleanup command or inject
+  # shell syntax. $workspace is function-local but still in scope at
+  # RETURN time.
+  trap 'rm -rf "$workspace"' RETURN
 
   printf "  ⤷ %s — cloning %s\n" "$consumer_name" "$consumer_repo"
   if ! gh repo clone "$consumer_repo" "$workspace/repo" -- --depth=10 --quiet >&2; then
@@ -1067,7 +1072,13 @@ sync_open_pr() {
   # Sanity: did the copy actually change anything? If the consumer was
   # already in sync (someone hand-propagated it before us, or a prior
   # sync ran but the PR was never opened), don't push an empty commit.
-  if ! git -C "$workspace/repo" diff --quiet HEAD --; then
+  # `git status --porcelain` (not `git diff HEAD`) so the no-op check
+  # also catches BRAND-NEW files: a consumer missing a whole canonical
+  # or kit file gets it materialized as an untracked file, which
+  # `git diff --quiet HEAD` would not see — it would false-negative as
+  # "already in sync" and skip a real propagation. Porcelain reports
+  # tracked modifications AND untracked additions.
+  if [ -n "$(git -C "$workspace/repo" status --porcelain)" ]; then
     :
   else
     printf "  · %s already in sync at HEAD (no diff after copy)\n" "$consumer_name"
@@ -1287,7 +1298,12 @@ sync_all_open_pr() {
     err "could not create workspace tmpdir"
     return 1
   }
-  trap "rm -rf '$workspace'" RETURN
+  # Single-quote the trap body so $workspace is expanded when the trap
+  # FIRES (RETURN), not when it's installed — a single quote in TMPDIR
+  # or a consumer name can't then break the cleanup command or inject
+  # shell syntax. $workspace is function-local but still in scope at
+  # RETURN time.
+  trap 'rm -rf "$workspace"' RETURN
 
   printf "  ⤷ %s — cloning %s\n" "$consumer_name" "$consumer_repo"
   if ! gh repo clone "$consumer_repo" "$workspace/repo" -- --depth=10 --quiet >&2; then
@@ -1443,7 +1459,13 @@ sync_all_open_pr() {
   # Sanity: did the copy actually change anything? A consumer already
   # at HEAD state (hand-propagated, or a prior --sync-all PR merged)
   # should not get an empty commit / PR.
-  if ! git -C "$workspace/repo" diff --quiet HEAD --; then
+  # `git status --porcelain` (not `git diff HEAD`) so the no-op check
+  # also catches BRAND-NEW files: a consumer missing a whole canonical
+  # or kit file gets it materialized as an untracked file, which
+  # `git diff --quiet HEAD` would not see — it would false-negative as
+  # "already in sync" and skip a real propagation. Porcelain reports
+  # tracked modifications AND untracked additions.
+  if [ -n "$(git -C "$workspace/repo" status --porcelain)" ]; then
     :
   else
     printf "  · %s already in sync at HEAD (no diff after copy)\n" "$consumer_name"
@@ -2041,6 +2063,15 @@ fi
 if [ "$SAW_SYNC_ALL" = "1" ] && [ "$SAW_COMMIT_ISH" = "1" ]; then
   err "--sync-all and a positional <commit-ish> are mutually exclusive"
   err "       --sync-all replays the full manifest at HEAD; a <commit-ish> propagates only that commit's changes. Pick one."
+  exit 2
+fi
+# --audit is read-only and takes no commit-ish. A positional arg
+# alongside --audit is a mixed-mode invocation: without this guard the
+# commit-ish is silently dropped and audit runs anyway. Reject it with
+# a usage error rather than doing the wrong thing quietly.
+if [ "$SAW_AUDIT" = "1" ] && [ "$SAW_COMMIT_ISH" = "1" ]; then
+  err "--audit takes no positional <commit-ish> (audit is a read-only drift scan, not a propagation)"
+  err "       Drop the commit-ish for an audit, or drop --audit to propagate that commit."
   exit 2
 fi
 

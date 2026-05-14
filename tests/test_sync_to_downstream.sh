@@ -768,6 +768,25 @@ sa_commit_ec2=$?
 set -e
 [[ "$sa_commit_ec2" -eq 2 ]] || fail "commit-ish + --sync-all (order swapped) should exit 2; got $sa_commit_ec2"
 
+# 4b) --audit + positional <commit-ish> → exit 2 (mixed-mode guard).
+#     --audit is a read-only drift scan and takes no commit-ish; before
+#     the SAW_* trackers, the commit-ish was silently dropped and audit
+#     ran anyway. Reject both arg orders with a usage error.
+set +e
+sa_audit_commit_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" "$SCRIPT" --audit "$sa_head" 2>&1)
+sa_audit_commit_ec=$?
+set -e
+[[ "$sa_audit_commit_ec" -eq 2 ]] \
+  || fail "--audit + positional commit-ish should exit 2; got $sa_audit_commit_ec"
+echo "$sa_audit_commit_out" | grep -q "takes no positional" \
+  || fail "--audit + commit-ish should emit a 'takes no positional' diagnostic; got: $sa_audit_commit_out"
+set +e
+MERGEPATH_ROOT_OVERRIDE="$SA_MP" "$SCRIPT" "$sa_head" --audit 2>/dev/null
+sa_audit_commit_ec2=$?
+set -e
+[[ "$sa_audit_commit_ec2" -eq 2 ]] \
+  || fail "commit-ish + --audit (order swapped) should exit 2; got $sa_audit_commit_ec2"
+
 # 5) --sync-all --repos <one> restricts to the named consumer.
 sa_repos_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" MERGEPATH_SIBLINGS_DIR="$SA_SIBLINGS" \
   "$SCRIPT" --sync-all --dry-run --repos beta 2>&1)
@@ -775,7 +794,7 @@ sa_repos_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" MERGEPATH_SIBLINGS_DIR="$SA_SIBL
   || fail "--sync-all --repos beta should plan exactly one PR; got: $sa_repos_out"
 echo "$sa_repos_out" | grep -q "^beta (" \
   || fail "--sync-all --repos beta should include beta; got: $sa_repos_out"
-echo "$sa_repos_out" | grep -qE "^(alpha|gamma) \(" \
+echo "$sa_repos_out" | grep -qE "^(alpha|gamma|delta) \(" \
   && fail "--sync-all --repos beta leaked a non-filtered consumer; got: $sa_repos_out"
 
 # 6) Branch-name scheme for --sync-all is distinct from per-commit: it
