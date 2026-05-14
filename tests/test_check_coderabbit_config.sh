@@ -268,7 +268,7 @@ cp "$CHECK" "$case_root/scripts/ci/check_coderabbit_config"
 chmod +x "$case_root/scripts/ci/check_coderabbit_config"
 printf 'reviews:\n  profile: assertive\n' > "$case_root/.coderabbit.yml"
 gr_rc=0
-out=$(GITHUB_REPOSITORY=somebody/mergepath \
+out=$(MERGEPATH_TEMPLATE_CHECK= GITHUB_REPOSITORY=somebody/mergepath \
   "$case_root/scripts/ci/check_coderabbit_config" 2>&1) || gr_rc=$?
 assert_contains "github_repository_mergepath_enforces_gate" \
   "$gr_rc" 1 "$out" "FAIL: reviews.profile is 'assertive'"
@@ -280,7 +280,7 @@ cp "$CHECK" "$case_root/scripts/ci/check_coderabbit_config"
 chmod +x "$case_root/scripts/ci/check_coderabbit_config"
 printf 'reviews:\n  profile: assertive\n' > "$case_root/.coderabbit.yml"
 gc_rc=0
-out=$(GITHUB_REPOSITORY=somebody/some-consumer-repo \
+out=$(MERGEPATH_TEMPLATE_CHECK= GITHUB_REPOSITORY=somebody/some-consumer-repo \
   "$case_root/scripts/ci/check_coderabbit_config" 2>&1) || gc_rc=$?
 assert_contains "github_repository_consumer_skips_gate" \
   "$gc_rc" 0 "$out" "profile gate skipped"

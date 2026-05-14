@@ -61,6 +61,16 @@ if ! command -v yq >/dev/null 2>&1; then
   exit 2
 fi
 
+# Reject non-mikefarah yq (kislyuk/yq is a Python wrapper around jq with a
+# completely different syntax — its `//` and `-r` semantics don't match the
+# patterns this script relies on; accepting it surfaces as cryptic downstream
+# parse errors). Mirrors the same check in scripts/sync-to-downstream.sh and
+# scripts/bootstrap-new-repo.sh's preflight. CodeRabbit round-2 minor on #256.
+if ! yq --version 2>&1 | grep -q "mikefarah/yq"; then
+  echo "FAIL: unsupported yq implementation (got: $(yq --version 2>&1 | head -1)); expected mikefarah/yq v4+. Install via 'brew install yq'."
+  exit 2
+fi
+
 # Resolve whether this repo expects CodeRabbit to be active. The
 # canonical signal is `.github/review-policy.yml`'s `coderabbit.enabled`
 # field — sub-D (#248) flips this to `false` and deletes .coderabbit.yml
