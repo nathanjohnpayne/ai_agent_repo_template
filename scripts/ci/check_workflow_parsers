@@ -55,6 +55,25 @@ assert_eq() {
   fi
 }
 
+# Classify a phase_4b_default value read from review-policy.yml.
+# Echoes "valid" or "invalid".
+#
+# A MISSING field (empty string) is VALID — the documented semantics
+# (CLAUDE.md, REVIEW_POLICY.md, and the `policy_field` unit fixture
+# below that asserts an absent field returns "") treat an absent
+# phase_4b_default as the `fallback-only` default. This check ships
+# in the propagated `scripts/ci/` kit; a consumer repo whose
+# review-policy.yml predates the field (#185) must NOT hard-fail just
+# for not having opted in. Only a PRESENT-but-unrecognized value is a
+# real failure. (Before this, the propagation wave's 8 consumer PRs
+# all failed `lint` here — see #264.)
+classify_phase_4b() {
+  case "$1" in
+    ""|fallback-only|complex-changes|always) echo "valid" ;;
+    *) echo "invalid" ;;
+  esac
+}
+
 echo "parse_policy_list.sh tests"
 
 # Covers bug 2: the range-based parser silently produced an empty
@@ -184,20 +203,35 @@ nested_only=$(printf 'codex:\n  phase_4b_default: nested-only\n')
 got=$(echo "$nested_only" | awk -v field="phase_4b_default" "$policy_field_awk")
 assert_eq "policy_field returns empty when only a nested same-named key exists" "" "$got"
 
-# Fixture: real mergepath review-policy.yml has the field set; verify
-# end-to-end against the actual file so a typo in the schema-doc
-# example doesn't pass the unit fixtures while breaking the real read.
+# classify_phase_4b: a MISSING field is valid (= the fallback-only
+# default), the three recognized values are valid, anything else is a
+# real failure. This is the classification the real-file check below
+# uses — fixtured here so the "missing is valid" branch (#264) is
+# covered even though mergepath's own review-policy.yml sets the field.
+assert_eq "classify_phase_4b: missing field is valid (defaults to fallback-only)" "valid" "$(classify_phase_4b "")"
+assert_eq "classify_phase_4b: fallback-only is valid" "valid" "$(classify_phase_4b "fallback-only")"
+assert_eq "classify_phase_4b: complex-changes is valid" "valid" "$(classify_phase_4b "complex-changes")"
+assert_eq "classify_phase_4b: always is valid" "valid" "$(classify_phase_4b "always")"
+assert_eq "classify_phase_4b: a present-but-unrecognized value is invalid" "invalid" "$(classify_phase_4b "strict-mode")"
+
+# Fixture: verify end-to-end against the actual review-policy.yml so a
+# typo in the schema-doc example doesn't pass the unit fixtures while
+# breaking the real read. A missing field is accepted as valid (the
+# documented fallback-only default) per classify_phase_4b — this check
+# ships in the propagated kit and must not hard-fail a consumer repo
+# that simply hasn't opted into phase_4b_default yet (#264).
 got=$(awk -v field="phase_4b_default" "$policy_field_awk" "$ROOT/.github/review-policy.yml")
-case "$got" in
-  fallback-only|complex-changes|always)
-    pass=$((pass + 1))
+if [ "$(classify_phase_4b "$got")" = "valid" ]; then
+  pass=$((pass + 1))
+  if [ -z "$got" ]; then
+    echo "  PASS: real .github/review-policy.yml has no phase_4b_default (valid — defaults to fallback-only)"
+  else
     echo "  PASS: real .github/review-policy.yml has a valid phase_4b_default value ('$got')"
-    ;;
-  *)
-    fail=$((fail + 1))
-    echo "  FAIL: real .github/review-policy.yml phase_4b_default is missing or invalid (got '$got'; expected one of fallback-only / complex-changes / always)"
-    ;;
-esac
+  fi
+else
+  fail=$((fail + 1))
+  echo "  FAIL: real .github/review-policy.yml phase_4b_default is set to an unrecognized value (got '$got'; expected one of fallback-only / complex-changes / always, or absent for the fallback-only default)"
+fi
 
 echo
 if [ "$fail" -gt 0 ]; then
