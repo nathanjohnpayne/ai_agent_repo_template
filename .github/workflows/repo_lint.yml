@@ -69,6 +69,9 @@ jobs:
       - name: check_auto_clear_workflow
         run: ./scripts/ci/check_auto_clear_workflow
 
+      - name: check_pr_audit_codex_clearance
+        run: ./scripts/ci/check_pr_audit_codex_clearance
+
       - name: check_sweep_unresolved_feedback
         run: ./scripts/ci/check_sweep_unresolved_feedback
 
