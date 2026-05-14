@@ -631,6 +631,7 @@ consumers:
   - {name: alpha, repo: example/alpha}
   - {name: beta,  repo: example/beta}
   - {name: gamma, repo: example/gamma}
+  - {name: delta, repo: example/delta}
 paths:
   - {path: scripts/hooks/the-hook.sh,  type: canonical, consumers: all}
   - {path: scripts/coderabbit-wait.sh, type: canonical, consumers: all}
@@ -656,14 +657,27 @@ sa_short=${sa_head:0:7}
 # Sibling consumers on disk so the dry-run override probe (which reads
 # the LOCAL consumer worktree's .sync-overrides.yml) has something to
 # read. alpha + beta carry no overrides; gamma registers a skip.
-mkdir -p "$SA_SIBLINGS/alpha" "$SA_SIBLINGS/beta" "$SA_SIBLINGS/gamma"
+mkdir -p "$SA_SIBLINGS/alpha" "$SA_SIBLINGS/beta" "$SA_SIBLINGS/gamma" "$SA_SIBLINGS/delta"
 git init -q "$SA_SIBLINGS/alpha"
 git init -q "$SA_SIBLINGS/beta"
 git init -q "$SA_SIBLINGS/gamma"
+git init -q "$SA_SIBLINGS/delta"
 cat >"$SA_SIBLINGS/gamma/.sync-overrides.yml" <<'YAML'
 skip_paths:
   - path: scripts/coderabbit-wait.sh
     reason: gamma maintains a bespoke coderabbit-wait wrapper
+YAML
+# delta overrides EVERY canonical + kit path — a fully-diverged
+# consumer. --sync-all must report it as skipped, not as a planned PR
+# (the dry-run path must mirror sync_all_open_pr's zero-target guard).
+cat >"$SA_SIBLINGS/delta/.sync-overrides.yml" <<'YAML'
+skip_paths:
+  - path: scripts/hooks/the-hook.sh
+    reason: delta vendors its own hook
+  - path: scripts/coderabbit-wait.sh
+    reason: delta vendors its own coderabbit-wait wrapper
+  - path: scripts/ci/
+    reason: delta maintains a bespoke CI kit
 YAML
 
 # 1) --sync-all --dry-run lists ALL canonical + kit paths for EVERY
@@ -707,6 +721,22 @@ echo "$alpha_block" | grep -q "+ scripts/coderabbit-wait.sh (canonical)" \
   || fail "--sync-all should still sync scripts/coderabbit-wait.sh to alpha (no overrides); alpha block: $alpha_block"
 echo "$alpha_block" | grep -q "SKIPPED per .sync-overrides.yml" \
   && fail "--sync-all marked a path skipped for alpha, which has no overrides; alpha block: $alpha_block"
+
+# 2b) Zero-target guard: delta overrides EVERY canonical + kit path, so
+#     the dry-run plan MUST report it as skipped (⊘) rather than as a
+#     planned PR. A "would open PR" line for delta would overstate the
+#     planned PR count vs. live behavior (sync_all_open_pr skips a
+#     fully-overridden consumer without opening a PR).
+echo "$sa_out" | grep -q "⊘ delta — all canonical+kit targets skipped per .sync-overrides.yml" \
+  || fail "--sync-all dry-run should report fully-overridden delta as skipped; got: $sa_out"
+echo "$sa_out" | grep -qE "⤷ delta — would open PR" \
+  && fail "--sync-all dry-run planned a PR for fully-overridden delta; should be skipped; got: $sa_out"
+# delta's overridden paths must still be surfaced as SKIPPED lines.
+echo "$sa_out" | grep -q "scripts/hooks/the-hook.sh (SKIPPED per .sync-overrides.yml" \
+  || fail "--sync-all dry-run should surface delta's override-skipped paths; got: $sa_out"
+# The "would open PR" count is still 3 — delta is skipped, not planned.
+[[ "$(echo "$sa_out" | grep -c 'would open PR')" -eq 3 ]] \
+  || fail "--sync-all dry-run should still plan exactly 3 PRs (delta skipped); got: $sa_out"
 
 # 3) --sync-all + --audit → exit 2 (mutex).
 set +e

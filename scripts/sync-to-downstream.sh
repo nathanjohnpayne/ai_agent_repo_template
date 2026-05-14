@@ -1706,6 +1706,23 @@ sync_all_one_consumer() {
       kit_count=0
     fi
 
+    # Zero-target guard — mirror sync_all_open_pr's live behavior. When
+    # the consumer's .sync-overrides.yml filters out every canonical +
+    # kit path, the live path skips the consumer without opening a PR;
+    # the dry-run plan must report it as skipped too, or it overstates
+    # the planned PR count.
+    if [ "$canonical_count" -eq 0 ] && [ "$kit_count" -eq 0 ]; then
+      if [ -n "$plan_skipped" ]; then
+        printf "  ⊘ %s — all canonical+kit targets skipped per .sync-overrides.yml\n" \
+          "$consumer_name"
+        printf '%s' "$plan_skipped"
+      else
+        printf "  ⊘ %s — no canonical+kit targets\n" "$consumer_name"
+      fi
+      SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+      return 0
+    fi
+
     printf "  ⤷ %s — would open PR on branch %s (%d canonical + %d kit path(s))\n" \
       "$consumer_name" "$branch" "$canonical_count" "$kit_count"
     while IFS= read -r p; do
