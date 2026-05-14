@@ -31,7 +31,7 @@
 // config. The `eslint.config.js` filename is the only spelling the
 // Mergepath CI check accepts; if you have a strong reason to use
 // `.mjs`/`.cjs`/`.ts`, file an exception in `.sync-overrides.yml`
-// with a `reason:` per docs/agents/code-review-requirements.md.
+// with a `reason:` per docs/agents/code-modification-rules.md.
 
 import js from "@eslint/js";
 import globals from "globals";
@@ -68,13 +68,30 @@ export default [
 
   // Apply browser + node globals to all JS sources by default. Narrow
   // these per-file-pattern if your repo has a clean split.
+  //
+  // `*.cjs` files are split out so ESLint parses them as CommonJS
+  // (`sourceType: "commonjs"`) rather than ES modules — otherwise
+  // top-level `require`/`module.exports` and CommonJS scope rules
+  // produce false-positive parse errors. The defaults ESLint applies
+  // by extension are: `module` for `.js`/`.mjs`, `commonjs` for
+  // `.cjs`; we make that explicit here so the policy is self-documenting.
   {
-    files: ["**/*.{js,mjs,cjs,jsx}"],
+    files: ["**/*.{js,mjs,jsx}"],
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",
       globals: {
         ...globals.browser,
+        ...globals.node,
+      },
+    },
+  },
+  {
+    files: ["**/*.cjs"],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "commonjs",
+      globals: {
         ...globals.node,
       },
     },

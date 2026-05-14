@@ -2,12 +2,19 @@
 # tests/test_eslint_policy_check.sh
 #
 # Unit tests for scripts/ci/check_eslint_config_present. Covers the
-# three contract cases from the script's header:
+# contract cases from the script's header plus the policy-floor and
+# unique-tempfile regressions added in CodeRabbit round 1 on #253:
 #
 #   1. no root package.json                          → exit 0 (pass)
 #   2. package.json present, eslint.config.js absent → exit 1 (fail)
 #   3. package.json + valid eslint.config.js         → exit 0 (pass)
 #   4. package.json + syntax-broken eslint.config.js → exit 1 (fail)
+#   5. package.json + parseable eslint.config.js but
+#      missing @eslint/js recommended baseline       → exit 1 (fail)
+#   6. concurrent runs do not clobber each other's
+#      parse-error tempfile (no fixed /tmp path)     → both fail with
+#                                                       distinct error
+#                                                       output
 #
 # We invoke the check against a synthetic REPO_ROOT by symlinking the
 # real script into a temp tree — the script computes REPO_ROOT from
@@ -123,6 +130,84 @@ if [ "$rc" -eq 1 ] && grep -q "failed Node syntax check" "$WORKDIR/out.txt"; the
 else
   fail "expected exit 1 + parse error, got rc=$rc / output:"
   sed 's/^/    /' "$WORKDIR/out.txt" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 5: package.json + parseable eslint.config.js that omits the
+# @eslint/js recommended baseline → fail. Regression guard for the
+# policy-floor finding (CodeRabbit round 1 on #253): before the fix,
+# any syntactically-valid file passed even if it didn't import the
+# required ruleset.
+# ---------------------------------------------------------------------------
+T5="$WORKDIR/case5-pkg-missing-baseline"
+make_fake_repo "$T5"
+echo '{"name":"t5","version":"0.0.0","type":"module"}' >"$T5/package.json"
+cat >"$T5/eslint.config.js" <<'EOF'
+// Parseable but DOES NOT include @eslint/js recommended.
+// The policy floor must reject this.
+export default [
+  {
+    rules: {
+      "no-unused-vars": "warn",
+    },
+  },
+];
+EOF
+rc=$(run_check "$T5")
+if [ "$rc" -eq 1 ] && grep -q "@eslint/js recommended" "$WORKDIR/out.txt"; then
+  pass "package.json + config missing @eslint/js baseline → exits 1"
+else
+  fail "expected exit 1 + '@eslint/js recommended' message, got rc=$rc / output:"
+  sed 's/^/    /' "$WORKDIR/out.txt" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 6: concurrent runs do not clobber each other's parse-error
+# tempfile. Regression guard for the unique-tempfile finding
+# (CodeRabbit round 1 on #253): before the fix, both runs wrote to a
+# fixed `/tmp/eslint_config_parse.err` and could race.
+#
+# We launch two parse-failing runs in parallel, then assert both
+# emit their parse-error message in their respective output. If a
+# fixed tempfile were still in use, one run could see an empty or
+# truncated error block depending on race ordering. We also assert
+# no `eslint_config_parse.err` file (the old fixed name) lingers in
+# $TMPDIR after both runs complete.
+# ---------------------------------------------------------------------------
+T6A="$WORKDIR/case6a-concurrent"
+T6B="$WORKDIR/case6b-concurrent"
+make_fake_repo "$T6A"
+make_fake_repo "$T6B"
+echo '{"name":"t6a","version":"0.0.0"}' >"$T6A/package.json"
+echo '{"name":"t6b","version":"0.0.0"}' >"$T6B/package.json"
+printf 'this is not javascript &!@(*#^$\n' >"$T6A/eslint.config.js"
+printf 'this is also not javascript $#@!\n' >"$T6B/eslint.config.js"
+
+set +e
+"$T6A/scripts/ci/check_eslint_config_present" >"$WORKDIR/out6a.txt" 2>&1 &
+PID_A=$!
+"$T6B/scripts/ci/check_eslint_config_present" >"$WORKDIR/out6b.txt" 2>&1 &
+PID_B=$!
+wait $PID_A; RC_A=$?
+wait $PID_B; RC_B=$?
+set -e
+
+if [ "$RC_A" -eq 1 ] && [ "$RC_B" -eq 1 ] \
+   && grep -q "failed Node syntax check" "$WORKDIR/out6a.txt" \
+   && grep -q "failed Node syntax check" "$WORKDIR/out6b.txt"; then
+  pass "concurrent parse-failure runs both report a parse error (unique tempfile)"
+else
+  fail "concurrent runs: expected both rc=1 + 'failed Node syntax check', got rc=$RC_A/$RC_B"
+  echo "--- out6a ---" >&2; sed 's/^/    /' "$WORKDIR/out6a.txt" >&2
+  echo "--- out6b ---" >&2; sed 's/^/    /' "$WORKDIR/out6b.txt" >&2
+fi
+
+# No fixed-name leftover should exist (would indicate the old
+# `/tmp/eslint_config_parse.err` path is still in use somewhere).
+if [ -e "${TMPDIR:-/tmp}/eslint_config_parse.err" ]; then
+  fail "fixed-name tempfile ${TMPDIR:-/tmp}/eslint_config_parse.err still in use"
+else
+  pass "no fixed-name parse-error tempfile leftover"
 fi
 
 # ---------------------------------------------------------------------------

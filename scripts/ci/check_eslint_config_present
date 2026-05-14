@@ -60,12 +60,38 @@ if [ "$FAILED" -eq 0 ]; then
     echo "check_eslint_config_present: ERROR"
     exit 2
   fi
-  if ! node --check "$ESLINT_CONFIG" 2>/tmp/eslint_config_parse.err; then
+  # Use a unique temp file rather than a fixed `/tmp/...` path so two
+  # concurrent runners (CI matrix, multiple worktrees on a dev box)
+  # can't clobber each other's parse output.
+  ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/eslint-config-parse.XXXXXX")"
+  trap 'rm -f "$ERR_FILE"' EXIT
+  if ! node --check "$ESLINT_CONFIG" 2>"$ERR_FILE"; then
     echo "FAIL: eslint.config.js failed Node syntax check:"
-    sed 's/^/      /' </tmp/eslint_config_parse.err
+    sed 's/^/      /' <"$ERR_FILE"
     FAILED=1
   fi
-  rm -f /tmp/eslint_config_parse.err
+  rm -f "$ERR_FILE"
+  trap - EXIT
+
+  # Enforce the policy floor from rules/repo_rules.md § ESLint policy:
+  # the config must include `@eslint/js`'s `recommended` ruleset. We
+  # match on both the package import and a `*.configs.recommended`
+  # reference — either alone is a common partial-config mistake (e.g.
+  # importing `@eslint/js` but forgetting to spread `js.configs.recommended`).
+  # Skipped if the parse step already failed — no point re-reporting
+  # on a syntactically-broken file.
+  if [ "$FAILED" -eq 0 ]; then
+    if ! grep -Eq '["'\'']@eslint/js["'\'']' "$ESLINT_CONFIG" \
+       || ! grep -Eq '\.configs\.recommended\b' "$ESLINT_CONFIG"; then
+      echo "FAIL: eslint.config.js must include the @eslint/js recommended ruleset."
+      echo "      Mergepath policy floor (rules/repo_rules.md § ESLint policy)"
+      echo "      requires at least:"
+      echo "        import js from \"@eslint/js\";"
+      echo "        export default [ js.configs.recommended, ... ];"
+      echo "      See examples/eslint.config.js for a starting point."
+      FAILED=1
+    fi
+  fi
 fi
 
 if [ "$FAILED" -eq 1 ]; then
