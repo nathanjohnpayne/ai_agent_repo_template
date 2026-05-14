@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# check_pr_audit_codex_clearance — unit coverage for the Codex
+# clearance branch of `.github/workflows/pr-audit.yml`.
+#
+# The audit workflow runs in GitHub Actions under `actions/github-
+# script`, so the gate logic itself is JavaScript embedded in YAML.
+# This check extracts the clearance algorithm into a small Node
+# script that mirrors the workflow's logic verbatim, then runs it
+# against six fixture payloads under
+# `scripts/ci/fixtures/pr-audit-codex-clearance/` covering:
+#
+#   - clean-clear.json            — COMMENTED on HEAD, zero P0/P1 → cleared
+#   - p1-flagged.json             — COMMENTED on HEAD with P1 finding → NOT cleared (#249 case)
+#   - p0-flagged.json             — COMMENTED on HEAD with P0 finding → NOT cleared
+#   - wrong-sha.json              — COMMENTED on an older SHA → NOT cleared
+#   - p2-only.json                — only P2/P3 inline findings → cleared (P2/P3 advisory)
+#   - quote-reply-from-author.json — author quote-reply containing `![P1 Badge]` text →
+#                                     cleared (filter scopes to bot author only)
+#
+# Inline-literal pattern: the algorithm under test is duplicated
+# from the workflow YAML into the Node script below, the same way
+# `check_workflow_parsers` carries an inline copy of the awk
+# `policy_field_awk` literal it tests. If the workflow's clearance
+# logic changes, this script must be updated in lockstep — that
+# coupling is intentional, since extracting to a separate .js file
+# would force the sync manifest to ship two files and complicate
+# downstream propagation.
+#
+# Issue: #249. Cross-reference: scripts/codex-review-check.sh
+# gate (c) and (when it lands) #235's merge-gate P1 helper.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+FIXTURES_DIR="scripts/ci/fixtures/pr-audit-codex-clearance"
+WORKFLOW=".github/workflows/pr-audit.yml"
+
+for f in "$FIXTURES_DIR" "$WORKFLOW"; do
+  if [ ! -e "$f" ]; then
+    echo "check_pr_audit_codex_clearance: missing required path: $f" >&2
+    exit 1
+  fi
+done
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "check_pr_audit_codex_clearance: SKIP — node not on PATH" >&2
+  exit 0
+fi
+
+# The mirrored algorithm. Keep this in sync with the
+# `codexCleared` computation in .github/workflows/pr-audit.yml.
+RUNNER=$(cat <<'NODE_EOF'
+const fs = require('fs');
+// With `node -e`, process.argv[1] is the first user-supplied arg
+// (there is no script-path slot to consume argv[1]).
+const fixturePath = process.argv[1];
+const fx = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+
+const codexBotLogin = fx.codex_bot_login;
+const headSha = fx.head_sha;
+const reviews = fx.reviews || [];
+const inlineComments = fx.inline_comments || [];
+
+// --- mirrored from .github/workflows/pr-audit.yml (#249) ----------
+const codexReviewsOnHead = reviews.filter(
+  r => r.user.login === codexBotLogin &&
+       headSha &&
+       r.commit_id === headSha
+);
+const codexCommentedOnHead = codexReviewsOnHead.filter(
+  r => r.state === 'COMMENTED'
+);
+
+let codexCleared = false;
+if (codexCommentedOnHead.length > 0) {
+  const latestCodexReview = codexCommentedOnHead.reduce(
+    (latest, r) => {
+      if (!latest) return r;
+      return (r.submitted_at > latest.submitted_at) ? r : latest;
+    },
+    null
+  );
+
+  const p01Regex = /!\[P[01] Badge\]/;
+  const unresolvedP01 = inlineComments.filter(
+    c => c.user && c.user.login === codexBotLogin &&
+         c.pull_request_review_id === latestCodexReview.id &&
+         p01Regex.test(c.body || '')
+  );
+
+  if (unresolvedP01.length === 0) {
+    codexCleared = true;
+  }
+}
+// --- end mirrored algorithm --------------------------------------
+
+const result = {
+  fixture: fixturePath,
+  expected_cleared: fx.expected_cleared,
+  actual_cleared: codexCleared,
+  pass: codexCleared === fx.expected_cleared,
+  description: fx.description,
+};
+process.stdout.write(JSON.stringify(result));
+NODE_EOF
+)
+
+pass=0
+fail=0
+
+for fixture in "$FIXTURES_DIR"/*.json; do
+  name=$(basename "$fixture")
+  result=$(node -e "$RUNNER" "$fixture")
+  ok=$(echo "$result" | node -e 'const d=JSON.parse(require("fs").readFileSync("/dev/stdin","utf8"));console.log(d.pass?"yes":"no")')
+  desc=$(echo "$result" | node -e 'const d=JSON.parse(require("fs").readFileSync("/dev/stdin","utf8"));console.log(d.description)')
+  expected=$(echo "$result" | node -e 'const d=JSON.parse(require("fs").readFileSync("/dev/stdin","utf8"));console.log(d.expected_cleared)')
+  actual=$(echo "$result" | node -e 'const d=JSON.parse(require("fs").readFileSync("/dev/stdin","utf8"));console.log(d.actual_cleared)')
+
+  if [ "$ok" = "yes" ]; then
+    pass=$((pass + 1))
+    echo "  PASS: $name — $desc (expected=$expected, actual=$actual)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: $name — $desc (expected=$expected, actual=$actual)" >&2
+  fi
+done
+
+# Structural assertion: the workflow contains the load-bearing
+# `p01Regex` literal. If someone refactors the workflow to drop the
+# P0/P1 check entirely, this assertion is the long-pole canary.
+if grep -qF '!\[P[01] Badge\]' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW carries the !\[P[01] Badge\] regex literal (clearance gate present)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW is missing the !\[P[01] Badge\] regex literal — the #249 gate may have regressed" >&2
+fi
+
+# Structural assertion: the workflow cross-references #249 in a
+# comment, anchoring the regression to the issue if grep/blame
+# leads someone here later.
+if grep -qF '#249' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW references #249 (audit-side Codex clearance issue)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must reference #249 in a comment for traceability" >&2
+fi
+
+# Structural assertion: the per-PR review fetch is paginated. PRs
+# with a long review history would otherwise truncate at 30 items
+# and silently miss the latest Codex review on HEAD, producing a
+# false-positive policy violation (PR #255 round 2 Codex P2). The
+# fix is to use `github.paginate(github.rest.pulls.listReviews, ...)`
+# with `per_page: 100`. This assertion is structural rather than
+# algorithmic because the fixture-based tests above consume already-
+# materialised review arrays — they can't catch a pagination bug at
+# the API call site. If the workflow regresses to the unpaginated
+# `github.rest.pulls.listReviews({...})` form, this canary fails.
+if grep -qE 'github\.paginate\(\s*$' "$WORKFLOW" && \
+   grep -A1 'github\.paginate(' "$WORKFLOW" | grep -qF 'github.rest.pulls.listReviews,'; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW paginates pulls.listReviews via github.paginate (PR #255 P2)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must call pulls.listReviews via github.paginate with per_page:100 (PR #255 P2)" >&2
+fi
+
+echo
+if [ "$fail" -gt 0 ]; then
+  echo "check_pr_audit_codex_clearance: $fail FAIL / $pass PASS" >&2
+  exit 1
+fi
+echo "check_pr_audit_codex_clearance: PASS ($pass tests)"
