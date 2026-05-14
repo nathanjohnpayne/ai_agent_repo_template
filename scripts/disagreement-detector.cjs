@@ -1,4 +1,12 @@
-// scripts/disagreement-detector.js
+// scripts/disagreement-detector.cjs
+//
+// The `.cjs` extension is load-bearing: this module is CommonJS
+// (`module.exports` / `require`). A consumer repo whose package.json
+// declares `"type": "module"` would treat a bare `.js` file as ESM
+// and fail with "module is not defined in ES module scope" when
+// agent-review.yml require()s it. `.cjs` forces CommonJS regardless
+// of the consuming repo's package.json type — see #264 (caught on
+// the nathanpaynedotcom propagation PR).
 //
 // Pure decision function for `.github/workflows/agent-review.yml`'s
 // `detect-disagreement` job and its CI test (#259). Given a PR's

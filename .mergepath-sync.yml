@@ -78,7 +78,7 @@ paths:
   - path: scripts/codex-p1-gate.sh
     type: canonical
     consumers: all
-  - path: scripts/disagreement-detector.js
+  - path: scripts/disagreement-detector.cjs
     # Runtime dependency of .github/workflows/agent-review.yml's
     # detect-disagreement job — the job require()s this module.
     # Must sync in lockstep with the workflow. See #259.

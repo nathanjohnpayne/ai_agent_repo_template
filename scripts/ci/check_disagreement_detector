@@ -4,7 +4,7 @@
 #
 # `.github/workflows/agent-review.yml`'s `detect-disagreement` job
 # applies / removes the `needs-human-review` label. Its decision
-# logic was factored into `scripts/disagreement-detector.js` so the
+# logic was factored into `scripts/disagreement-detector.cjs` so the
 # workflow and this test exercise the same code (the lockstep
 # pattern documented for pr-audit.yml's P0/P1 detection — except
 # here the JS is a real module both sides `require()`, not an
@@ -26,7 +26,7 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-DETECTOR="scripts/disagreement-detector.js"
+DETECTOR="scripts/disagreement-detector.cjs"
 FIXTURES_DIR="scripts/ci/fixtures/disagreement-detector"
 TEST_SCRIPT="tests/test_disagreement_detector.sh"
 WORKFLOW=".github/workflows/agent-review.yml"
@@ -47,8 +47,8 @@ fi
 # If detect-disagreement is re-inlined, the module can rot silently
 # while this test still passes against the stale file. This canary
 # fails first.
-if ! grep -qF 'scripts/disagreement-detector.js' "$WORKFLOW"; then
-  echo "check_disagreement_detector: $WORKFLOW no longer require()s scripts/disagreement-detector.js — the detect-disagreement job and its test may have drifted" >&2
+if ! grep -qF 'scripts/disagreement-detector.cjs' "$WORKFLOW"; then
+  echo "check_disagreement_detector: $WORKFLOW no longer require()s scripts/disagreement-detector.cjs — the detect-disagreement job and its test may have drifted" >&2
   exit 1
 fi
 

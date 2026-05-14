@@ -270,13 +270,13 @@ jobs:
             const path = require('path');
             const yaml = require('js-yaml');
 
-            // Decision logic lives in scripts/disagreement-detector.js
+            // Decision logic lives in scripts/disagreement-detector.cjs
             // so the workflow and the fixture-driven test
             // (scripts/ci/check_disagreement_detector) exercise the
             // exact same code. See #259 for the regression this
             // factoring closes.
             const { decide } = require(
-              path.resolve(process.env.GITHUB_WORKSPACE, 'scripts/disagreement-detector.js')
+              path.resolve(process.env.GITHUB_WORKSPACE, 'scripts/disagreement-detector.cjs')
             );
 
             let reviewerAccounts;

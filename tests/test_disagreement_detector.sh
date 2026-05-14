@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/test_disagreement_detector.sh
 #
-# Fixture-driven unit tests for scripts/disagreement-detector.js,
+# Fixture-driven unit tests for scripts/disagreement-detector.cjs,
 # the decision function used by `.github/workflows/agent-review.yml`'s
 # `detect-disagreement` job (#259).
 #
@@ -23,7 +23,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DETECTOR="$ROOT/scripts/disagreement-detector.js"
+DETECTOR="$ROOT/scripts/disagreement-detector.cjs"
 FIXTURES_DIR="$ROOT/scripts/ci/fixtures/disagreement-detector"
 
 [[ -f "$DETECTOR" ]] || { echo "missing $DETECTOR" >&2; exit 1; }
