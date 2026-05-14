@@ -72,15 +72,87 @@ jobs:
           if [ ! -f "$CONFIG" ]; then
             echo "WARNING: $CONFIG not found, skipping external review check"
             echo "needs_review=false" >> "$GITHUB_OUTPUT"
+            echo "propagation_lane=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA")
+
+          # --- Propagation PR review lane (mergepath#264) ----------------
+          # A PR opened by scripts/sync-to-downstream.sh is a verbatim
+          # mirror of canonical/kit content that was ALREADY reviewed in
+          # its upstream mergepath PR. It is huge by design and always
+          # touches .github/** — so the line-count threshold and the
+          # external_review_paths check below would flag every sync PR
+          # for a redundant Phase 4 review of non-novel content.
+          #
+          # The lane recognizes a propagation PR by a deterministic
+          # fingerprint and, if ALL of the following hold, exempts it
+          # from external-review labeling:
+          #   1. propagation_prs.enabled: true in review-policy.yml
+          #   2. branch name starts with propagation_prs.branch_prefix
+          #   3. PR author is author_identity (the propagation actor)
+          #   4. EVERY changed file is under a path the manifest
+          #      (.mergepath-sync.yml) declares as propagation surface
+          #      — canonical / kit / templated. This is the teeth: a
+          #      "sync" PR that touches a non-manifest path is NOT a
+          #      faithful mirror and falls through to normal review.
+          # Any one failing → normal labeling applies. See
+          # REVIEW_POLICY.md § Propagation PR review lane.
+          PROPAGATION_LANE=false
+          # Read a 2-space-indented scalar from a named YAML block,
+          # anchored to the block header and stopping at the next
+          # column-0 key — so comment lines between the header and the
+          # field don't matter. Quote- and inline-comment-stripped.
+          prop_field() {
+            awk -v blk="$1" -v key="$2" '
+              $0 ~ "^" blk ":" { in_blk = 1; next }
+              in_blk && /^[^[:space:]#]/ { in_blk = 0 }
+              in_blk && $1 == key":" {
+                sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+                sub(/[[:space:]]*#.*$/, "", $0)
+                gsub(/^"|"$/, "", $0)
+                print
+                exit
+              }
+            ' "$CONFIG"
+          }
+          PROP_ENABLED=$(prop_field propagation_prs enabled)
+          PROP_PREFIX=$(prop_field propagation_prs branch_prefix)
+          AUTHOR_ID=$(grep -m1 '^author_identity:' "$CONFIG" | awk '{print $2}')
+          HEAD_REF="${{ github.event.pull_request.head.ref }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          if [ "$PROP_ENABLED" = "true" ] && [ -n "$PROP_PREFIX" ] \
+             && [ "${HEAD_REF#"$PROP_PREFIX"}" != "$HEAD_REF" ] \
+             && [ "$PR_AUTHOR" = "$AUTHOR_ID" ] \
+             && [ -f ".mergepath-sync.yml" ] && [ -n "$CHANGED_FILES" ]; then
+            MAN_PATTERNS=()
+            while IFS= read -r mp; do
+              [ -n "$mp" ] && MAN_PATTERNS+=("$mp")
+            done < <(bash scripts/workflow/parse_manifest_paths.sh .mergepath-sync.yml)
+            if [ "${#MAN_PATTERNS[@]}" -gt 0 ]; then
+              CHANGED_COUNT=$(printf '%s\n' "$CHANGED_FILES" | grep -c . || true)
+              CONFINED_COUNT=$(printf '%s\n' "$CHANGED_FILES" | grep -v '^$' \
+                | bash scripts/workflow/match_protected_paths.sh "${MAN_PATTERNS[@]}" \
+                | grep -c . || true)
+              if [ "$CHANGED_COUNT" -gt 0 ] && [ "$CHANGED_COUNT" = "$CONFINED_COUNT" ]; then
+                PROPAGATION_LANE=true
+              fi
+            fi
+          fi
+          if [ "$PROPAGATION_LANE" = "true" ]; then
+            echo "Propagation PR review lane: recognized (branch=$HEAD_REF, author=$PR_AUTHOR, diff confined to manifest paths)."
+            echo "needs_review=false" >> "$GITHUB_OUTPUT"
+            echo "propagation_lane=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "propagation_lane=false" >> "$GITHUB_OUTPUT"
 
           # Read threshold from review-policy.yml
           THRESHOLD=$(grep 'external_review_threshold:' "$CONFIG" | awk '{print $2}')
           THRESHOLD=${THRESHOLD:-300}
-
-          BASE_SHA=${{ github.event.pull_request.base.sha }}
-          HEAD_SHA=${{ github.event.pull_request.head.sha }}
 
           # Count lines changed (additions + deletions), excluding lockfiles and generated files
           LINES_CHANGED=$(git diff --stat "$BASE_SHA"..."$HEAD_SHA" -- \
@@ -111,7 +183,8 @@ jobs:
           # earlier inline glob-to-regex sed pipeline double-transformed
           # `*` and silently missed nested paths. See #54 for the
           # post-mortem.
-          CHANGED_FILES=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA")
+          # (CHANGED_FILES is computed once near the top of this step,
+          # before the propagation-lane check.)
 
           PATTERNS=()
           while IFS= read -r line; do
@@ -164,3 +237,49 @@ jobs:
           > Automated check per .github/review-policy.yml
           EOF
           )"
+
+      - name: Propagation PR review lane
+        if: steps.check.outputs.propagation_lane == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Recognized propagation PR (see REVIEW_POLICY.md § Propagation
+          # PR review lane): a verbatim mirror of canonical/kit content
+          # already reviewed in its upstream mergepath PR, with the diff
+          # confined to manifest-declared paths. It is exempt from the
+          # external-review requirement — but still subject to CI green,
+          # CodeRabbit advisory review, and an internal reviewer-identity
+          # APPROVED (the standard under-threshold path).
+          #
+          # If a prior run (or a stale label-prefixed edit) applied
+          # needs-external-review before this PR qualified, remove it so
+          # the Label Gate stops blocking. The workflow REMOVING a label
+          # it is responsible for applying is not an agent override — the
+          # human-action-label prohibition (REVIEW_POLICY.md § Agent
+          # prohibitions) is about agents clearing labels, not about the
+          # policy automation reconciling its own decision.
+          EXISTING=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name' | grep '^needs-external-review$' || true)
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$PR_NUMBER" --remove-label "needs-external-review" \
+              --repo "${{ github.repository }}"
+            echo "Removed needs-external-review — PR qualifies for the propagation review lane."
+          fi
+
+          # Post the lane note once. The HTML marker keeps re-runs
+          # (synchronize events) from re-commenting.
+          MARKER="<!-- propagation-review-lane -->"
+          ALREADY=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -F "$MARKER" || true)
+          if [ -z "$ALREADY" ]; then
+            gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$(cat <<EOF
+          $MARKER
+          **Propagation PR review lane**
+
+          This PR is a verbatim mirror of canonical/kit paths from \`mergepath\` — its content was already reviewed in the upstream mergepath PR(s) that introduced it, and the diff is confined to paths declared in \`.mergepath-sync.yml\`. Per REVIEW_POLICY.md § Propagation PR review lane it is **exempt from the Phase 4 external-review requirement**.
+
+          It is still subject to: CI green, CodeRabbit advisory review, and an internal reviewer-identity \`APPROVED\` — the standard under-threshold path. Merge as the author once those clear.
+
+          > Automated check per .github/review-policy.yml
+          EOF
+          )"
+          fi

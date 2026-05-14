@@ -231,6 +231,21 @@ Before moving past Phase 2.5, confirm all of the following:
 9. If the threshold is **not** met, the agent merges the PR as `nathanjohnpayne`. Done.
 10. If the threshold **is** met, the agent proceeds to [Phase 4: External Review](#phase-4-external-review). Phase 4 itself routes the PR to Phase 4a (automated, via the Codex GitHub App) or Phase 4b (manual handoff) based on `codex.enabled` in `.github/review-policy.yml` and on whether 4a's automated loop converges. The agent does NOT post a handoff message directly from this step — Phase 4b posts its own handoff message if and when the fallback path is taken.
 
+### Phase 3.5: Propagation PR review lane
+
+A **propagation PR** — one opened by `scripts/sync-to-downstream.sh` to mirror canonical/kit paths from `mergepath` into a downstream consumer — is a special case of the threshold check. Its content was **already reviewed in the upstream `mergepath` PR** that introduced it; the propagation PR only re-applies that already-reviewed content verbatim. It is also large by construction (a `--sync-all` PR mirrors the full canonical surface) and always touches `.github/**`, so both the line-count threshold *and* the `external_review_paths` check would flag every sync PR for a redundant Phase 4 review of non-novel code.
+
+The lane closes that mismatch. `.github/workflows/pr-review-policy.yml`'s External Review Check recognizes a propagation PR by a deterministic fingerprint and **exempts it from the `needs-external-review` label** — and removes the label if a prior run applied it — when **all** of the following hold:
+
+1. `propagation_prs.enabled: true` in `.github/review-policy.yml`.
+2. The PR branch name starts with `propagation_prs.branch_prefix` (must match `SYNC_BRANCH_PREFIX` in `scripts/sync-to-downstream.sh`).
+3. The PR author is `author_identity` — the propagation actor.
+4. **Every** changed file is under a path that `.mergepath-sync.yml` declares as propagation surface (`canonical` / `kit` / `templated`), as enumerated by `scripts/workflow/parse_manifest_paths.sh`. This is the load-bearing teeth: a PR on a `mergepath-sync/**` branch that touches *any* non-manifest path is **not** a faithful mirror — it has a hand-edit — and falls straight through to normal Phase 3 / Phase 4 review.
+
+A lane PR is **not** un-reviewed. It is still subject to the full under-threshold path: required CI green, CodeRabbit advisory review, and an internal reviewer-identity `APPROVED`. The lane removes **only** the cross-agent Phase 4 external review, because re-reviewing a verbatim mirror of already-reviewed content adds latency without adding signal. The faithful-mirror guarantee (criterion 4) is what makes that safe — anything that *isn't* a pure mirror is not eligible.
+
+Worked example: in a `--sync-all` wave, the pure-mirror consumer PRs take the lane and merge via the under-threshold path; a consumer PR that also carries a hand-edit (e.g. a one-off convergence commit that touches a non-manifest test path) fails criterion 4, keeps `needs-external-review`, and goes through normal Phase 4.
+
 ### Phase 4: External Review
 
 Phase 4 has two sub-phases that together cover the two ways external review can run:
