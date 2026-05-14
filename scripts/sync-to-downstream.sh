@@ -965,9 +965,20 @@ sync_open_pr() {
   # Single-quote the trap body so $workspace is expanded when the trap
   # FIRES (RETURN), not when it's installed — a single quote in TMPDIR
   # or a consumer name can't then break the cleanup command or inject
-  # shell syntax. $workspace is function-local but still in scope at
-  # RETURN time.
-  trap 'rm -rf "$workspace"' RETURN
+  # shell syntax.
+  #
+  # `${workspace:-}` (not bare `$workspace`) is load-bearing: a bash
+  # RETURN trap set inside a function is NOT function-scoped — it stays
+  # installed and ALSO fires on the return of every PARENT function
+  # afterward (sync_all_one_consumer, run_sync_all, ...), where
+  # `workspace` (a `local` in THIS function) is out of scope. Under
+  # `set -u` a bare `$workspace` reference there aborts the whole
+  # script with "unbound variable" — observed live on the first
+  # --sync-all wave, right after the matchline PR was opened. The `:-`
+  # default makes the spurious parent-return firings a harmless
+  # `rm -rf ""` no-op, while the intended firing (this function's own
+  # RETURN, workspace still in scope) still cleans up correctly.
+  trap 'rm -rf "${workspace:-}"' RETURN
 
   printf "  ⤷ %s — cloning %s\n" "$consumer_name" "$consumer_repo"
   if ! gh repo clone "$consumer_repo" "$workspace/repo" -- --depth=10 --quiet >&2; then
@@ -1301,9 +1312,20 @@ sync_all_open_pr() {
   # Single-quote the trap body so $workspace is expanded when the trap
   # FIRES (RETURN), not when it's installed — a single quote in TMPDIR
   # or a consumer name can't then break the cleanup command or inject
-  # shell syntax. $workspace is function-local but still in scope at
-  # RETURN time.
-  trap 'rm -rf "$workspace"' RETURN
+  # shell syntax.
+  #
+  # `${workspace:-}` (not bare `$workspace`) is load-bearing: a bash
+  # RETURN trap set inside a function is NOT function-scoped — it stays
+  # installed and ALSO fires on the return of every PARENT function
+  # afterward (sync_all_one_consumer, run_sync_all, ...), where
+  # `workspace` (a `local` in THIS function) is out of scope. Under
+  # `set -u` a bare `$workspace` reference there aborts the whole
+  # script with "unbound variable" — observed live on the first
+  # --sync-all wave, right after the matchline PR was opened. The `:-`
+  # default makes the spurious parent-return firings a harmless
+  # `rm -rf ""` no-op, while the intended firing (this function's own
+  # RETURN, workspace still in scope) still cleans up correctly.
+  trap 'rm -rf "${workspace:-}"' RETURN
 
   printf "  ⤷ %s — cloning %s\n" "$consumer_name" "$consumer_repo"
   if ! gh repo clone "$consumer_repo" "$workspace/repo" -- --depth=10 --quiet >&2; then

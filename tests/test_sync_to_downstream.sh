@@ -610,6 +610,20 @@ awk '
   in_fn && /gh pr close/ { print "FAIL: sync_one_consumer should not call gh pr close — recreate is deferred to sync_open_pr"; exit 1 }
 ' "$SCRIPT" || fail "sync_one_consumer carries an inline gh pr close — recreate must be deferred to sync_open_pr"
 
+# RETURN-trap unbound-variable guard. A bash `trap ... RETURN` set
+# inside a function is NOT function-scoped: it stays installed and
+# fires again on every PARENT function's return, where the function-
+# local `workspace` is out of scope. Under `set -u` a bare
+# `"$workspace"` reference there aborts the whole script with
+# "unbound variable" (observed live on the first --sync-all wave,
+# right after the matchline PR was opened). The trap body MUST use
+# the `${workspace:-}` default form so the spurious parent-return
+# firings are a harmless `rm -rf ""` no-op.
+grep -q 'trap .rm -rf "\$workspace". RETURN' "$SCRIPT" \
+  && fail "RETURN trap uses bare \$workspace — must be \${workspace:-} (unbound-variable abort under set -u; see --sync-all wave regression)"
+[ "$(grep -c 'trap .rm -rf "${workspace:-}". RETURN' "$SCRIPT")" -eq 2 ] \
+  || fail "expected exactly 2 RETURN traps using the \${workspace:-} safe form (sync_open_pr + sync_all_open_pr)"
+
 # ---------------------------------------------------------------------------
 # --sync-all mode (#168 Layer 3 steady-state reconcile).
 #
