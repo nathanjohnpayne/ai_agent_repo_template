@@ -124,12 +124,28 @@ jobs:
               // self-approval) consume them, and an earlier version
               // of this script fetched twice. CodeRabbit caught the
               // duplicate on PR #68.
-              const reviewsResp = await github.rest.pulls.listReviews({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: pr.number,
-              });
-              const reviews = reviewsResp.data;
+              //
+              // Paginate via `github.paginate` (PR #255 round 2 Codex
+              // P2): the unpaginated `listReviews` call returns at
+              // most 30 items in chronological order, so on a PR with
+              // a long review history the latest Codex review on
+              // `pr.head.sha` can sit on a later page and never reach
+              // the HEAD-scoped filter below. The result was a
+              // false-positive policy violation even when Codex had
+              // genuinely cleared on HEAD. `per_page: 100 +
+              // page traversal` is the standard GitHub-API fix and
+              // matches the patterns already used at the
+              // `pulls.list` and `pulls.listReviewComments` call
+              // sites in this file.
+              const reviews = await github.paginate(
+                github.rest.pulls.listReviews,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  per_page: 100,
+                }
+              );
 
               // Check 1: Missing Self-Review section
               //

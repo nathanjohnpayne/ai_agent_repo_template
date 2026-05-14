@@ -149,6 +149,25 @@ else
   echo "  FAIL: $WORKFLOW must reference #249 in a comment for traceability" >&2
 fi
 
+# Structural assertion: the per-PR review fetch is paginated. PRs
+# with a long review history would otherwise truncate at 30 items
+# and silently miss the latest Codex review on HEAD, producing a
+# false-positive policy violation (PR #255 round 2 Codex P2). The
+# fix is to use `github.paginate(github.rest.pulls.listReviews, ...)`
+# with `per_page: 100`. This assertion is structural rather than
+# algorithmic because the fixture-based tests above consume already-
+# materialised review arrays — they can't catch a pagination bug at
+# the API call site. If the workflow regresses to the unpaginated
+# `github.rest.pulls.listReviews({...})` form, this canary fails.
+if grep -qE 'github\.paginate\(\s*$' "$WORKFLOW" && \
+   grep -A1 'github\.paginate(' "$WORKFLOW" | grep -qF 'github.rest.pulls.listReviews,'; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW paginates pulls.listReviews via github.paginate (PR #255 P2)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must call pulls.listReviews via github.paginate with per_page:100 (PR #255 P2)" >&2
+fi
+
 echo
 if [ "$fail" -gt 0 ]; then
   echo "check_pr_audit_codex_clearance: $fail FAIL / $pass PASS" >&2
