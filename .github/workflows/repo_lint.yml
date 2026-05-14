@@ -60,6 +60,12 @@ jobs:
       - name: check_gh_as_author
         run: ./scripts/ci/check_gh_as_author
 
+      - name: check_eslint_config_present
+        run: ./scripts/ci/check_eslint_config_present
+
+      - name: check_eslint_config_policy
+        run: ./scripts/ci/check_eslint_config_policy
+
       - name: check_auto_clear_workflow
         run: ./scripts/ci/check_auto_clear_workflow
 

@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# scripts/ci/check_eslint_config_present
+#
+# Enforces the ESLint flat-config policy from `rules/repo_rules.md`:
+# any repo with a root `package.json` MUST ship an `eslint.config.js`
+# flat config at the repo root, and the file must be syntactically
+# valid JavaScript.
+#
+# Repos without a root `package.json` (mergepath itself is shell-only,
+# for example) are exempt — the check logs a not-applicable note and
+# exits 0.
+#
+# Contract (load-bearing — referenced by docs/agents/code-review-
+# requirements.md and the rule in rules/repo_rules.md):
+#
+#   exit 0 — pass:
+#            (a) no root package.json (policy not applicable), OR
+#            (b) root package.json present AND eslint.config.js
+#                present at root AND `node --check` parses it.
+#   exit 1 — fail:
+#            root package.json present AND either eslint.config.js
+#            missing at root, OR present but fails `node --check`.
+#   exit 2 — environment error (Node not available when we needed it
+#            to parse-check). Treated as fail by the workflow so the
+#            check can't silently degrade to "skip".
+#
+# Bash 3.2 portable (macOS default shell). Mirrors the style of
+# scripts/ci/check_codex_scripts and scripts/ci/check_required_root_files.
+#
+# Synced to consumer repos via the `scripts/ci/` kit entry in
+# .mergepath-sync.yml — the file is canonical at this path everywhere.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+PKG_JSON="$REPO_ROOT/package.json"
+ESLINT_CONFIG="$REPO_ROOT/eslint.config.js"
+
+if [ ! -f "$PKG_JSON" ]; then
+  echo "check_eslint_config_present: no package.json — ESLint policy not applicable to this repo."
+  echo "check_eslint_config_present: PASS"
+  exit 0
+fi
+
+FAILED=0
+
+if [ ! -f "$ESLINT_CONFIG" ]; then
+  echo "FAIL: package.json is present at repo root but eslint.config.js is missing."
+  echo "      Mergepath policy requires a flat ESLint config in every Node-bearing repo."
+  echo "      See rules/repo_rules.md § ESLint policy and examples/eslint.config.js for"
+  echo "      a starting point you can copy."
+  FAILED=1
+fi
+
+if [ "$FAILED" -eq 0 ]; then
+  if ! command -v node >/dev/null 2>&1; then
+    echo "ERROR: node is not on PATH — cannot parse-check eslint.config.js."
+    echo "       Install Node.js >= 18 on the runner."
+    echo "check_eslint_config_present: ERROR"
+    exit 2
+  fi
+  # Use a unique temp file rather than a fixed `/tmp/...` path so two
+  # concurrent runners (CI matrix, multiple worktrees on a dev box)
+  # can't clobber each other's parse output.
+  ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/eslint-config-parse.XXXXXX")"
+  trap 'rm -f "$ERR_FILE"' EXIT
+  if ! node --check "$ESLINT_CONFIG" 2>"$ERR_FILE"; then
+    echo "FAIL: eslint.config.js failed Node syntax check:"
+    sed 's/^/      /' <"$ERR_FILE"
+    FAILED=1
+  fi
+  rm -f "$ERR_FILE"
+  trap - EXIT
+
+  # Enforce the policy floor from rules/repo_rules.md § ESLint policy:
+  # the config must include `@eslint/js`'s `recommended` ruleset. We
+  # match on both the package import and a `*.configs.recommended`
+  # reference — either alone is a common partial-config mistake (e.g.
+  # importing `@eslint/js` but forgetting to spread `js.configs.recommended`).
+  # Skipped if the parse step already failed — no point re-reporting
+  # on a syntactically-broken file.
+  #
+  # Comment-bypass guard (codex CR on #253): a config that only
+  # references `@eslint/js` or `.configs.recommended` from within a
+  # JS comment must NOT satisfy the check. nathanpayne-codex
+  # reproduced the bypass on the prior HEAD: a config that imports
+  # `@eslint/js` but exports only a local rules object, with a stray
+  # `// ...tseslint.configs.recommended` comment, passed CI. We strip
+  # `//` and `/* */` comments before grepping. Strings are preserved
+  # so a `//` literal inside a quoted value can't confuse the
+  # stripper (theoretical — ESLint configs rarely contain `//` in
+  # strings, but the stripper handles it correctly).
+  if [ "$FAILED" -eq 0 ]; then
+    STRIPPED="$(node -e '
+      const fs = require("fs");
+      const src = fs.readFileSync(process.argv[1], "utf8");
+      let out = "", i = 0, n = src.length;
+      while (i < n) {
+        const c = src[i], nx = src[i+1];
+        if (c === "/" && nx === "/") {
+          while (i < n && src[i] !== "\n") i++;
+        } else if (c === "/" && nx === "*") {
+          i += 2;
+          while (i < n && !(src[i] === "*" && src[i+1] === "/")) i++;
+          i += 2;
+        } else if (c === "\"" || c === "\x27" || c === "`") {
+          const q = c; out += c; i++;
+          while (i < n) {
+            const ch = src[i]; out += ch;
+            if (ch === "\\") { out += src[i+1] || ""; i += 2; continue; }
+            i++;
+            if (ch === q) break;
+          }
+        } else { out += c; i++; }
+      }
+      process.stdout.write(out);
+    ' "$ESLINT_CONFIG")"
+    if ! printf '%s' "$STRIPPED" | grep -Eq '["'\'']@eslint/js["'\'']' \
+       || ! printf '%s' "$STRIPPED" | grep -Eq '\.configs\.recommended\b'; then
+      echo "FAIL: eslint.config.js must include the @eslint/js recommended ruleset."
+      echo "      Mergepath policy floor (rules/repo_rules.md § ESLint policy)"
+      echo "      requires at least:"
+      echo "        import js from \"@eslint/js\";"
+      echo "        export default [ js.configs.recommended, ... ];"
+      echo "      See examples/eslint.config.js for a starting point."
+      echo "      (Comments are stripped before this check — a"
+      echo "      // @eslint/js .configs.recommended line in a comment"
+      echo "      cannot satisfy the policy floor.)"
+      FAILED=1
+    fi
+  fi
+fi
+
+if [ "$FAILED" -eq 1 ]; then
+  echo "check_eslint_config_present: FAIL"
+  exit 1
+fi
+
+echo "check_eslint_config_present: PASS"
+exit 0
