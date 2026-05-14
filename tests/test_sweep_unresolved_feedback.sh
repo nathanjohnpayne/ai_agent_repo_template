@@ -330,6 +330,31 @@ grep -q '<summary>Unknown (1)</summary>' "$BODY_OUT" \
   && pass "render: Unknown severity group rendered" \
   || fail "render: Unknown group missing"
 
+# Codex #254 P2: the body must include the thread-ids marker block on
+# BOTH the create path and the edit path, otherwise the first sweep
+# after bootstrap would treat every existing thread as "new" on the
+# subsequent run. SWEEP_DRY_RUN exercises the same body the create
+# path would post.
+grep -q '<!-- thread-ids-begin -->' "$BODY_OUT" \
+  && pass "render: dry-run body includes thread-ids-begin marker" \
+  || fail "render: dry-run body missing thread-ids-begin marker"
+
+grep -q '<!-- thread-ids-end -->' "$BODY_OUT" \
+  && pass "render: dry-run body includes thread-ids-end marker" \
+  || fail "render: dry-run body missing thread-ids-end marker"
+
+MARKER_IDS=$(awk '
+  /<!-- thread-ids-begin -->/ { capture=1; next }
+  /<!-- thread-ids-end -->/   { capture=0 }
+  capture==1                  { print }
+' "$BODY_OUT" | sed -E 's/^<!-- //; s/ -->$//' | sort -u | tr '\n' ' ')
+WANT_MARKER_IDS="PRT_alpha_1_a PRT_alpha_2_a PRT_alpha_2_b "
+if [ "$MARKER_IDS" = "$WANT_MARKER_IDS" ]; then
+  pass "render: thread-id marker block contains all current thread_ids"
+else
+  fail "render: marker thread_ids mismatch. got=[$MARKER_IDS] want=[$WANT_MARKER_IDS]"
+fi
+
 # ---------------------------------------------------------------------------
 # Test 3: idempotency — same input produces same content-hash.
 # ---------------------------------------------------------------------------

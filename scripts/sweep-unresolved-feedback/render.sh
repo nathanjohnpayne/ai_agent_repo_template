@@ -212,6 +212,28 @@ BODY="$WORKDIR/body.md"
 } > "$BODY"
 
 # ---------------------------------------------------------------------------
+# Append the hidden thread-id marker block. Both the create path AND
+# the edit path emit it so delta detection on the next run can diff
+# against a complete prior id set. Without this on create, the first
+# subsequent run with content changes would treat every existing
+# thread as "new" because PRIOR_IDS would parse as empty (see #254
+# Codex P2 finding).
+# ---------------------------------------------------------------------------
+{
+  cat "$BODY"
+  echo ""
+  echo "<!-- thread-ids-begin -->"
+  if [ -s "$SORTED_IDS" ]; then
+    while IFS= read -r tid; do
+      [ -z "$tid" ] && continue
+      printf '<!-- %s -->\n' "$tid"
+    done < "$SORTED_IDS"
+  fi
+  echo "<!-- thread-ids-end -->"
+} > "$BODY.with-marker"
+mv "$BODY.with-marker" "$BODY"
+
+# ---------------------------------------------------------------------------
 # Dry-run short-circuit. Print the body and exit. Tests use this.
 # ---------------------------------------------------------------------------
 if [ -n "${SWEEP_DRY_RUN:-}" ]; then
@@ -282,20 +304,9 @@ comm -13 "$SORTED_IDS" "$PRIOR_IDS" > "$RESOLVED_IDS" 2>/dev/null || true
 NEW_COUNT=$(wc -l < "$NEW_IDS" | tr -d ' ')
 RESOLVED_COUNT=$(wc -l < "$RESOLVED_IDS" | tr -d ' ')
 
-# Append the marker block so the next run can compute the delta.
-{
-  cat "$BODY"
-  echo ""
-  echo "<!-- thread-ids-begin -->"
-  if [ -s "$SORTED_IDS" ]; then
-    while IFS= read -r tid; do
-      [ -z "$tid" ] && continue
-      printf '<!-- %s -->\n' "$tid"
-    done < "$SORTED_IDS"
-  fi
-  echo "<!-- thread-ids-end -->"
-} > "$BODY.with-marker"
-mv "$BODY.with-marker" "$BODY"
+# The thread-id marker block was already appended to $BODY above,
+# before the dry-run short-circuit, so both the create and edit
+# paths post bodies that the next run can delta against.
 
 # Update the body in place.
 echo "render: updating issue #$EXISTING_NUMBER body (new=$NEW_COUNT, resolved=$RESOLVED_COUNT)" >&2
