@@ -36,6 +36,17 @@
 
 set -euo pipefail
 
+# Hard dependency: `jq`. The script invokes `jq` many times below to
+# parse the PR files payload and emit the recommendation. Without
+# `jq`, those calls exit 127 with `jq: command not found` and the
+# script falls through to undocumented behavior. Fail with a clear
+# error early. (CodeRabbit Major, #272.)
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: jq is required (used to parse the PR files payload + emit the recommendation)." >&2
+  echo "       Install via 'brew install jq' (macOS) or 'apt-get install jq' (Debian/Ubuntu)." >&2
+  exit 2
+fi
+
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
 PR_NUM=""
@@ -97,7 +108,14 @@ fi
 
 # ── Policy: phase_4b_default ─────────────────────────────────────────────────
 
-CONFIG=".github/review-policy.yml"
+# Resolve the policy config from the script's repo root, NOT $PWD.
+# A cwd-relative path silently falls back to `fallback-only` when the
+# script is run from a subdirectory — suppressing real Phase 4b
+# triggers. (CodeRabbit Major, #272.) An env override
+# (`MERGEPATH_REVIEW_POLICY_PATH`) lets tests point at a fixture
+# config without depending on cwd.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG="${MERGEPATH_REVIEW_POLICY_PATH:-$SCRIPT_DIR/../.github/review-policy.yml}"
 PHASE_4B_DEFAULT=""
 if [ -f "$CONFIG" ]; then
   PHASE_4B_DEFAULT=$(awk '

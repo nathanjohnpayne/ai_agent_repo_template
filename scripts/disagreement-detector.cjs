@@ -64,6 +64,15 @@ function decide(input) {
   const headSha = (input && input.headSha) || '';
   const hasLabel = !!(input && input.hasLabel);
 
+  // If `headSha` is missing, refuse to decide. Without it the
+  // HEAD-SHA filter below drops every review (`r.commit_id !==
+  // headSha` always true) → no live disagreement → the final branch
+  // returns `remove` when `hasLabel` is true, INCORRECTLY clearing
+  // `needs-human-review` from a malformed input. Return `noop` on
+  // malformed input so the label is never auto-cleared without a
+  // real signal. (CodeRabbit Major, #272.)
+  if (!headSha) return 'noop';
+
   const allowed = new Set(reviewerAccounts);
 
   // Step 1: collapse to latest review per reviewer. We collapse
