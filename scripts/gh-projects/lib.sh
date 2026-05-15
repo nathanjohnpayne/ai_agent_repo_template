@@ -47,10 +47,14 @@ link_sub_issue() {
 # Usage: prep_body <src> <parent_num> [c1] [c2] [c3] [c4]
 prep_body() {
   local src="$1" parent="$2" c1="${3:-}" c2="${4:-}" c3="${5:-}" c4="${6:-}"
-  # Encode the full source path into the destination name by replacing
-  # slashes with underscores, so distinct source paths map to distinct
-  # destinations.
-  local dst="$GHP_TMPDIR/$(echo "$src" | tr '/' '_')"
+  # Preserve the full source path structure under $GHP_TMPDIR. The
+  # earlier `tr '/' '_'` transform was still collision-prone: a
+  # source like `phase-1/c1.md` mapped to `phase-1_c1.md`, which
+  # collides with an actual `phase-1_c1.md` source. Mirroring the
+  # full path eliminates any name-collision ambiguity. (CodeRabbit
+  # Major, #272.)
+  local dst="$GHP_TMPDIR/$src"
+  mkdir -p "$(dirname "$dst")"
   sed \
     -e "s|__PARENT_NUM__|$parent|g" \
     -e "s|__C1_NUM__|$c1|g" \
