@@ -356,12 +356,13 @@ echo "Bug 2 production parser path: AUTHORING_AGENT extraction under set -eo pip
 
 PARSER_HARNESS=$(cat <<'PARSER'
 set -eo pipefail
-# Verbatim from scripts/codex-review-check.sh
+# Verbatim from scripts/codex-review-check.sh (the r3 herestring form
+# — see the multi-iteration comment block above the live parser for
+# why this shape and not `printf | grep`).
 AUTHORING_AGENT=""
 SAME_AGENT_REVIEWER=""
-if printf '%s\n' "$PR_BODY" | grep -qiE '^Authoring-Agent:'; then
-  AUTHORING_AGENT=$(printf '%s\n' "$PR_BODY" \
-    | grep -i -m1 -E '^Authoring-Agent:' \
+if grep -qiE '^Authoring-Agent:' <<<"$PR_BODY"; then
+  AUTHORING_AGENT=$(grep -i -m1 -E '^Authoring-Agent:' <<<"$PR_BODY" \
     | sed -E 's/^[Aa]uthoring-[Aa]gent:[[:space:]]*([A-Za-z0-9_-]+).*/\1/' \
     | tr '[:upper:]' '[:lower:]')
   if [ -n "$AUTHORING_AGENT" ]; then
@@ -471,6 +472,38 @@ if [ "$rc" = "0" ] && [ "$got" = "cursor|nathanpayne-cursor" ]; then
 else
   fail=$((fail + 1))
   echo "  FAIL: mid-body header parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case L: LARGE PR body (>64KB pipe buffer) with Authoring-Agent near
+# the top. This is the regression nathanpayne-codex r3 flagged: r2
+# used `printf '%s\n' "$PR_BODY" | grep -q…`, a producer-pipe shape.
+# When the body crosses the OS pipe buffer (typically 64KB) and grep
+# matches near the top, grep exits early, printf gets SIGPIPE (141),
+# pipefail bubbles 141 as the pipeline's exit, the guard's `if` test
+# evaluates false even though the header IS present, and
+# SAME_AGENT_REVIEWER stays "" — reopening the same-agent self-
+# approval hole that #283 was meant to close. r3 replaced the
+# producer pipe with a bash herestring `<<<"$PR_BODY"`, which feeds
+# grep directly from the shell with no producer process to receive
+# SIGPIPE.
+#
+# Construct the body in a pipefail-safe way: `head -c N < /dev/zero`
+# has no upstream producer, so it can't be killed by SIGPIPE itself,
+# and `tr` reads to EOF.
+LARGE_FILLER=$(head -c 70000 < /dev/zero | tr '\0' 'x')
+LARGE_BODY="Authoring-Agent: claude"$'\n\n'"$LARGE_FILLER"
+
+set +e
+got=$(run_parser "$LARGE_BODY")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "claude|nathanpayne-claude" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: >64KB PR body with header still parses (no SIGPIPE on producer; pipefail safe)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: large-body parser regressed — header silently lost (rc=$rc, got='$got')" >&2
+  echo "        body size was ${#LARGE_BODY} bytes; r2 producer-pipe shape would fail here." >&2
 fi
 
 echo

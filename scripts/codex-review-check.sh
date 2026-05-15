@@ -284,32 +284,56 @@ fi
 # by gate (b) branch 2 (#170) to detect the same-agent author/reviewer
 # case where Codex's 👍 reaction can substitute for an APPROVED review.
 #
-# Pipefail-safe header parse. The earlier form was a single pipeline
-# `echo "$PR_BODY" | grep ... | sed ... | tr ...` assigned to
-# AUTHORING_AGENT. On a PR body with no `Authoring-Agent:` line, the
-# `grep` step returned rc=1; under `set -eo pipefail` that rc=1
-# bubbled up as the pipeline's exit status, became the assignment's
-# exit status, and `set -e` aborted the script BEFORE reaching the
-# `SAME_AGENT_REVIEWER=""` initializer on the next line — so any PR
-# missing the header (UI-created PRs, external-contributor PRs, or
-# PRs predating the `gh-pr-guard.sh` enforcement of the header on
-# `gh pr create`) blew up the merge gate with an opaque `set -e`
-# trace instead of taking the intended "no Authoring-Agent → empty
-# SAME_AGENT_REVIEWER → branch 1 only" path. Gate the actual
-# extraction on a prior `if` test that uses `grep -q` — the if-test
-# context suppresses `set -e` on the test command itself per bash
-# semantics. (nathanpayne-codex Phase 4b r2 on PR #283.)
+# Pipefail-safe header parse, iteration history:
+#
+#   r1 (#283 initial): used `echo "$PR_BODY" | grep ... | sed ... | tr ...`
+#   assigned to AUTHORING_AGENT. On a PR with no `Authoring-Agent:` line
+#   the `grep` step returned rc=1; under `set -eo pipefail` that rc=1
+#   bubbled up as the pipeline's exit status and `set -e` aborted the
+#   script before `SAME_AGENT_REVIEWER=""` ran on the next line — so any
+#   PR missing the header (UI-created, external-contributor, or
+#   predating the `gh-pr-guard.sh` Authoring-Agent enforcement on
+#   `gh pr create`) blew up the merge gate with an opaque trace.
+#
+#   r2 (codex CHANGES_REQUESTED): gated extraction on a prior
+#   `if printf ... | grep -qiE ...`. The if-test context suppresses
+#   `set -e` on the test command, so no-header bodies now took the
+#   intended "skip extraction, leave SAME_AGENT_REVIEWER empty" path
+#   without aborting.
+#
+#   r3 (codex CHANGES_REQUESTED — THIS iteration): r2 still had a
+#   silent failure on LARGE bodies. `printf '%s\n' "$PR_BODY" | grep`
+#   is a producer pipe; once the body crosses the 64KB pipe buffer
+#   AND the `Authoring-Agent:` header is near the top of the body,
+#   `grep -q`/`grep -m1` matches and exits early, `printf` gets
+#   SIGPIPE (rc=141), and `pipefail` bubbles the 141 as the pipeline's
+#   exit status. In the guard `if` test, 141 is non-zero → the `if`
+#   evaluates false → AUTHORING_AGENT and SAME_AGENT_REVIEWER stay
+#   empty even though the header IS present. The same-agent
+#   exclusion in gate (b)/(c) then no-ops (empty-string clause), and
+#   the authoring agent's own reviewer identity can satisfy the
+#   merge gate. THE EXACT HOLE r1+r2 set out to close, reopened by
+#   a different mechanism.
+#
+#   Fix: replace `printf '%s\n' "$PR_BODY" |` with a bash herestring
+#   `<<<"$PR_BODY"`. The herestring feeds grep directly from the
+#   shell — there is no producer process, so SIGPIPE on producer-
+#   close cannot happen. `grep` reads what it needs and exits 0/1
+#   cleanly; pipefail has nothing to bubble. Bash 3.2+ supports
+#   `<<<` (added in 2.05b), so portability is not a concern.
+#   (nathanpayne-codex Phase 4b r3 on PR #283.)
 AUTHORING_AGENT=""
 SAME_AGENT_REVIEWER=""
-if printf '%s\n' "$PR_BODY" | grep -qiE '^Authoring-Agent:'; then
-  AUTHORING_AGENT=$(printf '%s\n' "$PR_BODY" \
-    | grep -i -m1 -E '^Authoring-Agent:' \
+if grep -qiE '^Authoring-Agent:' <<<"$PR_BODY"; then
+  AUTHORING_AGENT=$(grep -i -m1 -E '^Authoring-Agent:' <<<"$PR_BODY" \
     | sed -E 's/^[Aa]uthoring-[Aa]gent:[[:space:]]*([A-Za-z0-9_-]+).*/\1/' \
     | tr '[:upper:]' '[:lower:]')
   if [ -n "$AUTHORING_AGENT" ]; then
     # Match against available_reviewers via suffix (e.g., "claude"
     # matches "nathanpayne-claude"). Empty if no match — also
-    # pipefail-safe: awk always exits 0 even when no record matched.
+    # pipefail-safe: REVIEWERS is small (~3 lines) so SIGPIPE on the
+    # `echo` producer cannot fire here, and awk always exits 0 even
+    # when no record matched.
     SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
   fi
 fi
