@@ -529,9 +529,21 @@ post_retry_trigger() {
   # byline). Fail closed BEFORE the write if the keyring has drifted.
   # Opt-out via CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 (for CI / test
   # harnesses without a real keyring).
-  if [ "${CODERABBIT_WAIT_SKIP_IDENTITY_CHECK:-0}" != "1" ] && \
-     [ -x "$(dirname "${BASH_SOURCE[0]}")/identity-check.sh" ]; then
-    "$(dirname "${BASH_SOURCE[0]}")/identity-check.sh" --expect-reviewer \
+  #
+  # r3 (#284): fail CLOSED if the helper is missing or non-executable.
+  # The previous shape ANDed the opt-out and `[ -x "$CHECKER" ]` so a
+  # rename / delete / chmod -x silently skipped the gate. Helper
+  # presence is now a hard error inside the opt-out branch.
+  if [ "${CODERABBIT_WAIT_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
+    local checker="$(dirname "${BASH_SOURCE[0]}")/identity-check.sh"
+    if [ ! -x "$checker" ]; then
+      echo "ERROR: identity-check helper missing or non-executable: $checker" >&2
+      echo "       Refusing to post retry-trigger comment without identity verification." >&2
+      echo "       Restore the helper, or opt out via" >&2
+      echo "       CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
+      die 3 "identity-check helper unavailable"
+    fi
+    "$checker" --expect-reviewer \
       || die 3 "identity-check failed before retry-trigger write; see stderr above."
   fi
   log "posting retry trigger comment to PR #$PR_NUMBER as $mention"

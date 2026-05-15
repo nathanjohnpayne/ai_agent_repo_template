@@ -340,12 +340,26 @@ fi
 # re-check and the mutation ran without identity verification on
 # every thread AFTER the first failure. Lifting the check out of
 # the loop entirely makes it a single up-front gate.
-if [ "${RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK:-0}" != "1" ] && \
-   ! $DRY_RUN && \
-   [ -x "$(dirname "${BASH_SOURCE[0]}")/identity-check.sh" ]; then
+#
+# r3 (#284): fail CLOSED if the helper is missing or non-executable.
+# The previous shape bundled `[ -x "$CHECKER" ]` into the same AND
+# chain as the opt-out — so if the helper got renamed, deleted, or
+# lost its +x bit, the entire identity-check block was silently
+# SKIPPED and the mutation ran without verification. nathanpayne-codex
+# Phase 4b r2 reproduced this. The fix: the helper-presence test
+# becomes a hard error inside the opt-out branch rather than a
+# precondition for entering it.
+if [ "${RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK:-0}" != "1" ] && ! $DRY_RUN; then
+  CHECKER="$(dirname "${BASH_SOURCE[0]}")/identity-check.sh"
+  if [ ! -x "$CHECKER" ]; then
+    echo "ERROR: identity-check helper missing or non-executable: $CHECKER" >&2
+    echo "       Refusing to mutate without identity verification." >&2
+    echo "       Restore the helper, or opt out via" >&2
+    echo "       RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
+    exit 2
+  fi
   expected_login="nathanpayne-${MERGEPATH_AGENT:-claude}"
-  if ! GH_TOKEN="$PAT_GH_TOKEN" \
-       "$(dirname "${BASH_SOURCE[0]}")/identity-check.sh" \
+  if ! GH_TOKEN="$PAT_GH_TOKEN" "$CHECKER" \
        --expect-token-identity "$expected_login"; then
     echo "ERROR: identity-check failed before any mutation. Refusing to" >&2
     echo "       resolve threads. Confirm GH_TOKEN / OP_PREFLIGHT_REVIEWER_PAT" >&2

@@ -431,9 +431,21 @@ else
   # — fail closed BEFORE posting if the keyring drifted from the
   # agent's reviewer identity. Opt-out via
   # CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK=1 for test harnesses.
-  if [ "${CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK:-0}" != "1" ] && \
-     [ -x "$(dirname "${BASH_SOURCE[0]}")/identity-check.sh" ]; then
-    "$(dirname "${BASH_SOURCE[0]}")/identity-check.sh" --expect-reviewer \
+  #
+  # r3 (#284): fail CLOSED if the helper is missing or non-executable.
+  # The previous shape ANDed the opt-out and `[ -x "$CHECKER" ]` so a
+  # rename / delete / chmod -x silently skipped the gate. Helper
+  # presence is now a hard error inside the opt-out branch.
+  if [ "${CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
+    CHECKER="$(dirname "${BASH_SOURCE[0]}")/identity-check.sh"
+    if [ ! -x "$CHECKER" ]; then
+      echo "ERROR: identity-check helper missing or non-executable: $CHECKER" >&2
+      echo "       Refusing to post '@codex review' without identity verification." >&2
+      echo "       Restore the helper, or opt out via" >&2
+      echo "       CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
+      die 3 "identity-check helper unavailable"
+    fi
+    "$CHECKER" --expect-reviewer \
       || die 3 "identity-check failed before posting '@codex review'; see stderr above."
   fi
   log "posting '@codex review' trigger comment"
