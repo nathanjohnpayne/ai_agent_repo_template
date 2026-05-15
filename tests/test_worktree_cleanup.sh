@@ -318,6 +318,62 @@ fi
 # outside WORKDIR.
 rm -rf "$PR_WT"
 
+# ── Symlink-escape guard (#288 r2): orphan cleanup MUST refuse to ──────
+# follow a symlink under .claude/worktrees/ that points outside the
+# worktree root. nathanpayne-codex Phase 4b r1 caught that the prior
+# implementation resolved with `pwd -P` and then `rm -rf`'d the target,
+# which could traverse OUT of .claude/worktrees/ entirely.
+#
+# Test fixture: a symlink under .claude/worktrees/ pointing at a
+# scratch dir OUTSIDE the worktree root. The scratch dir contains a
+# canary file that must SURVIVE the cleanup. The helper's --apply
+# --orphan-clean must (a) not delete the canary, (b) emit a SKIP
+# diagnostic for the symlink.
+
+# Set up the scratch external dir + canary.
+EXT_DIR="$WORKDIR/external-canary"
+mkdir -p "$EXT_DIR"
+CANARY_FILE="$EXT_DIR/do-not-delete.txt"
+echo "this file MUST survive symlink-escape attempts" > "$CANARY_FILE"
+
+# Set up the symlink under .claude/worktrees/.
+ln -s "$EXT_DIR" "$MAIN/.claude/worktrees/agent-symlink-escape"
+
+# Run --apply --orphan-clean and capture output.
+set +e
+OUT_ESC=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply --orphan-clean 2>&1)
+RC_ESC=$?
+set -e
+
+# Canary file MUST still exist.
+if [ -f "$CANARY_FILE" ]; then
+  pass "symlink escape: external canary file survived --apply --orphan-clean"
+else
+  fail "SECURITY: symlink escape deleted external canary ($CANARY_FILE)"
+  echo "$OUT_ESC" >&2
+fi
+
+# The helper must have emitted a SKIP diagnostic on the symlink.
+if echo "$OUT_ESC" | grep -qE "SKIP.*symlink"; then
+  pass "symlink escape: helper emitted SKIP diagnostic for symlinked orphan"
+else
+  fail "symlink escape: no SKIP diagnostic in helper output"
+  echo "$OUT_ESC" >&2
+fi
+
+# The symlink itself should still exist (the helper refuses to touch
+# symlinks rather than removing them, since the user may have placed
+# them deliberately).
+if [ -L "$MAIN/.claude/worktrees/agent-symlink-escape" ]; then
+  pass "symlink escape: the symlink entry was not removed (helper is conservative)"
+else
+  fail "symlink escape: the symlink entry was removed unexpectedly"
+fi
+
+# Clean up the test symlink + external dir.
+rm -f "$MAIN/.claude/worktrees/agent-symlink-escape"
+rm -rf "$EXT_DIR"
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

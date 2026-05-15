@@ -362,16 +362,58 @@ done <"$REC_FILE"
 # ── Orphan scan ───────────────────────────────────────────────────────
 ORPHAN_ROOT="$MAIN_WORKTREE/.claude/worktrees"
 if [ -d "$ORPHAN_ROOT" ]; then
+  # Resolve ORPHAN_ROOT itself to its physical path so the per-entry
+  # `pwd -P` boundary check below compares against the SAME canonical
+  # form. Without this, a check like `[[ $abs == $ORPHAN_ROOT/* ]]`
+  # would false-negative when ORPHAN_ROOT contains a symlink in its
+  # ancestor path. (nathanpayne-codex Phase 4b r1 on PR #298.)
+  ORPHAN_ROOT_PHYS=$(cd "$ORPHAN_ROOT" 2>/dev/null && pwd -P) || ORPHAN_ROOT_PHYS=""
+  # Trailing slash so the prefix match below is bounded — `/foo` must
+  # not match a sibling path `/foobar`.
+  ORPHAN_ROOT_PHYS_TS="${ORPHAN_ROOT_PHYS%/}/"
+
   # Collect known worktree paths into a set (one per line) and check each
   # subdir against it.
-  KNOWN_FILE=$(mktemp -t wcleanup-known.XXXXXX)
+  KNOWN_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-known.XXXXXX")
   awk -F'|' '{ print $1 }' "$REC_FILE" >"$KNOWN_FILE"
   for d in "$ORPHAN_ROOT"/*; do
     [ -d "$d" ] || continue
+
+    # Defense in depth #1: refuse to operate on a symlink entry. A
+    # symlinked sub-entry of .claude/worktrees/ could point ANYWHERE
+    # (including outside the worktree root), and resolving + rm-rf'ing
+    # the target would delete data the user didn't intend. (codex
+    # Phase 4b r1 on #298: orphan cleanup with `pwd -P` followed by
+    # `rm -rf` could traverse OUT of .claude/worktrees/ when the
+    # entry was a symlink to an external dir.)
+    if [ -L "$d" ]; then
+      echo "  SKIP (symlink, refusing to follow): $d" >&2
+      continue
+    fi
+
     # Resolve to physical path so the orphan comparison aligns with how
     # git records worktree paths in `git worktree list` (it canonicalizes
     # symlinked roots like /var/folders → /private/var/folders on macOS).
     abs=$(cd "$d" 2>/dev/null && pwd -P) || continue
+
+    # Defense in depth #2: even though $d itself isn't a symlink, its
+    # physical path MIGHT be outside ORPHAN_ROOT_PHYS if a parent in
+    # the ORPHAN_ROOT chain was itself a symlink. Verify the resolved
+    # path is bounded under the resolved ORPHAN_ROOT before any
+    # destructive operation. Empty ORPHAN_ROOT_PHYS (cd failure on
+    # ORPHAN_ROOT) also short-circuits to refuse.
+    if [ -z "$ORPHAN_ROOT_PHYS" ]; then
+      echo "  SKIP (could not resolve ORPHAN_ROOT physical path '$ORPHAN_ROOT'): refusing rm -rf" >&2
+      continue
+    fi
+    case "${abs}/" in
+      "${ORPHAN_ROOT_PHYS_TS}"*) ;;  # bounded under ORPHAN_ROOT_PHYS — OK
+      *)
+        echo "  SKIP (resolved path '$abs' is OUTSIDE '$ORPHAN_ROOT_PHYS'): refusing rm -rf" >&2
+        continue
+        ;;
+    esac
+
     if ! grep -Fxq -- "$abs" "$KNOWN_FILE"; then
       print_record "[ORPHAN .claude/worktrees]" "$C_RED" \
         "$abs" "" "" "[orphan]" "" ""
