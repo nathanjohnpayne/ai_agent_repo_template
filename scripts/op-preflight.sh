@@ -106,6 +106,12 @@ ssh_host_for() {
 }
 
 # ── Cache layout ──────────────────────────────────────────────────────
+# Cache directory is intentionally shared across all consumer repos:
+#   - The session file is keyed by --agent (see SESSION_FILE below).
+#   - PATs are agent-keyed and currently uniform across the Phase 4
+#     propagation set, so a shared cache is functionally correct.
+# Re-evaluate if per-repo PATs ever diverge — at that point, namespace
+# the cache path per consumer repo (e.g. $HOME/.cache/mergepath/$REPO).
 DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mergepath"
 CACHE_DIR="${OP_PREFLIGHT_CACHE_DIR:-$DEFAULT_CACHE_DIR}"
 DEFAULT_TTL_SECONDS=14400  # 4 hours

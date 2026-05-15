@@ -864,3 +864,9 @@ op document edit 'GCP ADC' --vault=Private \
 
 After that, the next preflight run will materialize a usable credential
 and the `GOOGLE_APPLICATION_CREDENTIALS` export resumes normally.
+
+## Changelog
+
+**2026-05-15: Deploy credential precedence updated.** Project Firebase-vault SA keys
+are now the default for `op-firebase-deploy`. See #154 / #211 for implementation
+history; live consumer verification on matchline pending (#211 close-out).

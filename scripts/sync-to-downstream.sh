@@ -112,6 +112,34 @@
 #   --help, -h           Show this help.
 #   --version            Print version info.
 #
+# Canary-first procedure for --sync-all (#264):
+#   The original 263caf3 propagation wave (8 consumer PRs at once)
+#   failed lint on EVERY consumer because the kit `scripts/ci/`
+#   was propagated in isolation from coupled tests/fixtures it
+#   depended on. The pre-wave diff audit characterized all drift
+#   as staleness but did NOT exercise a consumer's CI to prove
+#   the propagated set was internally consistent — a content-level
+#   audit cannot catch a runtime-level closure gap.
+#
+#   The fix is a one-consumer canary BEFORE the full fan-out:
+#
+#     # 1. Pick one consumer (matchline is the canonical canary).
+#     scripts/sync-to-downstream.sh --sync-all --repos matchline
+#
+#     # 2. Wait for that consumer's `lint` workflow to pass on the
+#     #    opened PR. If it fails, fix the manifest gap in mergepath
+#     #    canonical first (most often a `requires:` closure miss
+#     #    flagged by `scripts/ci/check_sync_manifest`).
+#
+#     # 3. Once the canary's lint is green, fan out to the rest:
+#     scripts/sync-to-downstream.sh --sync-all
+#
+#   The `requires:` manifest invariant added in #264 catches the
+#   most common class of closure gap at the manifest layer, but the
+#   canary remains the operational safety net for cases the
+#   invariant can't see (consumer-specific repo_lint.yml steps,
+#   transitively-required files outside the manifest, etc.).
+#
 # Environment:
 #   MERGEPATH_SIBLINGS_DIR  Default: $HOME/GitHub. If a `.git` entry at
 #                           $MERGEPATH_SIBLINGS_DIR/<consumer-name>/.git

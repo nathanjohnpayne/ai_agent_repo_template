@@ -485,6 +485,52 @@ nathanpayne-{suggested_agent}
 
 The human uses this message to brief the external agent. The external agent does not need access to the internal review thread—the handoff message contains everything needed to begin.
 
+### Chat-side handoff block
+
+The PR-side comment above is the durable record on the PR itself. The **chat-side handoff block** is an additive, copy-paste-friendly summary the originating agent emits **into chat** at the same moment it alerts the human — it does NOT replace the PR-side comment. The human pastes the chat-side block directly into the external reviewer's CLI session (typically `nathanpayne-codex`) to brief that session in one keystroke; the external agent then opens the PR for the full context surfaced by the PR-side comment.
+
+Use the **single-PR variant** when the agent is handing off exactly one PR. Use the **batch variant** when alerting the human about two or more Phase 4b-eligible PRs at once (e.g., a propagation wave where several consumer mirror PRs each need an external `APPROVED` review).
+
+**Single-PR variant** — emit verbatim into chat (substitute the angle-bracket placeholders):
+
+```
+PR ready for external review (Phase 4b):
+
+  <PR URL>  head <short_sha>  (base <base_short_sha>)
+
+Context: <one line — content classification (novel work, verbatim
+         mirror of mergepath@<sha>, sync + N convergence commits, ...)>
+Gate: post APPROVED as nathanpayne-codex on the listed HEAD, OR a
+      Codex bot review / 👍 reaction newer than the HEAD committer date.
+Threads: <N> unresolved (auto-resolve-bots once the gate clears).
+```
+
+**Batch variant** (>1 PR) — emit a markdown table with one row per PR, followed by a single fenced prompt the human can paste into the external reviewer's CLI session:
+
+| Repo | PR # | HEAD short SHA | Unresolved threads | Content note |
+|------|------|---------------|-------------------|--------------|
+| `nathanjohnpayne/<repo-a>` | [#<num>](https://github.com/nathanjohnpayne/<repo-a>/pull/<num>) | `<short_sha>` | <N> | <content classification> |
+| `nathanjohnpayne/<repo-b>` | [#<num>](https://github.com/nathanjohnpayne/<repo-b>/pull/<num>) | `<short_sha>` | <N> | <content classification> |
+
+```
+PRs ready for external review (Phase 4b):
+
+  <PR URL #1>  head <short_sha>  (base <base_short_sha>)
+  <PR URL #2>  head <short_sha>  (base <base_short_sha>)
+  ...
+
+Context: <one line — shared content classification if all PRs share
+         one, e.g. "all verbatim mirrors of mergepath@<sha>"; otherwise
+         "mixed — see table above">
+Gate: for each PR, post APPROVED as nathanpayne-codex on the listed
+      HEAD, OR a Codex bot review / 👍 reaction newer than the HEAD
+      committer date.
+Threads: see "Unresolved threads" column (auto-resolve-bots once the
+         gate clears).
+```
+
+The chat-side block is **additive** to the existing PR-side comment template above. Agents emit both: the PR-side comment is the durable record on the PR; the chat-side block is the human-facing summary that flows into the external CLI session. Neither replaces the other.
+
 ## Post-Merge Issue Creation
 
 When an external reviewer approves a PR but flags observations or risks, the merging agent creates a GitHub Issue for each item before or immediately after merging:
