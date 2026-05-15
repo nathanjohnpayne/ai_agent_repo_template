@@ -152,6 +152,14 @@ paths:
   - path: scripts/phase-4b-classifier.sh
     type: canonical
     consumers: all
+  # Chat-side Phase 4b handoff block renderer (#281). Read-only,
+  # stdout-only: emits the single-PR or batch handoff variant per
+  # REVIEW_POLICY.md § Handoff Message Format § Chat-side handoff
+  # block. Must travel with every consumer that runs the Phase 4b
+  # workflow so the chat-side text is consistent across repos.
+  - path: scripts/post-phase-4b-handoff.sh
+    type: canonical
+    consumers: all
   - path: scripts/codex-p1-gate.sh
     type: canonical
     consumers: all
@@ -219,6 +227,12 @@ paths:
   # scripts/ci/check_disagreement_detector. The check wrapper requires
   # this test file; same #264/#266 coupling class (#273).
   - path: tests/test_disagreement_detector.sh
+    type: canonical
+    consumers: all
+  # Pairs with scripts/post-phase-4b-handoff.sh (#281). PATH-shimmed
+  # gh; no live GitHub network. Travels with the helper so consumers
+  # exercise the same renderer they propagate.
+  - path: tests/test_post_phase_4b_handoff.sh
     type: canonical
     consumers: all
 

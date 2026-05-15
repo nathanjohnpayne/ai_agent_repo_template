@@ -321,14 +321,17 @@ keyring active is your agent identity. No switch needed for commits.
    g. **Phase 4b checkpoint (do not skip).** Before the merge call,
       apply step 8.5: if `phase_4b_default` is `complex-changes`, run
       `scripts/phase-4b-classifier.sh <PR#>` and act on its exit code
-      (1 → post 4b handoff and wait for the external reviewer identity
-      to post an `APPROVED` review on the current HEAD with no
-      unaddressed P0/P1, then come back here; 0 → proceed to merge;
-      2 → stop and investigate; 3 → fix the invocation). If
-      `phase_4b_default` is `always`, post the 4b handoff
-      unconditionally and wait for the same external `APPROVED`
-      condition before coming back to merge. If `fallback-only`, skip
-      directly to merge.
+      (1 → emit the chat-side handoff block per REVIEW_POLICY.md
+      § Handoff Message Format § Chat-side handoff block, post the
+      4b handoff, and wait for the external reviewer identity to post
+      an `APPROVED` review on the current HEAD with no unaddressed
+      P0/P1, then come back here; 0 → proceed to merge; 2 → stop and
+      investigate; 3 → fix the invocation). If `phase_4b_default` is
+      `always`, emit the chat-side handoff block per REVIEW_POLICY.md
+      § Handoff Message Format § Chat-side handoff block, post the
+      4b handoff unconditionally, and wait for the same external
+      `APPROVED` condition before coming back to merge. If
+      `fallback-only`, skip directly to merge.
    h. With the gate passing AND the 4b checkpoint cleared, merge as
       nathanjohnpayne via `scripts/gh-as-author.sh` per the active-
       account convention above (HARD RULE — splitting the switch +
@@ -345,9 +348,11 @@ keyring active is your agent identity. No switch needed for commits.
 
    a. Post the handoff message per REVIEW_POLICY.md § Handoff Message
       Format as a PR comment.
-   b. Alert the human via chat. The human takes the handoff to a
-      different agent CLI session (typically `nathanpayne-codex`), which
-      posts an external review.
+   b. Emit the chat-side handoff block per REVIEW_POLICY.md
+      § Handoff Message Format § Chat-side handoff block, then alert
+      the human via chat. The human takes the handoff to a different
+      agent CLI session (typically `nathanpayne-codex`), which posts
+      an external review.
    c. Address feedback via the usual nathanjohnpayne commit loop.
    d. Wait for the external reviewer identity to post an `APPROVED` review.
    e. If the external reviewer flags observations or risks, file the
