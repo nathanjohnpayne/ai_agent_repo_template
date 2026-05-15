@@ -120,6 +120,77 @@ else
 fi
 rm -f "$WORKDIR/comment-mention.sh"
 
+# Case 8 (#286 r3): double-quoted bare-name prefix.
+run_check_on_fixture "bad-quoted-bare.sh" '#!/usr/bin/env bash
+foo=$(mktemp -t "prefix")
+'
+if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+  pass "double-quoted bare prefix: caught (#286 r3)"
+else
+  fail "double-quoted bare prefix: rc=$RC out=$OUT"
+fi
+rm -f "$WORKDIR/bad-quoted-bare.sh"
+
+# Case 9: single-quoted bare-name prefix.
+run_check_on_fixture "bad-squoted-bare.sh" '#!/usr/bin/env bash
+foo=$(mktemp -t '"'"'prefix'"'"')
+'
+if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+  pass "single-quoted bare prefix: caught"
+else
+  fail "single-quoted bare prefix: rc=$RC out=$OUT"
+fi
+rm -f "$WORKDIR/bad-squoted-bare.sh"
+
+# Case 10: double-quoted variable expansion prefix.
+run_check_on_fixture "bad-quoted-var.sh" '#!/usr/bin/env bash
+prefix=foo
+foo=$(mktemp -t "$prefix")
+'
+if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+  pass "double-quoted variable prefix: caught (#286 r3)"
+else
+  fail "double-quoted variable prefix: rc=$RC out=$OUT"
+fi
+rm -f "$WORKDIR/bad-quoted-var.sh"
+
+# Case 11: bare variable expansion prefix.
+run_check_on_fixture "bad-bare-var.sh" '#!/usr/bin/env bash
+prefix=foo
+foo=$(mktemp -t $prefix)
+'
+if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+  pass "bare variable prefix: caught"
+else
+  fail "bare variable prefix: rc=$RC out=$OUT"
+fi
+rm -f "$WORKDIR/bad-bare-var.sh"
+
+# Case 12: braced variable expansion prefix.
+run_check_on_fixture "bad-braced-var.sh" '#!/usr/bin/env bash
+prefix=foo
+foo=$(mktemp -t ${prefix})
+'
+if [ "$RC" = "1" ] && echo "$OUT" | grep -q "FAIL"; then
+  pass "braced variable prefix: caught"
+else
+  fail "braced variable prefix: rc=$RC out=$OUT"
+fi
+rm -f "$WORKDIR/bad-braced-var.sh"
+
+# Case 13: portable quoted template (slashes inside quote) → PASS.
+# This is the SHAPE we explicitly do NOT want to flag, even though
+# it contains the literal `mktemp -t "..."` substring.
+run_check_on_fixture "clean-quoted-template.sh" '#!/usr/bin/env bash
+foo=$(mktemp -d "${TMPDIR:-/tmp}/safe.XXXXXX")
+'
+if [ "$RC" = "0" ] && echo "$OUT" | grep -q "PASS"; then
+  pass "portable quoted template (slashes inside quotes): not flagged"
+else
+  fail "portable quoted template: rc=$RC out=$OUT"
+fi
+rm -f "$WORKDIR/clean-quoted-template.sh"
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then

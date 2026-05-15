@@ -86,8 +86,9 @@ VIOLATION_LIST=""
 
 # The pattern targets `mktemp` followed by zero or more whitespace-
 # separated short-option clusters, ending in a cluster that contains
-# `-t` (either bare `-t` OR a compact combined form like `-dt`),
-# followed by a bare-token prefix arg.
+# `-t` (bare `-t` OR a compact combined form like `-dt`), followed
+# by a prefix-like argument — bare token, quoted string, OR variable
+# expansion.
 #
 # The cluster regex `-[a-zA-Z]*t` matches:
 #   - bare `-t`                  (zero leading letters, then 't')
@@ -96,21 +97,32 @@ VIOLATION_LIST=""
 # so `t` must be the LAST char of the flag cluster — hence the trailing
 # `t` anchor in the regex.
 #
+# Prefix-argument alternation (#286 r3 — nathanpayne-codex Phase 4b
+# finding: r2 regex required a bare identifier as the prefix-arg, so
+# quoted forms like `mktemp -t "prefix"` and variable forms like
+# `mktemp -t "$prefix"` slipped through. r3 extends the alternation):
+#   - "..."   double-quoted bare-name (no slashes inside — slashes
+#             would indicate the portable template form)
+#   - '...'   single-quoted bare-name
+#   - $VAR    $-prefixed variable expansion (with or without braces)
+#   - bare    identifier (existing coverage)
+#
 # Examples this matches (BAD):
 #   mktemp -t myprefix
 #   mktemp -d -t mergepath-sim
-#   mktemp -dt myprefix            (#286 r2 — nathanpayne-codex Phase
-#                                    4b finding: the prior regex required
-#                                    a separate `-t` token, missing the
-#                                    compact combined form.)
-#   mktemp -Pdt myprefix           (any leading flags before the t)
+#   mktemp -dt myprefix
+#   mktemp -Pdt myprefix
+#   mktemp -t "prefix"             (r3: quoted bare-name)
+#   mktemp -t 'prefix'             (r3: single-quoted bare-name)
+#   mktemp -t "$prefix"            (r3: quoted variable expansion)
+#   mktemp -t ${prefix}            (r3: bare variable expansion)
 #
 # Examples this DOES NOT match (GOOD):
-#   mktemp -d "${TMPDIR:-/tmp}/mergepath-sim.XXXXXX"
-#   mktemp /tmp/foo.XXXXXX
-#   mktemp --tmpdir name.XXXXXX
-#   mktemp -d   (no -t, no prefix-as-bare-token)
-PATTERN='mktemp([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*t[[:space:]]+[A-Za-z_][A-Za-z0-9_.-]*'
+#   mktemp -d "${TMPDIR:-/tmp}/mergepath-sim.XXXXXX"  (slashes in quote)
+#   mktemp "/tmp/foo.XXXXXX"                          (no -t)
+#   mktemp --tmpdir name.XXXXXX                       (no -t flag)
+#   mktemp -d                                         (no -t, no prefix-arg)
+PATTERN='mktemp([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*t[[:space:]]+("[^"/]*"|'"'"'[^'"'"'/]*'"'"'|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|[A-Za-z_][A-Za-z0-9_.-]*)'
 
 while IFS= read -r file; do
   [[ -z "$file" ]] && continue

@@ -176,12 +176,9 @@ ERR3="$WORKDIR/case3.err"
 : >"$WORKDIR/ofd-calls.log"
 
 set +e
-# Pass an arg through `--` (`--only hosting`) so DEPLOY_ARGS is
-# non-empty when the script reaches `op-firebase-deploy
-# "${DEPLOY_ARGS[@]}"`. macOS bash 3.2 treats empty array expansion
-# under `set -u` as an unbound-variable error — that's a pre-existing
-# quirk in deploy.sh independent of #286 and out of scope for this
-# test; non-empty args sidestep it cleanly.
+# Pass trailing args through `--` (`--only hosting`) to exercise the
+# non-empty DEPLOY_ARGS path. The empty-DEPLOY_ARGS path is exercised
+# separately in Case 4 below (#286 r3 regression).
 PATH="$STUB_DIR:$PATH" \
 OFD_LOG="$WORKDIR/ofd-calls.log" \
 DEPLOY_ALLOW_DIRTY=1 \
@@ -200,6 +197,45 @@ elif ! grep -q 'op-firebase-deploy' "$WORKDIR/ofd-calls.log"; then
   fail "allow-dirty: deploy.sh did not reach the op-firebase-deploy step despite the override."
 else
   pass "allow-dirty: DEPLOY_ALLOW_DIRTY=1 override permits deploy, logs the banner, reaches the deploy step."
+fi
+
+# ---------------------------------------------------------------------------
+# Case 4 (#286 r3 — nathanpayne-codex Phase 4b finding): empty
+# DEPLOY_ARGS must NOT trip the bash 3.2 unbound-variable abort.
+# Invoke `deploy.sh --force --skip-build --skip-cf-purge` with NO
+# trailing `-- <args>`; the script reaches the op-firebase-deploy
+# step with DEPLOY_ARGS=(). Pre-fix: aborts with `DEPLOY_ARGS[@]:
+# unbound variable`. Post-fix: expansion is `${ARR[@]+"${ARR[@]}"}`
+# which is empty-safe under `set -u`.
+# ---------------------------------------------------------------------------
+REPO4="$WORKDIR/case4-empty-args-repo"
+mkdir -p "$REPO4"
+( cd "$REPO4" && git init -q -b main && git config user.email a@b.c && git config user.name a && \
+  echo init >README.md && git add README.md && git commit -q -m init )
+
+OUT4="$WORKDIR/case4.out"
+ERR4="$WORKDIR/case4.err"
+: >"$WORKDIR/ofd-calls-4.log"
+
+set +e
+PATH="$STUB_DIR:$PATH" \
+OFD_LOG="$WORKDIR/ofd-calls-4.log" \
+  bash -c "cd '$REPO4' && bash '$SCRIPT' --force --skip-build --skip-cf-purge" \
+  >"$OUT4" 2>"$ERR4"
+RC4=$?
+set -e
+
+if grep -q 'unbound variable' "$ERR4" 2>/dev/null; then
+  fail "empty-args: deploy.sh aborted with 'unbound variable' (#286 r3 regression)."
+  cat "$ERR4" >&2
+elif [[ $RC4 -ne 0 ]]; then
+  fail "empty-args: deploy.sh returned $RC4 (expected 0). stderr was:"
+  cat "$ERR4" >&2
+elif ! grep -q 'op-firebase-deploy' "$WORKDIR/ofd-calls-4.log"; then
+  fail "empty-args: deploy.sh did not reach the op-firebase-deploy step."
+  cat "$ERR4" >&2
+else
+  pass "empty-args: deploy.sh with no trailing DEPLOY_ARGS reaches op-firebase-deploy without unbound-variable abort"
 fi
 
 # ---------------------------------------------------------------------------

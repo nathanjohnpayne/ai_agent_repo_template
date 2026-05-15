@@ -179,7 +179,17 @@ fi
 
 # Step 2: Deploy
 echo ">> Deploying via op-firebase-deploy"
-op-firebase-deploy "${DEPLOY_ARGS[@]}"
+# Bash 3.2 + `set -u`: expanding an empty `${DEPLOY_ARGS[@]}` aborts
+# with "DEPLOY_ARGS[@]: unbound variable" when no trailing deploy
+# args were appended (e.g. `deploy.sh --force --skip-build
+# --skip-cf-purge` with nothing after `--`). The `${ARR[@]+"${ARR[@]}"}`
+# idiom expands to the array contents only when the array has been
+# ASSIGNED — DEPLOY_ARGS=() at parse time qualifies as assigned, so
+# this expansion is always defined regardless of length. Bash 4+
+# tolerates the bare form; Bash 3.2 (still the macOS system shell)
+# does not. nathanpayne-codex Phase 4b r3 on PR #296 reproduced
+# the abort with `--force --skip-build --skip-cf-purge` under bash 3.2.
+op-firebase-deploy ${DEPLOY_ARGS[@]+"${DEPLOY_ARGS[@]}"}
 
 # Step 3: Cloudflare cache purge (optional)
 if [[ "$CF_PURGE_SKIP" == "true" ]]; then
