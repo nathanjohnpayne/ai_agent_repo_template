@@ -52,14 +52,39 @@ if [ "$version" != "$SUPPORTED_VERSION" ]; then
   FAILED=1
 fi
 
-# 3. consumers shape
+# 3. consumers shape.
+# Assert `.consumers` is actually a sequence first. Without this, a
+# scalar like `consumers: "oops"` makes `.consumers | length` return
+# a string length and `.consumers[]` iterate garbage instead of
+# failing — a fail-open path the error-check below can't catch
+# because yq still exits 0. (CodeRabbit Major, #271.)
+consumers_tag=$(yq '.consumers | tag' "$MANIFEST" 2>/dev/null || echo "")
+if [ "$consumers_tag" != "!!seq" ]; then
+  echo "FAIL: .consumers must be a list (got YAML tag '$consumers_tag')"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
 consumer_count=$(yq '.consumers | length' "$MANIFEST")
 if [ "$consumer_count" -lt 1 ]; then
   echo "FAIL: consumers list is empty"
   FAILED=1
 fi
 
+# Extract the consumer rows into a variable FIRST, with an explicit
+# error check. `while ... done < <(yq ...)` would swallow a yq
+# failure (malformed `.consumers`, or a null field that errors the
+# `+` concat in some yq builds) and run the loop zero times, leaving
+# FAILED=0 → a false PASS. `(.repo // "null")` makes the concat
+# null-safe across yq versions; the loop below still flags the
+# literal "null". (CodeRabbit Major, propagation-wave audit #271.)
+if ! consumer_rows=$(yq -r '.consumers[] | ((.name // "null") + "\t" + (.repo // "null"))' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract .consumers from the manifest (yq error):"
+  printf '%s\n' "$consumer_rows"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
 while IFS=$'\t' read -r name repo; do
+  [ -z "$name$repo" ] && continue
   if [ -z "$name" ] || [ "$name" = "null" ]; then
     echo "FAIL: a consumer entry has no name (repo=$repo)"
     FAILED=1
@@ -68,14 +93,55 @@ while IFS=$'\t' read -r name repo; do
     echo "FAIL: consumer '$name' has no repo"
     FAILED=1
   fi
-done < <(yq -r '.consumers[] | (.name + "\t" + .repo)' "$MANIFEST")
+done <<< "$consumer_rows"
 
 # Build a set of valid consumer names for cross-check
 valid_consumers=$(yq -r '.consumers[].name' "$MANIFEST" | tr '\n' ',')
 
-# 4-6. path entries
+# 4-6. path entries.
+# Same fail-closed treatment as the consumers extraction above:
+# assert `.paths` is a sequence (a scalar `paths:` value would let
+# `.paths[]` iterate garbage while yq still exits 0), then capture
+# the rows with an explicit yq error check so a malformed `.paths`
+# block fails loudly instead of running the loop zero times and
+# reporting PASS. (CodeRabbit Major, #271.)
+paths_tag=$(yq '.paths | tag' "$MANIFEST" 2>/dev/null || echo "")
+if [ "$paths_tag" != "!!seq" ]; then
+  echo "FAIL: .paths must be a list (got YAML tag '$paths_tag')"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
+if ! path_rows=$(yq -r '
+  .paths[]
+  | ((.path // "") + "\t" + (.type // "") + "\t"
+     + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
+' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract .paths from the manifest (yq error):"
+  printf '%s\n' "$path_rows"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
 while IFS=$'\t' read -r path type consumers; do
   [ -z "$path" ] && continue
+
+  # 4a: reject repo-escaping paths. An absolute path or one
+  # containing a `..` segment would make the on-disk existence check
+  # below probe OUTSIDE REPO_ROOT, and (worse) sync-to-downstream.sh
+  # would propagate from / to a path outside the repo. A manifest
+  # path must be a repo-relative path with no `..` segment.
+  # (CodeRabbit Major, #271.)
+  case "$path" in
+    /*)
+      echo "FAIL: path '$path' is absolute — manifest paths must be repo-relative"
+      FAILED=1
+      continue
+      ;;
+    ../*|*/../*|*/..)
+      echo "FAIL: path '$path' contains a '..' segment — manifest paths must not escape the repo root"
+      FAILED=1
+      continue
+      ;;
+  esac
 
   # 4: path exists on disk
   case "$type" in
@@ -105,17 +171,24 @@ while IFS=$'\t' read -r path type consumers; do
   else
     IFS=',' read -ra consumer_arr <<< "$consumers"
     for c in "${consumer_arr[@]}"; do
-      if [[ ",$valid_consumers," != *",$c,"* ]]; then
-        echo "FAIL: path '$path' references unknown consumer '$c'"
+      # Reject an empty / whitespace-only token explicitly. Without
+      # this, an empty `c` makes the membership test `*",,"*`, which
+      # matches `,$valid_consumers,` (it has a trailing comma) — an
+      # empty token would silently pass. (CodeRabbit Major, #271.)
+      c_trimmed="${c#"${c%%[![:space:]]*}"}"
+      c_trimmed="${c_trimmed%"${c_trimmed##*[![:space:]]}"}"
+      if [ -z "$c_trimmed" ]; then
+        echo "FAIL: path '$path' has an empty consumer token in its consumers list"
+        FAILED=1
+        continue
+      fi
+      if [[ ",$valid_consumers," != *",$c_trimmed,"* ]]; then
+        echo "FAIL: path '$path' references unknown consumer '$c_trimmed'"
         FAILED=1
       fi
     done
   fi
-done < <(yq -r '
-  .paths[]
-  | (.path + "\t" + .type + "\t"
-     + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
-' "$MANIFEST")
+done <<< "$path_rows"
 
 if [ "$FAILED" -eq 1 ]; then
   echo "check_sync_manifest: FAIL"

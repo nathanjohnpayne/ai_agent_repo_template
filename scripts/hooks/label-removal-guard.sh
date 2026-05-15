@@ -96,7 +96,19 @@ try:
 except ValueError:
     sys.exit(1)
 ' > "$TMP_TOKENS" 2>/dev/null; then
-  exit 0
+  # FAIL CLOSED. This is a protection hook — the command already
+  # matched the `gh ... pr edit` prefix screen above, so it IS a
+  # `gh pr edit` invocation; we just can't parse it to check whether
+  # it removes a human-action label. Allowing an unparseable
+  # `gh pr edit` through (the old `exit 0`) was a fail-open hole:
+  # malformed quoting would bypass the guard entirely. Block it and
+  # tell the agent to fix the quoting — same posture as
+  # gh-pr-guard.sh's tokenization failure path. (CodeRabbit Major, #271.)
+  echo "BLOCKED: label-removal-guard could not tokenize the gh command (malformed shell quoting)." >&2
+  echo "  The command matched the 'gh pr edit' screen but cannot be parsed to verify it" >&2
+  echo "  does not remove a human-action label (needs-external-review / needs-human-review /" >&2
+  echo "  policy-violation). Fix the quoting and retry." >&2
+  exit 2
 fi
 
 TOKENS=()
