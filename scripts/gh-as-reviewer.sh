@@ -31,6 +31,15 @@
 
 set -euo pipefail
 
+# Clear any ambient GH_TOKEN / GITHUB_TOKEN before doing anything.
+# `gh` prioritizes a set GH_TOKEN / GITHUB_TOKEN over the account
+# selected by `gh auth switch -u`, so an exported token in the
+# caller's shell would silently override the keyring switch below
+# and run the wrapped command under the wrong identity. Unsetting
+# makes the switch authoritative — same fix shape as
+# scripts/gh-as-author.sh. (CodeRabbit Major, #271/#272.)
+unset GH_TOKEN GITHUB_TOKEN
+
 REVIEWER="${GH_AS_REVIEWER_IDENTITY:-nathanpayne-claude}"
 
 PRIOR=$(gh config get -h github.com user 2>/dev/null || echo "")
@@ -53,6 +62,16 @@ if ! gh auth switch -u "$REVIEWER" >/dev/null 2>&1; then
 fi
 
 [ "${1:-}" = "--" ] && shift
+
+# Fail fast on an empty wrapped command. Without this, `"$@"` below
+# expands to nothing, runs successfully (a no-op), and the wrapper
+# exits 0 — hiding a caller bug behind a false success. (CodeRabbit
+# Major, #272.)
+if [ "$#" -eq 0 ]; then
+  echo "gh-as-reviewer: no wrapped command given." >&2
+  echo "gh-as-reviewer: usage: scripts/gh-as-reviewer.sh -- gh pr review ..." >&2
+  exit 1
+fi
 
 # Run the wrapped command in THIS shell (NOT exec) so the EXIT trap
 # still fires and restores $PRIOR. `exec "$@"` would replace the

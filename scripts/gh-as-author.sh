@@ -62,6 +62,18 @@
 
 set -euo pipefail
 
+# Clear any ambient GH_TOKEN / GITHUB_TOKEN before doing anything.
+# This wrapper's entire guarantee is "the wrapped command runs under
+# the AUTHOR keyring identity." But `gh` prioritizes a set GH_TOKEN /
+# GITHUB_TOKEN over the account selected by `gh auth switch -u` — so
+# if a caller has either exported (e.g. a preflight'd shell), the
+# `gh auth switch` below would be silently overridden and the wrapped
+# command would run under whatever that token resolves to. Unsetting
+# them makes the keyring switch authoritative for every `gh` call in
+# this process — the wrapped write AND the post-create verification
+# read. (CodeRabbit Major, #271/#272.)
+unset GH_TOKEN GITHUB_TOKEN
+
 AUTHOR="${GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}"
 
 # Capture prior active via `gh config get -h github.com user`, NOT
@@ -97,6 +109,17 @@ fi
 # Strip leading `--` if present so callers can use the conventional
 # disambiguator `scripts/gh-as-author.sh -- gh pr create ...`.
 [ "${1:-}" = "--" ] && shift
+
+# Fail fast on an empty wrapped command. Without this, `"$@"` below
+# expands to nothing, runs successfully (a no-op), and the wrapper
+# exits 0 — hiding a caller bug (e.g. `gh-as-author.sh --` with the
+# command accidentally dropped) behind a false success. (CodeRabbit
+# Major, #272.)
+if [ "$#" -eq 0 ]; then
+  echo "gh-as-author: no wrapped command given." >&2
+  echo "gh-as-author: usage: scripts/gh-as-author.sh -- gh pr <create|merge|edit> ..." >&2
+  exit 1
+fi
 
 # Detect whether the wrapped command is `gh pr create`. argv[0] must
 # be `gh` and argv[1] must be `pr` and argv[2] must be `create`. We
