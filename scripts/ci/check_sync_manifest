@@ -83,17 +83,27 @@ if ! consumer_rows=$(yq -r '.consumers[] | ((.name // "null") + "\t" + (.repo //
   echo "check_sync_manifest: FAIL"
   exit 1
 fi
-while IFS=$'\t' read -r name repo; do
-  [ -z "$name$repo" ] && continue
-  if [ -z "$name" ] || [ "$name" = "null" ]; then
-    echo "FAIL: a consumer entry has no name (repo=$repo)"
-    FAILED=1
-  fi
-  if [ -z "$repo" ] || [ "$repo" = "null" ]; then
-    echo "FAIL: consumer '$name' has no repo"
-    FAILED=1
-  fi
-done <<< "$consumer_rows"
+# Guard the loop on non-empty `consumer_rows` at the OUTER level
+# rather than skipping empty rows INSIDE the loop. A `<<< ""` here-
+# string still yields one empty read, so an in-loop
+# `[ -z "$name$repo" ] && continue` would silently skip a consumer
+# entry whose name AND repo are both genuinely empty instead of
+# flagging it. With the outer guard, the only empty-row source —
+# zero consumers — is already caught by the `consumer_count` check
+# above, and any empty row that does reach the loop is validated
+# and FAILed. (Codex P2 on PR #275.)
+if [ -n "$consumer_rows" ]; then
+  while IFS=$'\t' read -r name repo; do
+    if [ -z "$name" ] || [ "$name" = "null" ]; then
+      echo "FAIL: a consumer entry has no name (repo=$repo)"
+      FAILED=1
+    fi
+    if [ -z "$repo" ] || [ "$repo" = "null" ]; then
+      echo "FAIL: consumer '$name' has no repo"
+      FAILED=1
+    fi
+  done <<< "$consumer_rows"
+fi
 
 # Build a set of valid consumer names for cross-check
 valid_consumers=$(yq -r '.consumers[].name' "$MANIFEST" | tr '\n' ',')
@@ -136,7 +146,14 @@ while IFS=$'\t' read -r path type consumers; do
       FAILED=1
       continue
       ;;
-    ../*|*/../*|*/..)
+  esac
+  # Wrap the path in slashes so EVERY `..` segment — leading
+  # (`../x`), embedded (`a/../b`), trailing (`a/..`), or a bare
+  # top-level `..` — normalizes to a `/../` substring. The earlier
+  # `../*|*/../*|*/..` form missed a bare `..`. (Codex P1 + CodeRabbit
+  # Major on PR #275.)
+  case "/$path/" in
+    */../*)
       echo "FAIL: path '$path' contains a '..' segment — manifest paths must not escape the repo root"
       FAILED=1
       continue
