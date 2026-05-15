@@ -581,13 +581,29 @@ REVIEWERS_JSON=$(echo "$REVIEWERS" | jq -R . | jq -s .)
 # changes) is caught by the preflight blocking-label check above: the
 # Agent Review Pipeline's detect-disagreement job applies
 # `needs-human-review`, which the preflight rejects before this gate runs.
+# Self-approval guard: exclude BOTH the GitHub PR-author login
+# (`$author`, typically nathanjohnpayne) AND the authoring-agent's
+# reviewer identity (`$same_agent_reviewer`, e.g.
+# nathanpayne-claude for a claude-authored PR). GitHub-native
+# branch protection only blocks reviewer == PR-author, but per
+# REVIEW_POLICY.md § No-self-approve scoping the authoring agent's
+# OWN reviewer identity is also disqualified for Phase 4 (over-
+# threshold) gate-(b) clearance — that's the exact case branch 2
+# below (same-agent + Codex 👍) is designed to handle. Without
+# the second exclusion, a claude-authored PR could be cleared by
+# nathanpayne-claude posting APPROVED, since nathanpayne-claude
+# is different from nathanjohnpayne and thus passes the bare
+# `.user.login != $author` filter. (nathanpayne-codex Phase 4b
+# finding on the 263caf3 sync wave.)
 APPROVING_REVIEWER=$(echo "$REVIEWS_JSON" | jq -r \
   --argjson reviewers "$REVIEWERS_JSON" \
-  --arg author "$PR_AUTHOR" '
+  --arg author "$PR_AUTHOR" \
+  --arg same_agent_reviewer "$SAME_AGENT_REVIEWER" '
     [ .[]
       | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
       | select(.user.login as $u | $reviewers | index($u))
       | select(.user.login != $author)
+      | select($same_agent_reviewer == "" or .user.login != $same_agent_reviewer)
     ]
     | group_by(.user.login)
     | map(max_by(.submitted_at))
@@ -794,15 +810,24 @@ fi
 # trigger or scheduled sweep, instead of stalling on a permanently-
 # failing gate (c) until a human clears the label by hand.
 if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
+  # Same self-approval guard as gate (b) branch 1 above: exclude
+  # the authoring-agent's reviewer identity in addition to the
+  # GitHub PR-author login. Without this, a claude-authored
+  # over-threshold PR could clear the Phase 4b substitute via
+  # nathanpayne-claude posting APPROVED on HEAD — collapsing the
+  # cross-agent guarantee Phase 4b is meant to provide. (Same
+  # nathanpayne-codex Phase 4b finding on the 263caf3 sync wave.)
   PHASE_4B_APPROVER=$(echo "$REVIEWS_JSON" | jq -r \
     --argjson reviewers "$REVIEWERS_JSON" \
     --arg author "$PR_AUTHOR" \
+    --arg same_agent_reviewer "$SAME_AGENT_REVIEWER" \
     --arg sha "$HEAD_SHA" '
       [ .[]
         | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
         | select(.commit_id == $sha)
         | select(.user.login as $u | $reviewers | index($u))
         | select(.user.login != $author)
+        | select($same_agent_reviewer == "" or .user.login != $same_agent_reviewer)
       ]
       | group_by(.user.login)
       | map(max_by(.submitted_at))

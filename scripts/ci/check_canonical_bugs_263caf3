@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# check_canonical_bugs_263caf3
+#
+# Regression coverage for two canonical-surface bugs found by
+# nathanpayne-codex while doing the Phase 4b external reviews on
+# the 263caf3 propagation wave (matchline#232, nathanpaynedotcom#368,
+# overridebroadway#59, device-source-of-truth#86,
+# friends-and-family-billing#270, device-platform-reporting#80,
+# swipewatch#51, tadlockpsychiatry#54). Both are upstream canonical
+# defects that affect every consumer, not consumer-local drift.
+#
+#   Bug 1: scripts/request-label-removal.sh aborted under `set -e`
+#          in the default no-`--repo` path. The BODY="..." assignment
+#          embedded `$([ -n "$REPO" ] && echo "--repo $REPO")`; the
+#          tested-empty `[` short-circuits the `&&` chain with rc=1,
+#          the command substitution's rc=1 propagates as the
+#          assignment's exit status, and `set -e` aborts the script
+#          BEFORE `gh pr comment` runs. Every `request-label-removal.sh
+#          <PR#> <label>` call without `--repo` silently failed.
+#
+#   Bug 2: scripts/codex-review-check.sh let the authoring agent's
+#          own reviewer identity satisfy both gate (b) branch 1 AND
+#          gate (c) Phase 4b substitute. The jq filter excluded only
+#          `.user.login != $author` (= nathanjohnpayne, the GitHub
+#          PR-author login), not the same-agent reviewer identity
+#          (e.g. nathanpayne-claude for a claude-authored PR). With
+#          nathanpayne-claude in `available_reviewers` and != the
+#          author, a claude-authored over-threshold PR could self-
+#          approve through the merge gate. The fix excludes BOTH
+#          `$author` AND `$same_agent_reviewer`.
+#
+# This check exercises the jq filter literals in isolation against
+# in-memory fixtures so a future edit can't silently regress either
+# guard. Inline-literal pattern matches check_workflow_parsers /
+# check_pr_audit_codex_clearance.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+LABEL_REMOVAL_SCRIPT="scripts/request-label-removal.sh"
+CODEX_CHECK_SCRIPT="scripts/codex-review-check.sh"
+
+for f in "$LABEL_REMOVAL_SCRIPT" "$CODEX_CHECK_SCRIPT"; do
+  if [ ! -f "$f" ]; then
+    echo "check_canonical_bugs_263caf3: FAIL — missing $f"
+    exit 1
+  fi
+done
+
+command -v jq >/dev/null 2>&1 || {
+  echo "check_canonical_bugs_263caf3: FAIL — jq not on PATH"
+  exit 1
+}
+
+pass=0
+fail=0
+
+# ── Bug 1 regression: request-label-removal.sh with no --repo ────────
+#
+# Drive the script far enough into the BODY assignment to prove the
+# `set -e` abort no longer fires. We stub `gh` so we don't need
+# network or a real PR — the assertion is that the script REACHES
+# the gh invocation, not what gh returns. The pre-fix code aborts
+# BEFORE reaching `gh pr comment`; the post-fix code reaches it.
+
+echo "Bug 1 regression: request-label-removal.sh set -e abort with no --repo"
+
+SCRATCH=$(mktemp -d)
+trap 'rm -rf "$SCRATCH"' EXIT
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+# Stub: print a marker proving the script reached gh, then succeed.
+case "$1" in
+  "pr")
+    case "${2:-}" in
+      "view")    printf 'https://github.com/nathanjohnpayne/mergepath/pull/99999\n' ;;
+      "comment") printf 'STUB_GH_COMMENT_REACHED\n' >&2 ;;
+      *)         printf 'STUB_GH_UNEXPECTED %s\n' "$*" >&2 ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" \
+  MERGEPATH_NOTIFY_IMESSAGE_TO="" \
+  "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" = "0" ] && echo "$out" | grep -q "STUB_GH_COMMENT_REACHED"; then
+  pass=$((pass + 1))
+  echo "  PASS: no-\`--repo\` invocation reaches \`gh pr comment\` (rc=0)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: no-\`--repo\` invocation did NOT reach gh pr comment (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+# Same, but WITH --repo — sanity-check that the explicit-repo path
+# is also still wired up.
+set +e
+out=$(PATH="$SCRATCH:$PATH" \
+  MERGEPATH_NOTIFY_IMESSAGE_TO="" \
+  "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review --repo nathanjohnpayne/mergepath 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" = "0" ] && echo "$out" | grep -q "STUB_GH_COMMENT_REACHED"; then
+  pass=$((pass + 1))
+  echo "  PASS: --repo invocation reaches \`gh pr comment\` (rc=0)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --repo invocation did NOT reach gh pr comment (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+# Confirm the BODY ends up containing the right hint string in both
+# paths. Inspect via a different stub that echoes argv to stderr.
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  "pr")
+    case "${2:-}" in
+      "view") printf 'https://github.com/nathanjohnpayne/mergepath/pull/99999\n' ;;
+      "comment")
+        # Dump --body content to a file so the test can inspect.
+        shift 2
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--body" ]; then printf '%s' "$2" > "$SCRATCH_BODY_OUT"; fi
+          shift
+        done
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+# no-repo path
+SCRATCH_BODY_OUT="$SCRATCH/body-norepo.txt" \
+  PATH="$SCRATCH:$PATH" \
+  MERGEPATH_NOTIFY_IMESSAGE_TO="" \
+  "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review >/dev/null 2>&1 || true
+
+if [ -f "$SCRATCH/body-norepo.txt" ] && \
+   grep -q "gh pr edit 99999 --remove-label needs-external-review\`" "$SCRATCH/body-norepo.txt" && \
+   ! grep -q -- "--repo " "$SCRATCH/body-norepo.txt"; then
+  pass=$((pass + 1))
+  echo "  PASS: no-\`--repo\` BODY contains correct CLI hint with no --repo flag"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: no-\`--repo\` BODY CLI hint malformed" >&2
+  [ -f "$SCRATCH/body-norepo.txt" ] && sed 's/^/    /' "$SCRATCH/body-norepo.txt" >&2
+fi
+
+# with-repo path
+SCRATCH_BODY_OUT="$SCRATCH/body-repo.txt" \
+  PATH="$SCRATCH:$PATH" \
+  MERGEPATH_NOTIFY_IMESSAGE_TO="" \
+  "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review --repo nathanjohnpayne/mergepath >/dev/null 2>&1 || true
+
+if [ -f "$SCRATCH/body-repo.txt" ] && \
+   grep -q "gh pr edit 99999 --remove-label needs-external-review --repo nathanjohnpayne/mergepath\`" "$SCRATCH/body-repo.txt"; then
+  pass=$((pass + 1))
+  echo "  PASS: --repo BODY contains correct CLI hint with --repo flag inline"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --repo BODY CLI hint malformed" >&2
+  [ -f "$SCRATCH/body-repo.txt" ] && sed 's/^/    /' "$SCRATCH/body-repo.txt" >&2
+fi
+
+echo
+echo "Bug 2 regression: codex-review-check.sh self-approval exclusion"
+
+# ── Bug 2 regression: jq filter must exclude same-agent reviewer ─────
+#
+# The filter literals are extracted verbatim from
+# `scripts/codex-review-check.sh` gate (b) branch 1 + gate (c) Phase
+# 4b substitute. Keep this in lockstep with the script under test —
+# same inline-literal coupling the other scripts/ci/check_* files use.
+
+REVIEWERS_JSON='["nathanpayne-claude","nathanpayne-cursor","nathanpayne-codex"]'
+
+run_filter() {
+  # Args:
+  #   $1 = jq filter (gate-b form or gate-c form)
+  #   $2 = author login
+  #   $3 = same_agent_reviewer login (may be empty)
+  #   $4 = sha (only used by gate-c form; harmless for gate-b)
+  #   $5 = reviews_json
+  echo "$5" | jq -r \
+    --argjson reviewers "$REVIEWERS_JSON" \
+    --arg author "$2" \
+    --arg same_agent_reviewer "$3" \
+    --arg sha "$4" \
+    "$1"
+}
+
+GATE_B_FILTER='
+  [ .[]
+    | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+    | select(.user.login as $u | $reviewers | index($u))
+    | select(.user.login != $author)
+    | select($same_agent_reviewer == "" or .user.login != $same_agent_reviewer)
+  ]
+  | group_by(.user.login)
+  | map(max_by(.submitted_at))
+  | map(select(.state == "APPROVED"))
+  | first
+  | if . == null then empty else .user.login end
+'
+
+GATE_C_FILTER='
+  [ .[]
+    | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+    | select(.commit_id == $sha)
+    | select(.user.login as $u | $reviewers | index($u))
+    | select(.user.login != $author)
+    | select($same_agent_reviewer == "" or .user.login != $same_agent_reviewer)
+  ]
+  | group_by(.user.login)
+  | map(max_by(.submitted_at))
+  | map(select(.state == "APPROVED"))
+  | max_by(.submitted_at)
+  | if . == null then "" else .user.login + "|" + .submitted_at end
+'
+
+HEAD_SHA="abc123"
+
+# Case A: claude-authored PR, nathanpayne-claude tries to self-approve.
+#   Expected: gate (b) returns empty (no APPROVING_REVIEWER).
+#   Expected: gate (c) returns empty (no PHASE_4B_APPROVER).
+REVIEWS_A='[
+  {"user":{"login":"nathanpayne-claude"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-05-15T10:00:00Z"}
+]'
+
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_A")
+if [ -z "$got" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) rejects same-agent self-approval (claude→claude)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) accepted same-agent self-approval — got '$got'" >&2
+fi
+
+got=$(run_filter "$GATE_C_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_A")
+if [ -z "$got" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (c) rejects same-agent self-approval (claude→claude)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (c) accepted same-agent self-approval — got '$got'" >&2
+fi
+
+# Case B: claude-authored PR, nathanpayne-codex (cross-agent) approves.
+#   Expected: gate (b) returns nathanpayne-codex.
+#   Expected: gate (c) returns nathanpayne-codex|<timestamp>.
+REVIEWS_B='[
+  {"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-05-15T10:00:00Z"}
+]'
+
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_B")
+if [ "$got" = "nathanpayne-codex" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) accepts cross-agent approval (claude-authored, codex-approved)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) rejected cross-agent approval — got '$got'" >&2
+fi
+
+got=$(run_filter "$GATE_C_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_B")
+case "$got" in
+  nathanpayne-codex\|*) pass=$((pass + 1)); echo "  PASS: gate (c) accepts cross-agent Phase 4b approval (claude-authored, codex-approved)" ;;
+  *) fail=$((fail + 1)); echo "  FAIL: gate (c) rejected cross-agent Phase 4b approval — got '$got'" >&2 ;;
+esac
+
+# Case C: no Authoring-Agent header (same_agent_reviewer=""), any
+# non-author reviewer approves. Filter must NOT over-exclude.
+REVIEWS_C='[
+  {"user":{"login":"nathanpayne-cursor"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-05-15T10:00:00Z"}
+]'
+
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "" "$HEAD_SHA" "$REVIEWS_C")
+if [ "$got" = "nathanpayne-cursor" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) accepts non-author reviewer when no Authoring-Agent header"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) over-excluded with empty same_agent_reviewer — got '$got'" >&2
+fi
+
+got=$(run_filter "$GATE_C_FILTER" "nathanjohnpayne" "" "$HEAD_SHA" "$REVIEWS_C")
+case "$got" in
+  nathanpayne-cursor\|*) pass=$((pass + 1)); echo "  PASS: gate (c) accepts non-author reviewer when no Authoring-Agent header" ;;
+  *) fail=$((fail + 1)); echo "  FAIL: gate (c) over-excluded with empty same_agent_reviewer — got '$got'" >&2 ;;
+esac
+
+# Case D: explicit PR author (nathanjohnpayne) somehow posts a review
+# anyway. Filter must always reject the GitHub PR author.
+REVIEWS_D='[
+  {"user":{"login":"nathanjohnpayne"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-05-15T10:00:00Z"}
+]'
+
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_D")
+if [ -z "$got" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) rejects PR-author self-approval (nathanjohnpayne→nathanjohnpayne)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) accepted PR-author self-approval — got '$got'" >&2
+fi
+
+# Case E: same-agent reviewer's LATEST state is CHANGES_REQUESTED
+# even though they previously approved → no clearance via the bare
+# group_by/max_by/latest-state filter. (Regression guard for the
+# pre-existing latest-state-wins behavior; ensures the new
+# same_agent_reviewer exclusion doesn't change unrelated semantics.)
+REVIEWS_E='[
+  {"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-05-15T10:00:00Z"},
+  {"user":{"login":"nathanpayne-codex"},"state":"CHANGES_REQUESTED","commit_id":"abc123","submitted_at":"2026-05-15T11:00:00Z"}
+]'
+
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_E")
+if [ -z "$got" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) honors latest-state CHANGES_REQUESTED over earlier APPROVED (regression)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) used stale APPROVED instead of latest CHANGES_REQUESTED — got '$got'" >&2
+fi
+
+echo
+total=$((pass + fail))
+if [ "$fail" -gt 0 ]; then
+  echo "check_canonical_bugs_263caf3: FAIL ($fail/$total failed)"
+  exit 1
+fi
+echo "check_canonical_bugs_263caf3: PASS ($total tests)"
+exit 0
