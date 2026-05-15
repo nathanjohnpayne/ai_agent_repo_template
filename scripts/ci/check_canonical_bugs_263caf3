@@ -337,6 +337,143 @@ else
 fi
 
 echo
+echo "Bug 2 production parser path: AUTHORING_AGENT extraction under set -eo pipefail"
+
+# ── Bug 2 augmentation (nathanpayne-codex Phase 4b r2 on #283) ───────
+#
+# The original Case A–E above exercised only the jq filter literals
+# with `same_agent_reviewer` injected directly — they did NOT prove
+# the production code reaches the filter at all. Codex r2 caught
+# that the AUTHORING_AGENT parser at line ~286 of the script
+# (`echo "$PR_BODY" | grep ... | sed ... | tr ...`) aborts under
+# `set -eo pipefail` when the body has no `Authoring-Agent:` header
+# (grep rc=1 → pipefail bubbles it → assignment inherits rc=1 →
+# `set -e` aborts BEFORE `SAME_AGENT_REVIEWER=""` runs).
+#
+# Inline-literal pattern: the parser snippet below is duplicated
+# verbatim from `scripts/codex-review-check.sh` lines ~286–305.
+# Keep them in lockstep — same coupling the jq literals above use.
+
+PARSER_HARNESS=$(cat <<'PARSER'
+set -eo pipefail
+# Verbatim from scripts/codex-review-check.sh
+AUTHORING_AGENT=""
+SAME_AGENT_REVIEWER=""
+if printf '%s\n' "$PR_BODY" | grep -qiE '^Authoring-Agent:'; then
+  AUTHORING_AGENT=$(printf '%s\n' "$PR_BODY" \
+    | grep -i -m1 -E '^Authoring-Agent:' \
+    | sed -E 's/^[Aa]uthoring-[Aa]gent:[[:space:]]*([A-Za-z0-9_-]+).*/\1/' \
+    | tr '[:upper:]' '[:lower:]')
+  if [ -n "$AUTHORING_AGENT" ]; then
+    SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
+  fi
+fi
+printf '%s|%s\n' "$AUTHORING_AGENT" "$SAME_AGENT_REVIEWER"
+PARSER
+)
+
+REVIEWERS_LIST=$'nathanpayne-claude\nnathanpayne-cursor\nnathanpayne-codex'
+
+run_parser() {
+  # Args: $1 = PR body. Prints "<AUTHORING_AGENT>|<SAME_AGENT_REVIEWER>".
+  # Runs in a fresh bash with set -eo pipefail so any abort surfaces
+  # as a non-zero exit code from this function.
+  PR_BODY="$1" REVIEWERS="$REVIEWERS_LIST" bash -c "$PARSER_HARNESS"
+}
+
+# Case F: no Authoring-Agent header. The pre-fix code aborts here
+# (grep rc=1 → pipefail → set -e abort). Post-fix: AUTHORING_AGENT=""
+# AND SAME_AGENT_REVIEWER="" AND non-zero exit propagates as failure.
+set +e
+got=$(run_parser "Some PR body with no Authoring-Agent line.
+Just regular content here.")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "|" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: no-header PR body → AUTHORING_AGENT='' SAME_AGENT_REVIEWER='' (no abort under pipefail)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: no-header parser aborted or produced unexpected output (rc=$rc, got='$got')" >&2
+fi
+
+# Case G: empty PR body. Same expectation.
+set +e
+got=$(run_parser "")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "|" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: empty PR body → AUTHORING_AGENT='' SAME_AGENT_REVIEWER='' (no abort)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: empty-body parser aborted or produced unexpected output (rc=$rc, got='$got')" >&2
+fi
+
+# Case H: Authoring-Agent: claude → maps to nathanpayne-claude.
+set +e
+got=$(run_parser "Authoring-Agent: claude
+
+## Summary
+Something.")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "claude|nathanpayne-claude" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: Authoring-Agent: claude → AUTHORING_AGENT='claude' SAME_AGENT_REVIEWER='nathanpayne-claude'"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: claude-header parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case I: case-insensitive header key + capitalized value.
+set +e
+got=$(run_parser "authoring-agent: Codex
+
+body")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "codex|nathanpayne-codex" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: case-insensitive header → AUTHORING_AGENT='codex' SAME_AGENT_REVIEWER='nathanpayne-codex'"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: case-insensitive parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case J: header value that doesn't match any available_reviewer.
+# AUTHORING_AGENT populated but SAME_AGENT_REVIEWER stays empty.
+set +e
+got=$(run_parser "Authoring-Agent: jules
+
+body")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "jules|" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: unknown agent → AUTHORING_AGENT='jules' SAME_AGENT_REVIEWER='' (awk no-match is pipefail-safe)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: unknown-agent parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case K: header not at start-of-body (regression for the -m1 + ^
+# anchors). The line IS at start-of-line, just not start-of-body.
+set +e
+got=$(run_parser "Some preface line.
+Authoring-Agent: cursor
+Trailing line.")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "cursor|nathanpayne-cursor" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: header on non-first line still parses (cursor → nathanpayne-cursor)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: mid-body header parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+echo
 total=$((pass + fail))
 if [ "$fail" -gt 0 ]; then
   echo "check_canonical_bugs_263caf3: FAIL ($fail/$total failed)"

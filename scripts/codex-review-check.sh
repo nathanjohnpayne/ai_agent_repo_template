@@ -283,12 +283,35 @@ fi
 # identity (e.g., `Authoring-Agent: claude` → `nathanpayne-claude`). Used
 # by gate (b) branch 2 (#170) to detect the same-agent author/reviewer
 # case where Codex's 👍 reaction can substitute for an APPROVED review.
-AUTHORING_AGENT=$(echo "$PR_BODY" | grep -i -m1 -E '^Authoring-Agent:' | sed -E 's/^[Aa]uthoring-[Aa]gent:[[:space:]]*([A-Za-z0-9_-]+).*/\1/' | tr '[:upper:]' '[:lower:]')
+#
+# Pipefail-safe header parse. The earlier form was a single pipeline
+# `echo "$PR_BODY" | grep ... | sed ... | tr ...` assigned to
+# AUTHORING_AGENT. On a PR body with no `Authoring-Agent:` line, the
+# `grep` step returned rc=1; under `set -eo pipefail` that rc=1
+# bubbled up as the pipeline's exit status, became the assignment's
+# exit status, and `set -e` aborted the script BEFORE reaching the
+# `SAME_AGENT_REVIEWER=""` initializer on the next line — so any PR
+# missing the header (UI-created PRs, external-contributor PRs, or
+# PRs predating the `gh-pr-guard.sh` enforcement of the header on
+# `gh pr create`) blew up the merge gate with an opaque `set -e`
+# trace instead of taking the intended "no Authoring-Agent → empty
+# SAME_AGENT_REVIEWER → branch 1 only" path. Gate the actual
+# extraction on a prior `if` test that uses `grep -q` — the if-test
+# context suppresses `set -e` on the test command itself per bash
+# semantics. (nathanpayne-codex Phase 4b r2 on PR #283.)
+AUTHORING_AGENT=""
 SAME_AGENT_REVIEWER=""
-if [ -n "$AUTHORING_AGENT" ]; then
-  # Match against available_reviewers via suffix (e.g., "claude" matches
-  # "nathanpayne-claude"). Empty if no match.
-  SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
+if printf '%s\n' "$PR_BODY" | grep -qiE '^Authoring-Agent:'; then
+  AUTHORING_AGENT=$(printf '%s\n' "$PR_BODY" \
+    | grep -i -m1 -E '^Authoring-Agent:' \
+    | sed -E 's/^[Aa]uthoring-[Aa]gent:[[:space:]]*([A-Za-z0-9_-]+).*/\1/' \
+    | tr '[:upper:]' '[:lower:]')
+  if [ -n "$AUTHORING_AGENT" ]; then
+    # Match against available_reviewers via suffix (e.g., "claude"
+    # matches "nathanpayne-claude"). Empty if no match — also
+    # pipefail-safe: awk always exits 0 even when no record matched.
+    SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
+  fi
 fi
 
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
