@@ -301,33 +301,46 @@ fi
 #   intended "skip extraction, leave SAME_AGENT_REVIEWER empty" path
 #   without aborting.
 #
-#   r3 (codex CHANGES_REQUESTED — THIS iteration): r2 still had a
-#   silent failure on LARGE bodies. `printf '%s\n' "$PR_BODY" | grep`
-#   is a producer pipe; once the body crosses the 64KB pipe buffer
-#   AND the `Authoring-Agent:` header is near the top of the body,
-#   `grep -q`/`grep -m1` matches and exits early, `printf` gets
-#   SIGPIPE (rc=141), and `pipefail` bubbles the 141 as the pipeline's
-#   exit status. In the guard `if` test, 141 is non-zero → the `if`
-#   evaluates false → AUTHORING_AGENT and SAME_AGENT_REVIEWER stay
-#   empty even though the header IS present. The same-agent
-#   exclusion in gate (b)/(c) then no-ops (empty-string clause), and
-#   the authoring agent's own reviewer identity can satisfy the
-#   merge gate. THE EXACT HOLE r1+r2 set out to close, reopened by
-#   a different mechanism.
+#   r3 (codex CHANGES_REQUESTED): r2 still had a silent failure on
+#   LARGE bodies. `printf '%s\n' "$PR_BODY" | grep` is a producer
+#   pipe; once the body crosses the 64KB pipe buffer AND the
+#   `Authoring-Agent:` header is near the top of the body, grep -q
+#   matches and exits early, printf gets SIGPIPE (rc=141), pipefail
+#   bubbles the 141 as the pipeline's exit. In the guard `if` test,
+#   141 is non-zero → the `if` evaluates false → AUTHORING_AGENT and
+#   SAME_AGENT_REVIEWER stay empty even though the header IS present.
+#   THE EXACT HOLE r1+r2 set out to close, reopened by a different
+#   mechanism. Fix: replace producer pipe with bash herestring
+#   `<<<"$PR_BODY"` — no producer process, no SIGPIPE.
 #
-#   Fix: replace `printf '%s\n' "$PR_BODY" |` with a bash herestring
-#   `<<<"$PR_BODY"`. The herestring feeds grep directly from the
-#   shell — there is no producer process, so SIGPIPE on producer-
-#   close cannot happen. `grep` reads what it needs and exits 0/1
-#   cleanly; pipefail has nothing to bubble. Bash 3.2+ supports
-#   `<<<` (added in 2.05b), so portability is not a concern.
-#   (nathanpayne-codex Phase 4b r3 on PR #283.)
+#   r4 (codex CHANGES_REQUESTED — THIS iteration): r3 still failed
+#   case-coverage. The guard's `grep -i` matched any case of the
+#   header (e.g. `AUTHORING-AGENT: Claude`), but the extraction
+#   `sed -E 's/^[Aa]uthoring-[Aa]gent:[[:space:]]*([A-Za-z0-9_-]+).*/\1/'`
+#   only character-classed the FIRST letter of each word — fully-
+#   uppercase keys fell through sed unchanged, and the trailing `tr`
+#   then lowercased the WHOLE line (`AUTHORING-AGENT: Claude` →
+#   `authoring-agent: claude`), so AUTHORING_AGENT was set to the
+#   string "authoring-agent: claude" rather than just "claude". The
+#   awk suffix match on `-authoring-agent: claude` against
+#   `nathanpayne-claude` then failed → SAME_AGENT_REVIEWER="" →
+#   same-agent exclusion no-op'd → self-approval hole reopened.
+#   GNU sed's `I` regex flag would be the natural fix but BSD/macOS
+#   sed doesn't support it, so we can't rely on it.
+#
+#   Fix: reorder the pipeline so `tr` lowercases BEFORE sed. sed
+#   then sees a canonical-lowercase line and uses a strict-lowercase
+#   pattern — no character classes needed. Order is grep -i (still
+#   case-insensitive on detection) → tr (canonicalize) → sed
+#   (extract from canonical). Works for every case-permutation of
+#   the header without per-letter character classing.
+#   (nathanpayne-codex Phase 4b r4 on PR #283.)
 AUTHORING_AGENT=""
 SAME_AGENT_REVIEWER=""
 if grep -qiE '^Authoring-Agent:' <<<"$PR_BODY"; then
   AUTHORING_AGENT=$(grep -i -m1 -E '^Authoring-Agent:' <<<"$PR_BODY" \
-    | sed -E 's/^[Aa]uthoring-[Aa]gent:[[:space:]]*([A-Za-z0-9_-]+).*/\1/' \
-    | tr '[:upper:]' '[:lower:]')
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/^authoring-agent:[[:space:]]*([a-z0-9_-]+).*/\1/')
   if [ -n "$AUTHORING_AGENT" ]; then
     # Match against available_reviewers via suffix (e.g., "claude"
     # matches "nathanpayne-claude"). Empty if no match — also

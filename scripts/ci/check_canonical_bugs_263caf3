@@ -356,15 +356,17 @@ echo "Bug 2 production parser path: AUTHORING_AGENT extraction under set -eo pip
 
 PARSER_HARNESS=$(cat <<'PARSER'
 set -eo pipefail
-# Verbatim from scripts/codex-review-check.sh (the r3 herestring form
-# — see the multi-iteration comment block above the live parser for
-# why this shape and not `printf | grep`).
+# Verbatim from scripts/codex-review-check.sh (the r4 form — tr
+# before sed, so sed sees canonical lowercase; see the multi-
+# iteration comment block above the live parser for the chain
+# r1 (initial) → r2 (pipefail abort) → r3 (SIGPIPE on producer) →
+# r4 (case coverage)).
 AUTHORING_AGENT=""
 SAME_AGENT_REVIEWER=""
 if grep -qiE '^Authoring-Agent:' <<<"$PR_BODY"; then
   AUTHORING_AGENT=$(grep -i -m1 -E '^Authoring-Agent:' <<<"$PR_BODY" \
-    | sed -E 's/^[Aa]uthoring-[Aa]gent:[[:space:]]*([A-Za-z0-9_-]+).*/\1/' \
-    | tr '[:upper:]' '[:lower:]')
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/^authoring-agent:[[:space:]]*([a-z0-9_-]+).*/\1/')
   if [ -n "$AUTHORING_AGENT" ]; then
     SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
   fi
@@ -472,6 +474,76 @@ if [ "$rc" = "0" ] && [ "$got" = "cursor|nathanpayne-cursor" ]; then
 else
   fail=$((fail + 1))
   echo "  FAIL: mid-body header parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case M: fully-uppercase header key, capitalized value
+# (nathanpayne-codex Phase 4b r4 finding via CodeRabbit). The r3
+# pipeline (`grep -i | sed [Aa]uthoring | tr upper→lower`) silently
+# produced `authoring-agent: claude` for `AUTHORING-AGENT: Claude`
+# because sed's per-letter `[Aa]` only covered first-of-word casing
+# — the rest of the line fell through unchanged, then the trailing
+# `tr` lowercased the whole "header: value" string into the
+# AUTHORING_AGENT variable, so the awk suffix match against
+# `nathanpayne-claude` failed and SAME_AGENT_REVIEWER stayed "".
+# The r4 reorder (tr before sed) canonicalizes the line to lowercase
+# before extraction, so any case-permutation of the header key works.
+set +e
+got=$(run_parser "AUTHORING-AGENT: Claude
+
+## Summary")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "claude|nathanpayne-claude" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: AUTHORING-AGENT: Claude (uppercase key) → claude (canonical extraction)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: uppercase-key header parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case N: uppercase value
+set +e
+got=$(run_parser "Authoring-Agent: CLAUDE
+
+body")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "claude|nathanpayne-claude" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: Authoring-Agent: CLAUDE (uppercase value) → claude"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: uppercase-value parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case O: fully-uppercase key AND value (worst case)
+set +e
+got=$(run_parser "AUTHORING-AGENT: CODEX
+
+body")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "codex|nathanpayne-codex" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: AUTHORING-AGENT: CODEX (fully upper) → codex"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: full-uppercase parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case P: mixed-case key in the middle of the word
+set +e
+got=$(run_parser "AuThOrInG-aGeNt: Cursor
+
+body")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "cursor|nathanpayne-cursor" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: mixed-case AuThOrInG-aGeNt → cursor (canonical extraction)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: mixed-case parse wrong (rc=$rc, got='$got')" >&2
 fi
 
 # Case L: LARGE PR body (>64KB pipe buffer) with Authoring-Agent near
