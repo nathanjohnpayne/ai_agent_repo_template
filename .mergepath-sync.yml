@@ -122,6 +122,14 @@ paths:
   - path: tests/test_gh_as_reviewer.sh
     type: canonical
     consumers: all
+  # Pairs with scripts/workflow/verify-propagation-pr.sh (under the
+  # scripts/workflow/ kit below). The verifier is security-load-bearing
+  # for the propagation-PR review lane; its test travels with it so a
+  # consumer that runs scripts/ci/check_verify_propagation_pr exercises
+  # the matching suite. See #264 / #268.
+  - path: tests/test_verify_propagation_pr.sh
+    type: canonical
+    consumers: all
 
   # Canonical workflows — review policy + automation surfaces that
   # should be lockstep across all consumers.
@@ -144,12 +152,33 @@ paths:
     type: canonical
     consumers: all
 
+  # The manifest itself. Propagated so the propagation-PR review lane
+  # in .github/workflows/pr-review-policy.yml can read the propagation
+  # surface IN-REPO when it runs in a consumer (a sync PR carries this
+  # file, so the lane check sees the exact manifest version the sync
+  # was generated from). See #264 / REVIEW_POLICY.md § Propagation PR
+  # review lane. Consumers otherwise treat it as an inert mirror — they
+  # don't run scripts/sync-to-downstream.sh.
+  - path: .mergepath-sync.yml
+    type: canonical
+    consumers: all
+
   # Kit directories — Mergepath-canonical files are required;
   # consumer-only additions in the same directory are allowed.
   - path: scripts/ci/
     type: kit
     consumers: all
   - path: scripts/gh-projects/
+    type: kit
+    consumers: all
+  # scripts/workflow/ — the awk/bash parser helpers the canonical
+  # .github/workflows/ files shell out to (parse_policy_list,
+  # match_protected_paths, parse_manifest_paths). These were already
+  # present in consumers (seeded at bootstrap) but UNTRACKED by this
+  # manifest — a latent #264-class drift gap, since pr-review-policy.yml
+  # is canonical and depends on them. Tracking the directory as kit
+  # keeps the workflow and its helpers in lockstep.
+  - path: scripts/workflow/
     type: kit
     consumers: all
 
