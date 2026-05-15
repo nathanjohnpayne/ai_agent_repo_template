@@ -16,14 +16,27 @@
 #   5. Every path entry's `type` is one of: canonical, kit, templated.
 #   6. Every path's `consumers` is either the literal "all" or a list
 #      of consumer names that exist in the consumers block.
+#   7. Every `requires:` entry (if present) is a YAML list of strings,
+#      and every required path is COVERED by the manifest — i.e. it
+#      matches an exact manifest entry OR is strictly inside a kit
+#      manifest entry. Closes the propagation closure gap that
+#      surfaced as #264 on the original wave (check_gh_as_author
+#      hard-required tests/test_gh_pr_guard.sh, which was not in
+#      the manifest, so every consumer's lint job failed in pre-flight).
 #
 # This check is read-only and does NOT contact downstream repos —
 # that's the audit script's job and is too slow for CI.
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-MANIFEST="$REPO_ROOT/.mergepath-sync.yml"
+# Env overrides for tests/test_check_sync_manifest.sh:
+#   MERGEPATH_MANIFEST_PATH — point at a fixture manifest YAML
+#   MERGEPATH_REPO_ROOT      — point at a fixture repo tree (so the
+#                              path-existence check probes the fixture
+#                              instead of the live repo). Default is
+#                              the script's own repo root in PR CI.
+REPO_ROOT="${MERGEPATH_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+MANIFEST="${MERGEPATH_MANIFEST_PATH:-$REPO_ROOT/.mergepath-sync.yml}"
 SUPPORTED_VERSION=1
 
 if ! command -v yq >/dev/null 2>&1; then
@@ -207,9 +220,294 @@ while IFS=$'\t' read -r path type consumers; do
   fi
 done <<< "$path_rows"
 
+# 7. requires: closure invariant (#264).
+#
+# Collect the full set of manifest paths (with their types) so we can
+# decide whether each declared `requires:` entry is satisfied. A
+# required path is COVERED iff:
+#   - it equals a canonical / templated / kit manifest entry exactly,
+#     OR
+#   - it lives strictly inside a kit manifest entry (kit propagation
+#     mirrors the whole subtree, so a fixtures subdir under a kit path
+#     travels for free).
+#
+# Failing fail-closed: a malformed `requires:` (not a sequence) is a
+# hard error; a required path with no manifest coverage is a hard error
+# naming both the requirer and the missing path.
+#
+# Build the "kit prefixes" list (kit paths with a trailing slash so
+# the prefix match is unambiguous — `scripts/c` must not match a kit
+# entry `scripts/ci/`) and the exact-paths set up front. Also build
+# a path→consumer-set map so the closure check can verify that a
+# requirer's consumer scope is a subset of each required path's
+# consumer scope (#264 r2 — nathanpayne-codex Phase 4b finding).
+#
+# Consumer set is represented as a CSV: either the literal "all"
+# (universal) or comma-joined consumer names with surrounding commas
+# (",matchline,swipewatch," — sentinel-padded so substring lookup
+# can't false-match on a name prefix).
+if ! kit_rows=$(yq -r '.paths[] | select(.type == "kit") | .path' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract kit paths from the manifest (yq error):"
+  printf '%s\n' "$kit_rows"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
+if ! exact_rows=$(yq -r '.paths[].path' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract manifest paths (yq error):"
+  printf '%s\n' "$exact_rows"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
+# Each line: <path>\t<consumers> where <consumers> is either the
+# literal "all" or a comma-joined list of consumer names. Two-pass
+# extraction (string-typed consumers, then sequence-typed consumers)
+# to dodge mikefarah/yq's inline-if/then/else parser limitations.
+if ! str_consumers_rows=$(yq -r '
+  .paths[] | select(.consumers | type == "!!str") | .path + "\t" + .consumers
+' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract string-typed path consumer sets from manifest (yq error):"
+  printf '%s\n' "$str_consumers_rows"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
+if ! seq_consumers_rows=$(yq -r '
+  .paths[] | select(.consumers | type == "!!seq") | .path + "\t" + (.consumers | join(","))
+' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract sequence-typed path consumer sets from manifest (yq error):"
+  printf '%s\n' "$seq_consumers_rows"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
+# Merge the two streams, filtering blanks.
+path_consumers_rows="$(printf '%s\n%s\n' "$str_consumers_rows" "$seq_consumers_rows" | grep -v '^$' || true)"
+
+# Wrap exact_rows with a sentinel boundary so substring lookups can't
+# false-match (`,foo/bar,` is unambiguous; `foo/bar` matches a `foo` or
+# `bar` substring otherwise).
+exact_set=",$(echo "$exact_rows" | tr '\n' ',')"
+
+# kit_prefixes is space-separated kit paths with each guaranteed to end
+# in a slash so `scripts/ci/fixtures/foo.json` matches the kit
+# `scripts/ci/` prefix unambiguously and `scripts/cinema/foo.json` does
+# not match `scripts/ci/`.
+kit_prefixes=""
+while IFS= read -r kp; do
+  [ -z "$kp" ] && continue
+  case "$kp" in
+    */) kit_prefixes="$kit_prefixes $kp" ;;
+    *)  kit_prefixes="$kit_prefixes $kp/" ;;
+  esac
+done <<< "$kit_rows"
+
+# path_consumers_for <path> → echoes the consumer set CSV ("all" or
+# comma-joined names) for the given path. Tries exact match first,
+# then kit-prefix match. Echoes empty string if no match (caller
+# will have already failed in the uncovered-path check).
+path_consumers_for() {
+  local needle="$1"
+  while IFS=$'\t' read -r p c; do
+    [ -z "$p" ] && continue
+    if [ "$p" = "$needle" ]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done <<< "$path_consumers_rows"
+  # Fall back to kit-prefix match. Find the kit whose prefix this
+  # path lives inside, then return that kit's consumer set.
+  for kp in $kit_prefixes; do
+    if [[ "$needle" == "$kp"* ]]; then
+      local kit_path="${kp%/}"
+      # Also try with trailing slash since some kit entries are
+      # stored that way in the manifest.
+      while IFS=$'\t' read -r p c; do
+        [ -z "$p" ] && continue
+        if [ "$p" = "$kit_path" ] || [ "$p" = "$kp" ]; then
+          printf '%s' "$c"
+          return 0
+        fi
+      done <<< "$path_consumers_rows"
+    fi
+  done
+  printf ''
+}
+
+# consumers_subset <sub_csv> <sup_csv> — returns 0 if sub is a
+# subset of sup, 1 otherwise. Special cases:
+#   - sup="all" always succeeds (universal set covers any explicit list).
+#   - sub="all" + sup explicit → fails (universal can't fit in finite).
+#   - both explicit → every consumer in sub must be in sup.
+consumers_subset() {
+  local sub="$1" sup="$2"
+  [ "$sup" = "all" ] && return 0
+  [ "$sub" = "all" ] && return 1
+  local IFS=','
+  local c
+  for c in $sub; do
+    [ -z "$c" ] && continue
+    case ",$sup," in
+      *",$c,"*) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# consumers_diff <sub_csv> <sup_csv> — echoes the comma-joined list
+# of consumers in sub that are NOT in sup. For diagnostic naming
+# when consumers_subset fails.
+consumers_diff() {
+  local sub="$1" sup="$2"
+  if [ "$sub" = "all" ] && [ "$sup" != "all" ]; then
+    printf '%s' "(requirer is consumers: all, required is only: $sup)"
+    return
+  fi
+  local IFS=','
+  local c missing=""
+  for c in $sub; do
+    [ -z "$c" ] && continue
+    case ",$sup," in
+      *",$c,"*) ;;
+      *) missing="${missing:+$missing,}$c" ;;
+    esac
+  done
+  printf '%s' "$missing"
+}
+
+# `requires:` is OPTIONAL — entries without it must remain valid.
+#
+# Two-pass design to dodge mikefarah/yq's silent-emit-nothing behavior
+# on `.requires[]` against a scalar (a malformed `requires: "foo"`
+# string would otherwise pass through with zero output instead of
+# erroring). Pass 1 type-checks every `requires:` field via the `type`
+# function and fails closed on any non-sequence shape. Pass 2 then
+# iterates the sequence safely.
+#
+# Pass 1: shape check.
+if ! shape_rows=$(yq -r '
+  .paths[] | select(has("requires"))
+  | .path + "\t" + (.requires | type)
+' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not type-check .paths[].requires (yq error):"
+  printf '%s\n' "$shape_rows"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
+if [ -n "$shape_rows" ]; then
+  while IFS=$'\t' read -r requirer rtype; do
+    [ -z "$requirer" ] && continue
+    if [ "$rtype" != "!!seq" ]; then
+      echo "FAIL: path '$requirer' has a malformed requires: field (expected a YAML sequence of strings, got type '$rtype')"
+      FAILED=1
+    fi
+  done <<< "$shape_rows"
+  if [ "$FAILED" -eq 1 ]; then
+    echo "check_sync_manifest: FAIL"
+    exit 1
+  fi
+fi
+
+# Pass 2: extract one (requirer, required_path) per line.
+if ! requires_rows=$(yq -r '
+  .paths[]
+  | select(has("requires"))
+  | .path as $p
+  | .requires[]
+  | $p + "\t" + .
+' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract .paths[].requires entries from the manifest (yq error):"
+  printf '%s\n' "$requires_rows"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
+
+# Defensive bash-side validation: yq -r outputs each requires string
+# unquoted. A scalar `requires: "tests/foo.sh"` (not a sequence) would
+# either yq-error above or — depending on yq version — emit the string
+# as a single-line value. Detect non-string output (lines with weird
+# whitespace, embedded newlines, structured-tag prefixes) and reject.
+if [ -n "$requires_rows" ]; then
+  while IFS=$'\t' read -r requirer required; do
+    [ -z "$requirer" ] && continue
+    # Required path must be a single non-empty token with no embedded
+    # whitespace beyond what `tr` could collapse — a sane file path.
+    case "$required" in
+      ""|*$'\n'*|*$'\t'*)
+        echo "FAIL: path '$requirer' has an empty or whitespace-broken requires: entry"
+        FAILED=1
+        continue
+        ;;
+    esac
+
+    # Path-coverage check first: exact entry OR strictly inside a kit.
+    covered=0
+    if [[ "$exact_set" == *",$required,"* ]]; then
+      covered=1
+    else
+      for kp in $kit_prefixes; do
+        if [[ "$required" == "$kp"* ]]; then
+          covered=1
+          break
+        fi
+      done
+    fi
+
+    if [ "$covered" -eq 0 ]; then
+      # Anything uncovered is a real manifest gap.
+      echo "FAIL: path '$requirer' requires '$required' but that path is not covered by the manifest"
+      echo "      (no exact entry, and not inside any kit entry — propagation would deliver '$requirer'"
+      echo "       to a consumer without '$required', and any tooling that hard-requires it will fail closed."
+      echo "       Fix by adding '$required' as its own manifest entry, or by extending an existing kit to cover it.)"
+      FAILED=1
+      continue
+    fi
+
+    # Consumer-scope coverage (#264 r2 — nathanpayne-codex Phase 4b
+    # finding). The path is covered by the manifest, but the consumer
+    # SET of the required path must be a SUPERSET of the requirer's
+    # consumer set. Otherwise a consumer that receives the requirer
+    # without the required path's coverage will still hit the
+    # closure gap at consumer-side lint time.
+    requirer_consumers=$(path_consumers_for "$requirer")
+    required_consumers=$(path_consumers_for "$required")
+    if [ -z "$requirer_consumers" ] || [ -z "$required_consumers" ]; then
+      # Defensive: a covered path with no consumer set is a logic
+      # error in this script, not a manifest defect. Fail loudly.
+      echo "FAIL: internal error — could not resolve consumer set for '$requirer' (got '$requirer_consumers') or '$required' (got '$required_consumers')"
+      FAILED=1
+      continue
+    fi
+    if ! consumers_subset "$requirer_consumers" "$required_consumers"; then
+      missing=$(consumers_diff "$requirer_consumers" "$required_consumers")
+      echo "FAIL: path '$requirer' (consumers: $requirer_consumers) requires '$required' (consumers: $required_consumers)"
+      echo "      but the required path's consumer set does NOT cover the requirer's. Consumers receiving"
+      echo "      '$requirer' but NOT '$required': $missing"
+      echo "      Propagation would deliver '$requirer' to those consumers without '$required', and any"
+      echo "      tooling that hard-requires it will fail closed on that consumer's lint."
+      echo "      Fix by widening '$required's consumers: to a superset of '$requirer's, or by narrowing"
+      echo "      '$requirer's consumers: to match '$required's."
+      FAILED=1
+    fi
+  done <<< "$requires_rows"
+fi
+
 if [ "$FAILED" -eq 1 ]; then
   echo "check_sync_manifest: FAIL"
   exit 1
+fi
+
+# Run the regression test suite if present. The fixture-based tests
+# under tests/test_check_sync_manifest.sh exercise the requires:
+# closure invariant against synthetic fixture manifests — they don't
+# re-run if this invocation was already driven by a fixture
+# (MERGEPATH_MANIFEST_PATH set) since that's the test harness calling
+# back into us.
+TEST_SUITE="$REPO_ROOT/tests/test_check_sync_manifest.sh"
+if [ -z "${MERGEPATH_MANIFEST_PATH:-}" ] && [ -x "$TEST_SUITE" ]; then
+  echo "check_sync_manifest: running regression test suite"
+  if ! bash "$TEST_SUITE"; then
+    echo "check_sync_manifest: FAIL (regression test suite failed)"
+    exit 1
+  fi
 fi
 
 echo "check_sync_manifest: PASS ($consumer_count consumer(s), $(yq '.paths | length' "$MANIFEST") path entry/entries)"

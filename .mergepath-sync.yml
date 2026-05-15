@@ -9,6 +9,83 @@
 # plan): manifest + audit. Additional path types and per-path knobs
 # (kit-with-allowlist, three-way-merge for review-policy.yml,
 # substitution rules for templated docs) land in later layers.
+#
+# ─────────────────────────────────────────────────────────────────────
+# `requires:` — propagation closure invariant (#264)
+# ─────────────────────────────────────────────────────────────────────
+#
+# A path entry MAY declare a `requires:` list naming OTHER paths that
+# must travel with it to a consumer for the entry to function. The
+# canonical motivation is the propagation wave that triggered #264:
+# scripts/ci/check_gh_as_author was propagated as part of the
+# scripts/ci/ kit, but the test files it hard-requires
+# (tests/test_gh_pr_guard.sh, tests/test_gh_as_author.sh, etc.)
+# were NOT in the manifest. Every consumer's `lint` job then
+# failed in pre-flight on `Missing required file: tests/...`.
+#
+# The `requires:` field closes that gap structurally:
+# `scripts/ci/check_sync_manifest` enforces that for every required
+# path listed under any entry, that path is ALSO covered by the
+# manifest. "Covered" means EITHER an exact entry of its own OR a
+# path strictly inside a manifest kit entry (because kit propagation
+# walks the whole directory, so a fixtures subdir under a kit path
+# travels for free).
+#
+# Be conservative when adding `requires:` — only entries you can
+# verify by grepping the actual script/workflow for hard-required
+# paths. A `requires:` entry should be:
+#   - a test file under tests/ that a `scripts/ci/check_*` wrapper
+#     hard-fails on if missing,
+#   - a script that a propagated workflow shells out to (e.g.
+#     codex-p1-gate.yml → codex-p1-gate.sh), or
+#   - a fixture/library path that an extracted module depends on at
+#     runtime (e.g. agent-review.yml's detect-disagreement job
+#     requires scripts/disagreement-detector.cjs).
+#
+# Things that are NOT `requires:` material:
+#   - Soft dependencies (docs cross-references, comment pointers).
+#   - Paths inside the SAME manifest entry's kit directory (those
+#     travel automatically; declaring them is harmless and may help
+#     readability, but the validator accepts them either way).
+#   - Per-consumer config (e.g. .github/review-policy.yml) that is
+#     intentionally NOT propagated.
+#
+# Format:
+#   - path: scripts/ci/
+#     type: kit
+#     consumers: all
+#     requires:
+#       - "tests/test_gh_pr_guard.sh"       # check_gh_as_author
+#       - "tests/test_gh_as_author.sh"      # check_gh_as_author
+#       - "scripts/ci/fixtures/"            # check_disagreement_detector
+#
+# ─────────────────────────────────────────────────────────────────────
+# Canary-first procedure for --sync-all
+# ─────────────────────────────────────────────────────────────────────
+#
+# When propagating a large change set, prefer the canary-first pattern
+# over a parallel fan-out. The propagation wave that surfaced #264
+# opened 8 consumer PRs simultaneously; every one of them failed the
+# same `lint` job for the same reason, so a single canary would have
+# caught the gap before the fan-out blew up.
+#
+# Recommended steps for `scripts/sync-to-downstream.sh --sync-all`:
+#   1. Pick ONE consumer (typically a public repo so the failure is
+#      easy to read in a tab without auth): `--repos <one-name>`.
+#   2. Wait for that consumer's PR to pass `lint`. If it fails,
+#      investigate IN THE CONSUMER PR before opening any others —
+#      most failures (missing test files, missing fixtures, missing
+#      scripts the kit hard-requires) are upstream manifest gaps
+#      that `requires:` would have caught at the manifest layer.
+#   3. Once the canary is green, fan out: `--sync-all` (no `--repos`).
+#   4. The remaining consumers re-use the cleared invariant, so the
+#      fan-out is reduced to a verification step, not exploration.
+#
+# This is documentation, not enforcement — agents and humans share the
+# same recommendation. The `requires:` invariant above is the
+# structural guard; the canary procedure is the operational practice
+# that makes a manifest gap recoverable for a single PR instead of
+# eight.
 
 # Schema version. Bumped on incompatible changes; the script refuses
 # to run against an unknown version so old scripts can't silently
@@ -164,9 +241,24 @@ paths:
   - path: .github/workflows/agent-review.yml
     type: canonical
     consumers: all
+    # The detect-disagreement job runs `require('scripts/disagreement-
+    # detector.cjs')`. Without the module file, the job aborts on
+    # MODULE_NOT_FOUND. Same lockstep coupling as #259 — propagate the
+    # workflow without the module and every consumer's agent-review job
+    # fails on the very first PR.
+    requires:
+      - "scripts/disagreement-detector.cjs"
   - path: .github/workflows/pr-review-policy.yml
     type: canonical
     consumers: all
+    # The workflow shells out to the three scripts/workflow/ parser
+    # helpers (parse_policy_list, match_protected_paths,
+    # parse_manifest_paths). They are propagated as part of the
+    # scripts/workflow/ kit; declaring the dependency here makes the
+    # coupling explicit so the check_sync_manifest invariant flags any
+    # future split of the parser kit from the workflow.
+    requires:
+      - "scripts/workflow/"
   - path: .github/workflows/dependabot-auto-merge.yml
     type: canonical
     consumers: all
@@ -179,6 +271,12 @@ paths:
   - path: .github/workflows/codex-p1-gate.yml
     type: canonical
     consumers: all
+    # The workflow's only job runs `scripts/codex-p1-gate.sh` directly
+    # (see the `Run scripts/codex-p1-gate.sh` step). Propagating the
+    # workflow without the script makes the gate fail-closed on
+    # `command not found` for every PR in the consumer.
+    requires:
+      - "scripts/codex-p1-gate.sh"
 
   # NOTE: `.mergepath-sync.yml` is deliberately NOT propagated.
   # #268 briefly made it a canonical path on the theory the lane
@@ -195,6 +293,33 @@ paths:
   - path: scripts/ci/
     type: kit
     consumers: all
+    # check_* wrappers under scripts/ci/ hard-fail (exit 1) when their
+    # paired tests, scripts, workflows, or fixtures are missing. Every
+    # entry below is grep-verified against a `scripts/ci/check_*`
+    # script's REQUIRED_FILES / TEST / FIXTURE constants — the same
+    # closure gap that surfaced as #264 on the original propagation
+    # wave (check_gh_as_author missing its tests on every consumer).
+    requires:
+      - "tests/test_gh_pr_guard.sh"            # check_gh_as_author
+      - "tests/test_gh_as_author.sh"           # check_gh_as_author
+      - "tests/test_gh_as_reviewer.sh"         # check_gh_as_author
+      - "tests/test_codex_p1_gate.sh"          # check_codex_p1_gate
+      - "tests/test_disagreement_detector.sh"  # check_disagreement_detector
+      - "tests/test_verify_propagation_pr.sh"  # check_verify_propagation_pr
+      - "scripts/codex-p1-gate.sh"             # check_codex_p1_gate
+      - "scripts/codex-review-request.sh"      # check_codex_scripts
+      - "scripts/codex-review-check.sh"        # check_codex_scripts, check_canonical_bugs_263caf3
+      - "scripts/phase-4b-classifier.sh"       # check_phase_4b_classifier
+      - "scripts/disagreement-detector.cjs"    # check_disagreement_detector
+      - "scripts/request-label-removal.sh"     # check_canonical_bugs_263caf3
+      - "scripts/resolve-pr-threads.sh"        # check_resolve_pr_threads
+      - "scripts/gh-as-author.sh"              # check_gh_as_author (transitive)
+      - "scripts/gh-as-reviewer.sh"            # check_gh_as_author (transitive)
+      - "scripts/hooks/gh-pr-guard.sh"         # tests/test_gh_pr_guard.sh runs it
+      - "scripts/workflow/"                    # check_workflow_parsers
+      - ".github/workflows/agent-review.yml"   # check_disagreement_detector structural assertion
+      - ".github/workflows/codex-p1-gate.yml"  # check_codex_p1_gate workflow shape
+      - ".github/workflows/pr-audit.yml"       # check_pr_audit_codex_clearance
   - path: scripts/gh-projects/
     type: kit
     consumers: all
