@@ -75,14 +75,17 @@ Valid status names are whatever options the Project's `Status` field has — typ
 ### Set the Project README
 
 ```bash
-gh project edit <N> --owner <owner> --readme "$(cat path/to/plan.md)"
+gh project edit <N> --owner <owner> --readme "$(cat "path/to/plan.md")"
 ```
 
 Or from a driver that has sourced `lib.sh`:
 
 ```bash
-set_project_readme ~/.claude/plans/my-initiative.md
+set_project_readme "$HOME/.claude/plans/my-initiative.md"
 ```
+
+(Use `"$HOME/..."` or `"~/path/..."` with double quotes around any path argument
+so a directory name with spaces — e.g. `~/My Plans/...` — survives word-splitting.)
 
 ## Placeholder conventions in body files
 
