@@ -42,6 +42,18 @@
 
 set -eo pipefail
 
+# --- preflight auto-source (#282) ------------------------------------------
+# If OP_PREFLIGHT_REVIEWER_PAT is unset and a fresh op-preflight cache
+# exists for this agent, source it. The existing GH_READ_PAT logic
+# below already prefers OP_PREFLIGHT_REVIEWER_PAT over GH_TOKEN, so this
+# block needs only to populate the env var. Silent on no-op paths.
+__REQUEST_LABEL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ] && [ -r "$__REQUEST_LABEL_DIR/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=lib/preflight-helpers.sh
+  . "$__REQUEST_LABEL_DIR/lib/preflight-helpers.sh"
+  auto_source_preflight
+fi
+
 ALLOWED_LABELS=(needs-external-review needs-human-review policy-violation)
 
 # Escape a string for embedding inside an AppleScript double-quoted

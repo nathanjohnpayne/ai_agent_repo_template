@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# scripts/lib/preflight-helpers.sh — shared auto-source logic for helpers.
+#
+# Sourced by the read-path helper scripts that previously required the
+# caller to set GH_TOKEN inline (codex-review-request.sh,
+# codex-review-check.sh, coderabbit-wait.sh, resolve-pr-threads.sh,
+# request-label-removal.sh). The contract:
+#
+#   * If GH_TOKEN is already set, do nothing (preserve existing behavior).
+#   * Otherwise, locate the op-preflight cache file for the current agent
+#     (or the agent inferred from MERGEPATH_AGENT / $USER / hostname) and
+#     source it if it is fresh per the TTL anchored on
+#     OP_PREFLIGHT_CREATED_AT_EPOCH.
+#   * After sourcing, helpers pick the right env var
+#     (OP_PREFLIGHT_REVIEWER_PAT vs OP_PREFLIGHT_AUTHOR_PAT) themselves —
+#     this library does NOT assign GH_TOKEN.
+#
+# Closes #282 (op-preflight contract): before this library, helpers that
+# required GH_TOKEN exited 3 when called from a fresh subshell even when
+# a warm preflight cache was sitting on disk for this agent. Auto-
+# sourcing means agents can drop the explicit `GH_TOKEN="$OP_PREFLIGHT_
+# REVIEWER_PAT" scripts/foo.sh` prefix without re-burning a biometric.
+#
+# Bash 3.2 portable.
+
+# Locate the cache directory the same way op-preflight.sh does.
+preflight_cache_dir() {
+  local override="${OP_PREFLIGHT_CACHE_DIR:-}"
+  if [[ -n "$override" ]]; then
+    printf '%s' "$override"
+    return 0
+  fi
+  local base="${XDG_CACHE_HOME:-$HOME/.cache}"
+  printf '%s/mergepath' "$base"
+}
+
+# Determine which agent's cache file to consult. Order of precedence:
+#   1. $MERGEPATH_AGENT (explicit override)
+#   2. $OP_PREFLIGHT_AGENT (left over from a prior eval in this shell)
+#   3. The single cache file under the cache dir (if exactly one exists)
+# Returns empty string if no agent can be determined.
+preflight_agent() {
+  if [[ -n "${MERGEPATH_AGENT:-}" ]]; then
+    printf '%s' "$MERGEPATH_AGENT"
+    return 0
+  fi
+  if [[ -n "${OP_PREFLIGHT_AGENT:-}" ]]; then
+    printf '%s' "$OP_PREFLIGHT_AGENT"
+    return 0
+  fi
+  local cache_dir
+  cache_dir="$(preflight_cache_dir)"
+  [[ -d "$cache_dir" ]] || return 0
+  local files=( "$cache_dir"/op-preflight-*.env )
+  if [[ ${#files[@]} -eq 1 && -f "${files[0]}" ]]; then
+    local base="${files[0]##*/}"
+    base="${base#op-preflight-}"
+    base="${base%.env}"
+    printf '%s' "$base"
+    return 0
+  fi
+  return 0
+}
+
+# Internal: returns 0 if the session file is fresh per its embedded
+# OP_PREFLIGHT_CREATED_AT_EPOCH (NOT mtime) and the active TTL.
+preflight_session_is_fresh() {
+  local session_file="$1"
+  [[ -f "$session_file" ]] || return 1
+  local created_at now age ttl
+  created_at=$(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$session_file" 2>/dev/null \
+    | cut -d= -f2- | tr -d "'\"" || true)
+  [[ -z "$created_at" ]] && return 1
+  [[ "$created_at" =~ ^[0-9]+$ ]] || return 1
+  ttl="${OP_PREFLIGHT_TTL_SECONDS:-14400}"
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=14400
+  now=$(date +%s)
+  age=$((now - created_at))
+  [[ "$age" -lt "$ttl" ]]
+}
+
+# Auto-source the op-preflight cache into the current shell IF:
+#   * GH_TOKEN is not already set (preserve caller-provided creds), AND
+#   * the cache file for the resolved agent exists and is fresh.
+#
+# Silent on the no-op paths (GH_TOKEN already set, no cache found,
+# stale cache). Emits a single-line diagnostic to stderr ONLY when it
+# actually sources, so noisy helpers don't accumulate prefix lines on
+# every tool call. Returns 0 in all cases — callers decide what to do
+# when GH_TOKEN is still unset after this returns.
+auto_source_preflight() {
+  if [[ -n "${GH_TOKEN:-}" ]]; then
+    return 0
+  fi
+  local agent cache_dir session_file
+  agent="$(preflight_agent)"
+  if [[ -z "$agent" ]]; then
+    return 0
+  fi
+  cache_dir="$(preflight_cache_dir)"
+  session_file="$cache_dir/op-preflight-${agent}.env"
+  if ! preflight_session_is_fresh "$session_file"; then
+    return 0
+  fi
+  # Source the cache file. Permissions are 0600 in a 0700 cache dir,
+  # owner-only; we trust the file the same way op-preflight.sh itself
+  # does on the cache-hit path.
+  # shellcheck disable=SC1090
+  . "$session_file"
+  if [[ "${OP_PREFLIGHT_QUIET:-0}" != "1" ]]; then
+    echo "# auto-source: loaded op-preflight cache for agent=$agent (no biometric)" >&2
+  fi
+  return 0
+}
+
+# Convenience wrappers: helpers that need a reviewer-scoped token call
+# `preflight_require_token reviewer`; helpers that want author scope
+# pass `author`. The function auto-sources the cache (if needed) and
+# exports GH_TOKEN from the matching OP_PREFLIGHT_*_PAT. Returns 0 if
+# GH_TOKEN ends up populated (either pre-existing or just exported by
+# auto-source), 1 otherwise. Callers that already validate
+# `[ -z "${GH_TOKEN:-}" ] && exit 3` get a no-op when this helper
+# succeeded and the same hard-error when it didn't — no regression.
+preflight_require_token() {
+  local scope="${1:-reviewer}"
+  if [[ -n "${GH_TOKEN:-}" ]]; then
+    return 0
+  fi
+  auto_source_preflight
+  local var_name
+  case "$scope" in
+    reviewer) var_name="OP_PREFLIGHT_REVIEWER_PAT" ;;
+    author)   var_name="OP_PREFLIGHT_AUTHOR_PAT" ;;
+    *)
+      echo "ERROR: preflight_require_token: unknown scope '$scope' (expected reviewer|author)" >&2
+      return 1
+      ;;
+  esac
+  local val="${!var_name:-}"
+  if [[ -n "$val" ]]; then
+    export GH_TOKEN="$val"
+    return 0
+  fi
+  return 1
+}

@@ -11,8 +11,12 @@ If the project uses Firebase or Google Cloud, prefer the canonical
 - When the resolved source credential is the project SA key directly, no impersonation wrapper is used (faster, no `serviceAccountTokenCreator` IAM dependency). When it's the shared ADC or another non-matching credential, `op-firebase-deploy` writes a temporary `impersonated_service_account` credential and stamps the target project as the quota project.
 - Do not introduce long-lived service account keys into repo docs,
   scripts, or secret stores unless a project explicitly requires them. The Firebase-vault SA key in 1Password is the supported on-account form; on-disk deploy keys are not.
-- If credential preflight was run at session start (`scripts/op-preflight.sh --mode all`),
-  deploy credentials are already cached. No additional biometric prompt is needed for deployment.
+- If credential preflight was run at session start with deploy creds
+  loaded (`scripts/op-preflight.sh --mode deploy` or `--mode all`),
+  deploy credentials are already cached. No additional biometric
+  prompt is needed for deployment. The default `--mode review` does
+  NOT load deploy credentials (#282); pass `--mode deploy` explicitly
+  for a deploy session.
 - If an `op` command fails with a sign-in or biometric error during deploy, follow the pause-and-prompt procedure in [operating-rules.md](operating-rules.md#1password-cli-authentication-failures). Do not retry or work around the failure without the human present.
 
 ## Credential source debugging

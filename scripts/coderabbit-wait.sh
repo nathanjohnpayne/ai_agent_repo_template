@@ -98,6 +98,25 @@
 
 set -euo pipefail
 
+# --- preflight auto-source (#282) ------------------------------------------
+# If GH_TOKEN is unset and a fresh op-preflight cache exists for this
+# agent, source it and export OP_PREFLIGHT_REVIEWER_PAT as GH_TOKEN.
+# This lets agents drop the explicit `GH_TOKEN=...` prefix when their
+# preflight cache is already warm. Preserves existing behavior when
+# GH_TOKEN is already set. The existing
+# `[ -z "${GH_TOKEN:-}" ] && exit 3` guard below still fires on a
+# missing cache + missing env var (no regression).
+__CODERABBIT_WAIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "$__CODERABBIT_WAIT_DIR/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=lib/preflight-helpers.sh
+  . "$__CODERABBIT_WAIT_DIR/lib/preflight-helpers.sh"
+  # Author PAT per the original docstring contract — this helper posts
+  # `@coderabbitai, try again.` on rate-limit retries. GH_TOKEN
+  # authenticates the API call; the trigger-comment byline is the
+  # keyring's active account regardless.
+  preflight_require_token author || true
+fi
+
 # --- argument parsing -------------------------------------------------------
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
@@ -121,7 +140,10 @@ if [ -z "$REPO" ]; then
 fi
 
 if [ -z "${GH_TOKEN:-}" ]; then
-  echo "ERROR: GH_TOKEN is required. See REVIEW_POLICY.md § PAT lookup table." >&2
+  echo "ERROR: GH_TOKEN is required. Either:" >&2
+  echo "  - Run: eval \"\$(scripts/op-preflight.sh --agent <agent> --mode review)\"" >&2
+  echo "    so this helper auto-sources OP_PREFLIGHT_REVIEWER_PAT, OR" >&2
+  echo "  - Set GH_TOKEN inline per REVIEW_POLICY.md § PAT lookup table." >&2
   exit 3
 fi
 

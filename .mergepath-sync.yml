@@ -140,6 +140,12 @@ paths:
   - path: scripts/op-preflight.sh
     type: canonical
     consumers: all
+  # Sourced by all five GH_TOKEN-using helper scripts; carries the
+  # auto-source logic that lets agents drop the explicit
+  # `GH_TOKEN=...` prefix once the preflight cache is warm. See #282.
+  - path: scripts/lib/preflight-helpers.sh
+    type: canonical
+    consumers: all
   - path: scripts/coderabbit-wait.sh
     type: canonical
     consumers: all
@@ -250,6 +256,16 @@ paths:
   # gh; no live GitHub network. Travels with the helper so consumers
   # exercise the same renderer they propagate.
   - path: tests/test_post_phase_4b_handoff.sh
+    type: canonical
+    consumers: all
+  # Pairs with scripts/op-preflight.sh + scripts/lib/preflight-helpers.sh
+  # + scripts/ci/check_op_preflight_contract. The check wrapper requires
+  # both test files; same coupling pattern as the gh-as-author and
+  # codex-p1-gate suites above. See #282.
+  - path: tests/test_op_preflight_check.sh
+    type: canonical
+    consumers: all
+  - path: tests/test_helper_autosource.sh
     type: canonical
     consumers: all
 

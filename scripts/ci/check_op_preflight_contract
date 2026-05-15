@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# scripts/ci/check_op_preflight_contract — CI entry point for #282.
+#
+# Runs the unit tests for the tightened op-preflight contract:
+#   - --check / --status mode never invokes op, never warms SSH
+#   - Default --mode is review (not all)
+#   - OP_PREFLIGHT_QUIET=1 collapses the cache-hit stderr block
+#   - The five helper scripts auto-source the cache when GH_TOKEN is
+#     unset, and the shared preflight-helpers.sh library works as
+#     documented.
+#
+# Hard-fails when either test file is missing so a rename can't
+# silently disable the check.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+TESTS=(
+  "tests/test_op_preflight_check.sh"
+  "tests/test_helper_autosource.sh"
+)
+
+FAILED=0
+for rel in "${TESTS[@]}"; do
+  full="$REPO_ROOT/$rel"
+  if [ ! -f "$full" ]; then
+    echo "check_op_preflight_contract: ERROR (missing $rel)" >&2
+    FAILED=1
+    continue
+  fi
+  echo "check_op_preflight_contract: running $rel"
+  if ! bash "$full"; then
+    echo "check_op_preflight_contract: FAIL ($rel)" >&2
+    FAILED=1
+  fi
+done
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_op_preflight_contract: FAIL"
+  exit 1
+fi
+
+echo "check_op_preflight_contract: PASS"
+exit 0
