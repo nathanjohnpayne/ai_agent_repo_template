@@ -420,26 +420,40 @@ mkdir -p "$empty_path_dir"
 # deliberately absent. yq + rsync became required in round 3 of
 # #233 (Codex P1: stage-B must fail-closed when yq is unavailable),
 # so they're part of the minimum set now.
-for tool in bash gh op git yq rsync; do
-  src=$(command -v "$tool" || true)
-  if [ -n "$src" ]; then ln -sf "$src" "$empty_path_dir/$tool"; fi
-done
-set +e
-# Include /usr/bin and /bin so coreutils (dirname, sed, etc.) resolve.
-# Crucially: NO /opt/homebrew/bin and NO ~/google-cloud-sdk/bin, so
-# `firebase` and `gcloud` are NOT findable — that's the scenario under
-# test (operator on a fresh machine, picks --firebase none).
-fb_out=$(PATH="$empty_path_dir:/usr/bin:/bin" \
-         BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 BOOTSTRAP_AUTO_CONFIRM=1 \
-         BOOTSTRAP_AUTO_PROMPT=skip \
-         "$SCRIPT" my-new-repo \
-         --target-dir "$fb_defer_target" \
-         --description d --visibility private --firebase none \
-         --codex-app n --project new --dry-run 2>&1)
-fb_ec=$?
-set -e
-[ "$fb_ec" -eq 0 ] && pass "--firebase none passes even without firebase/gcloud on PATH" \
-                   || fail "--firebase none should pass when firebase/gcloud missing; got rc=$fb_ec, out: $fb_out"
+#
+# CI guard: this test exercises the wizard's host-tool-check under a
+# hermetic PATH that should still satisfy the check (op + gh + git +
+# yq + rsync all available). GitHub Actions runners don't ship the
+# 1Password CLI, so `command -v op` returns empty on CI and the
+# symlink loop below skips op — the hermetic PATH then lacks op and
+# the wizard's tool-check fails for the wrong reason. Detect that
+# pre-condition and SKIP this case rather than failing closed; the
+# rest of the suite still runs. (nathanpayne-codex Phase 4b r1 on
+# PR #289.)
+if ! command -v op >/dev/null 2>&1; then
+  echo "SKIP: 'op' (1Password CLI) not on host PATH — Test 18 (--firebase none with hermetic PATH) cannot exercise the host-tool-check path on CI runners"
+else
+  for tool in bash gh op git yq rsync; do
+    src=$(command -v "$tool" || true)
+    if [ -n "$src" ]; then ln -sf "$src" "$empty_path_dir/$tool"; fi
+  done
+  set +e
+  # Include /usr/bin and /bin so coreutils (dirname, sed, etc.) resolve.
+  # Crucially: NO /opt/homebrew/bin and NO ~/google-cloud-sdk/bin, so
+  # `firebase` and `gcloud` are NOT findable — that's the scenario under
+  # test (operator on a fresh machine, picks --firebase none).
+  fb_out=$(PATH="$empty_path_dir:/usr/bin:/bin" \
+           BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 BOOTSTRAP_AUTO_CONFIRM=1 \
+           BOOTSTRAP_AUTO_PROMPT=skip \
+           "$SCRIPT" my-new-repo \
+           --target-dir "$fb_defer_target" \
+           --description d --visibility private --firebase none \
+           --codex-app n --project new --dry-run 2>&1)
+  fb_ec=$?
+  set -e
+  [ "$fb_ec" -eq 0 ] && pass "--firebase none passes even without firebase/gcloud on PATH" \
+                     || fail "--firebase none should pass when firebase/gcloud missing; got rc=$fb_ec, out: $fb_out"
+fi
 
 # ---------------------------------------------------------------------------
 # Test 19: Interactive prompt --project validation mirrors the flag
