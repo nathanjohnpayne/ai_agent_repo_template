@@ -283,12 +283,72 @@ fi
 # identity (e.g., `Authoring-Agent: claude` → `nathanpayne-claude`). Used
 # by gate (b) branch 2 (#170) to detect the same-agent author/reviewer
 # case where Codex's 👍 reaction can substitute for an APPROVED review.
-AUTHORING_AGENT=$(echo "$PR_BODY" | grep -i -m1 -E '^Authoring-Agent:' | sed -E 's/^[Aa]uthoring-[Aa]gent:[[:space:]]*([A-Za-z0-9_-]+).*/\1/' | tr '[:upper:]' '[:lower:]')
+#
+# Pipefail-safe header parse, iteration history:
+#
+#   r1 (#283 initial): used `echo "$PR_BODY" | grep ... | sed ... | tr ...`
+#   assigned to AUTHORING_AGENT. On a PR with no `Authoring-Agent:` line
+#   the `grep` step returned rc=1; under `set -eo pipefail` that rc=1
+#   bubbled up as the pipeline's exit status and `set -e` aborted the
+#   script before `SAME_AGENT_REVIEWER=""` ran on the next line — so any
+#   PR missing the header (UI-created, external-contributor, or
+#   predating the `gh-pr-guard.sh` Authoring-Agent enforcement on
+#   `gh pr create`) blew up the merge gate with an opaque trace.
+#
+#   r2 (codex CHANGES_REQUESTED): gated extraction on a prior
+#   `if printf ... | grep -qiE ...`. The if-test context suppresses
+#   `set -e` on the test command, so no-header bodies now took the
+#   intended "skip extraction, leave SAME_AGENT_REVIEWER empty" path
+#   without aborting.
+#
+#   r3 (codex CHANGES_REQUESTED): r2 still had a silent failure on
+#   LARGE bodies. `printf '%s\n' "$PR_BODY" | grep` is a producer
+#   pipe; once the body crosses the 64KB pipe buffer AND the
+#   `Authoring-Agent:` header is near the top of the body, grep -q
+#   matches and exits early, printf gets SIGPIPE (rc=141), pipefail
+#   bubbles the 141 as the pipeline's exit. In the guard `if` test,
+#   141 is non-zero → the `if` evaluates false → AUTHORING_AGENT and
+#   SAME_AGENT_REVIEWER stay empty even though the header IS present.
+#   THE EXACT HOLE r1+r2 set out to close, reopened by a different
+#   mechanism. Fix: replace producer pipe with bash herestring
+#   `<<<"$PR_BODY"` — no producer process, no SIGPIPE.
+#
+#   r4 (codex CHANGES_REQUESTED — THIS iteration): r3 still failed
+#   case-coverage. The guard's `grep -i` matched any case of the
+#   header (e.g. `AUTHORING-AGENT: Claude`), but the extraction
+#   `sed -E 's/^[Aa]uthoring-[Aa]gent:[[:space:]]*([A-Za-z0-9_-]+).*/\1/'`
+#   only character-classed the FIRST letter of each word — fully-
+#   uppercase keys fell through sed unchanged, and the trailing `tr`
+#   then lowercased the WHOLE line (`AUTHORING-AGENT: Claude` →
+#   `authoring-agent: claude`), so AUTHORING_AGENT was set to the
+#   string "authoring-agent: claude" rather than just "claude". The
+#   awk suffix match on `-authoring-agent: claude` against
+#   `nathanpayne-claude` then failed → SAME_AGENT_REVIEWER="" →
+#   same-agent exclusion no-op'd → self-approval hole reopened.
+#   GNU sed's `I` regex flag would be the natural fix but BSD/macOS
+#   sed doesn't support it, so we can't rely on it.
+#
+#   Fix: reorder the pipeline so `tr` lowercases BEFORE sed. sed
+#   then sees a canonical-lowercase line and uses a strict-lowercase
+#   pattern — no character classes needed. Order is grep -i (still
+#   case-insensitive on detection) → tr (canonicalize) → sed
+#   (extract from canonical). Works for every case-permutation of
+#   the header without per-letter character classing.
+#   (nathanpayne-codex Phase 4b r4 on PR #283.)
+AUTHORING_AGENT=""
 SAME_AGENT_REVIEWER=""
-if [ -n "$AUTHORING_AGENT" ]; then
-  # Match against available_reviewers via suffix (e.g., "claude" matches
-  # "nathanpayne-claude"). Empty if no match.
-  SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
+if grep -qiE '^Authoring-Agent:' <<<"$PR_BODY"; then
+  AUTHORING_AGENT=$(grep -i -m1 -E '^Authoring-Agent:' <<<"$PR_BODY" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/^authoring-agent:[[:space:]]*([a-z0-9_-]+).*/\1/')
+  if [ -n "$AUTHORING_AGENT" ]; then
+    # Match against available_reviewers via suffix (e.g., "claude"
+    # matches "nathanpayne-claude"). Empty if no match — also
+    # pipefail-safe: REVIEWERS is small (~3 lines) so SIGPIPE on the
+    # `echo` producer cannot fire here, and awk always exits 0 even
+    # when no record matched.
+    SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
+  fi
 fi
 
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
@@ -581,13 +641,29 @@ REVIEWERS_JSON=$(echo "$REVIEWERS" | jq -R . | jq -s .)
 # changes) is caught by the preflight blocking-label check above: the
 # Agent Review Pipeline's detect-disagreement job applies
 # `needs-human-review`, which the preflight rejects before this gate runs.
+# Self-approval guard: exclude BOTH the GitHub PR-author login
+# (`$author`, typically nathanjohnpayne) AND the authoring-agent's
+# reviewer identity (`$same_agent_reviewer`, e.g.
+# nathanpayne-claude for a claude-authored PR). GitHub-native
+# branch protection only blocks reviewer == PR-author, but per
+# REVIEW_POLICY.md § No-self-approve scoping the authoring agent's
+# OWN reviewer identity is also disqualified for Phase 4 (over-
+# threshold) gate-(b) clearance — that's the exact case branch 2
+# below (same-agent + Codex 👍) is designed to handle. Without
+# the second exclusion, a claude-authored PR could be cleared by
+# nathanpayne-claude posting APPROVED, since nathanpayne-claude
+# is different from nathanjohnpayne and thus passes the bare
+# `.user.login != $author` filter. (nathanpayne-codex Phase 4b
+# finding on the 263caf3 sync wave.)
 APPROVING_REVIEWER=$(echo "$REVIEWS_JSON" | jq -r \
   --argjson reviewers "$REVIEWERS_JSON" \
-  --arg author "$PR_AUTHOR" '
+  --arg author "$PR_AUTHOR" \
+  --arg same_agent_reviewer "$SAME_AGENT_REVIEWER" '
     [ .[]
       | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
       | select(.user.login as $u | $reviewers | index($u))
       | select(.user.login != $author)
+      | select($same_agent_reviewer == "" or .user.login != $same_agent_reviewer)
     ]
     | group_by(.user.login)
     | map(max_by(.submitted_at))
@@ -794,15 +870,24 @@ fi
 # trigger or scheduled sweep, instead of stalling on a permanently-
 # failing gate (c) until a human clears the label by hand.
 if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
+  # Same self-approval guard as gate (b) branch 1 above: exclude
+  # the authoring-agent's reviewer identity in addition to the
+  # GitHub PR-author login. Without this, a claude-authored
+  # over-threshold PR could clear the Phase 4b substitute via
+  # nathanpayne-claude posting APPROVED on HEAD — collapsing the
+  # cross-agent guarantee Phase 4b is meant to provide. (Same
+  # nathanpayne-codex Phase 4b finding on the 263caf3 sync wave.)
   PHASE_4B_APPROVER=$(echo "$REVIEWS_JSON" | jq -r \
     --argjson reviewers "$REVIEWERS_JSON" \
     --arg author "$PR_AUTHOR" \
+    --arg same_agent_reviewer "$SAME_AGENT_REVIEWER" \
     --arg sha "$HEAD_SHA" '
       [ .[]
         | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
         | select(.commit_id == $sha)
         | select(.user.login as $u | $reviewers | index($u))
         | select(.user.login != $author)
+        | select($same_agent_reviewer == "" or .user.login != $same_agent_reviewer)
       ]
       | group_by(.user.login)
       | map(max_by(.submitted_at))

@@ -1,0 +1,588 @@
+#!/usr/bin/env bash
+# check_canonical_bugs_263caf3
+#
+# Regression coverage for two canonical-surface bugs found by
+# nathanpayne-codex while doing the Phase 4b external reviews on
+# the 263caf3 propagation wave (matchline#232, nathanpaynedotcom#368,
+# overridebroadway#59, device-source-of-truth#86,
+# friends-and-family-billing#270, device-platform-reporting#80,
+# swipewatch#51, tadlockpsychiatry#54). Both are upstream canonical
+# defects that affect every consumer, not consumer-local drift.
+#
+#   Bug 1: scripts/request-label-removal.sh aborted under `set -e`
+#          in the default no-`--repo` path. The BODY="..." assignment
+#          embedded `$([ -n "$REPO" ] && echo "--repo $REPO")`; the
+#          tested-empty `[` short-circuits the `&&` chain with rc=1,
+#          the command substitution's rc=1 propagates as the
+#          assignment's exit status, and `set -e` aborts the script
+#          BEFORE `gh pr comment` runs. Every `request-label-removal.sh
+#          <PR#> <label>` call without `--repo` silently failed.
+#
+#   Bug 2: scripts/codex-review-check.sh let the authoring agent's
+#          own reviewer identity satisfy both gate (b) branch 1 AND
+#          gate (c) Phase 4b substitute. The jq filter excluded only
+#          `.user.login != $author` (= nathanjohnpayne, the GitHub
+#          PR-author login), not the same-agent reviewer identity
+#          (e.g. nathanpayne-claude for a claude-authored PR). With
+#          nathanpayne-claude in `available_reviewers` and != the
+#          author, a claude-authored over-threshold PR could self-
+#          approve through the merge gate. The fix excludes BOTH
+#          `$author` AND `$same_agent_reviewer`.
+#
+# This check exercises the jq filter literals in isolation against
+# in-memory fixtures so a future edit can't silently regress either
+# guard. Inline-literal pattern matches check_workflow_parsers /
+# check_pr_audit_codex_clearance.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+LABEL_REMOVAL_SCRIPT="scripts/request-label-removal.sh"
+CODEX_CHECK_SCRIPT="scripts/codex-review-check.sh"
+
+for f in "$LABEL_REMOVAL_SCRIPT" "$CODEX_CHECK_SCRIPT"; do
+  if [ ! -f "$f" ]; then
+    echo "check_canonical_bugs_263caf3: FAIL — missing $f"
+    exit 1
+  fi
+done
+
+command -v jq >/dev/null 2>&1 || {
+  echo "check_canonical_bugs_263caf3: FAIL — jq not on PATH"
+  exit 1
+}
+
+pass=0
+fail=0
+
+# ── Bug 1 regression: request-label-removal.sh with no --repo ────────
+#
+# Drive the script far enough into the BODY assignment to prove the
+# `set -e` abort no longer fires. We stub `gh` so we don't need
+# network or a real PR — the assertion is that the script REACHES
+# the gh invocation, not what gh returns. The pre-fix code aborts
+# BEFORE reaching `gh pr comment`; the post-fix code reaches it.
+
+echo "Bug 1 regression: request-label-removal.sh set -e abort with no --repo"
+
+SCRATCH=$(mktemp -d)
+trap 'rm -rf "$SCRATCH"' EXIT
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+# Stub: print a marker proving the script reached gh, then succeed.
+case "$1" in
+  "pr")
+    case "${2:-}" in
+      "view")    printf 'https://github.com/nathanjohnpayne/mergepath/pull/99999\n' ;;
+      "comment") printf 'STUB_GH_COMMENT_REACHED\n' >&2 ;;
+      *)         printf 'STUB_GH_UNEXPECTED %s\n' "$*" >&2 ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" \
+  MERGEPATH_NOTIFY_IMESSAGE_TO="" \
+  "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" = "0" ] && echo "$out" | grep -q "STUB_GH_COMMENT_REACHED"; then
+  pass=$((pass + 1))
+  echo "  PASS: no-\`--repo\` invocation reaches \`gh pr comment\` (rc=0)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: no-\`--repo\` invocation did NOT reach gh pr comment (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+# Same, but WITH --repo — sanity-check that the explicit-repo path
+# is also still wired up.
+set +e
+out=$(PATH="$SCRATCH:$PATH" \
+  MERGEPATH_NOTIFY_IMESSAGE_TO="" \
+  "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review --repo nathanjohnpayne/mergepath 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" = "0" ] && echo "$out" | grep -q "STUB_GH_COMMENT_REACHED"; then
+  pass=$((pass + 1))
+  echo "  PASS: --repo invocation reaches \`gh pr comment\` (rc=0)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --repo invocation did NOT reach gh pr comment (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+# Confirm the BODY ends up containing the right hint string in both
+# paths. Inspect via a different stub that echoes argv to stderr.
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  "pr")
+    case "${2:-}" in
+      "view") printf 'https://github.com/nathanjohnpayne/mergepath/pull/99999\n' ;;
+      "comment")
+        # Dump --body content to a file so the test can inspect.
+        shift 2
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--body" ]; then printf '%s' "$2" > "$SCRATCH_BODY_OUT"; fi
+          shift
+        done
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+# no-repo path
+SCRATCH_BODY_OUT="$SCRATCH/body-norepo.txt" \
+  PATH="$SCRATCH:$PATH" \
+  MERGEPATH_NOTIFY_IMESSAGE_TO="" \
+  "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review >/dev/null 2>&1 || true
+
+if [ -f "$SCRATCH/body-norepo.txt" ] && \
+   grep -q "gh pr edit 99999 --remove-label needs-external-review\`" "$SCRATCH/body-norepo.txt" && \
+   ! grep -q -- "--repo " "$SCRATCH/body-norepo.txt"; then
+  pass=$((pass + 1))
+  echo "  PASS: no-\`--repo\` BODY contains correct CLI hint with no --repo flag"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: no-\`--repo\` BODY CLI hint malformed" >&2
+  [ -f "$SCRATCH/body-norepo.txt" ] && sed 's/^/    /' "$SCRATCH/body-norepo.txt" >&2
+fi
+
+# with-repo path
+SCRATCH_BODY_OUT="$SCRATCH/body-repo.txt" \
+  PATH="$SCRATCH:$PATH" \
+  MERGEPATH_NOTIFY_IMESSAGE_TO="" \
+  "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review --repo nathanjohnpayne/mergepath >/dev/null 2>&1 || true
+
+if [ -f "$SCRATCH/body-repo.txt" ] && \
+   grep -q "gh pr edit 99999 --remove-label needs-external-review --repo nathanjohnpayne/mergepath\`" "$SCRATCH/body-repo.txt"; then
+  pass=$((pass + 1))
+  echo "  PASS: --repo BODY contains correct CLI hint with --repo flag inline"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --repo BODY CLI hint malformed" >&2
+  [ -f "$SCRATCH/body-repo.txt" ] && sed 's/^/    /' "$SCRATCH/body-repo.txt" >&2
+fi
+
+echo
+echo "Bug 2 regression: codex-review-check.sh self-approval exclusion"
+
+# ── Bug 2 regression: jq filter must exclude same-agent reviewer ─────
+#
+# The filter literals are extracted verbatim from
+# `scripts/codex-review-check.sh` gate (b) branch 1 + gate (c) Phase
+# 4b substitute. Keep this in lockstep with the script under test —
+# same inline-literal coupling the other scripts/ci/check_* files use.
+
+REVIEWERS_JSON='["nathanpayne-claude","nathanpayne-cursor","nathanpayne-codex"]'
+
+run_filter() {
+  # Args:
+  #   $1 = jq filter (gate-b form or gate-c form)
+  #   $2 = author login
+  #   $3 = same_agent_reviewer login (may be empty)
+  #   $4 = sha (only used by gate-c form; harmless for gate-b)
+  #   $5 = reviews_json
+  echo "$5" | jq -r \
+    --argjson reviewers "$REVIEWERS_JSON" \
+    --arg author "$2" \
+    --arg same_agent_reviewer "$3" \
+    --arg sha "$4" \
+    "$1"
+}
+
+GATE_B_FILTER='
+  [ .[]
+    | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+    | select(.user.login as $u | $reviewers | index($u))
+    | select(.user.login != $author)
+    | select($same_agent_reviewer == "" or .user.login != $same_agent_reviewer)
+  ]
+  | group_by(.user.login)
+  | map(max_by(.submitted_at))
+  | map(select(.state == "APPROVED"))
+  | first
+  | if . == null then empty else .user.login end
+'
+
+GATE_C_FILTER='
+  [ .[]
+    | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+    | select(.commit_id == $sha)
+    | select(.user.login as $u | $reviewers | index($u))
+    | select(.user.login != $author)
+    | select($same_agent_reviewer == "" or .user.login != $same_agent_reviewer)
+  ]
+  | group_by(.user.login)
+  | map(max_by(.submitted_at))
+  | map(select(.state == "APPROVED"))
+  | max_by(.submitted_at)
+  | if . == null then "" else .user.login + "|" + .submitted_at end
+'
+
+HEAD_SHA="abc123"
+
+# Case A: claude-authored PR, nathanpayne-claude tries to self-approve.
+#   Expected: gate (b) returns empty (no APPROVING_REVIEWER).
+#   Expected: gate (c) returns empty (no PHASE_4B_APPROVER).
+REVIEWS_A='[
+  {"user":{"login":"nathanpayne-claude"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-05-15T10:00:00Z"}
+]'
+
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_A")
+if [ -z "$got" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) rejects same-agent self-approval (claude→claude)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) accepted same-agent self-approval — got '$got'" >&2
+fi
+
+got=$(run_filter "$GATE_C_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_A")
+if [ -z "$got" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (c) rejects same-agent self-approval (claude→claude)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (c) accepted same-agent self-approval — got '$got'" >&2
+fi
+
+# Case B: claude-authored PR, nathanpayne-codex (cross-agent) approves.
+#   Expected: gate (b) returns nathanpayne-codex.
+#   Expected: gate (c) returns nathanpayne-codex|<timestamp>.
+REVIEWS_B='[
+  {"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-05-15T10:00:00Z"}
+]'
+
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_B")
+if [ "$got" = "nathanpayne-codex" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) accepts cross-agent approval (claude-authored, codex-approved)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) rejected cross-agent approval — got '$got'" >&2
+fi
+
+got=$(run_filter "$GATE_C_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_B")
+case "$got" in
+  nathanpayne-codex\|*) pass=$((pass + 1)); echo "  PASS: gate (c) accepts cross-agent Phase 4b approval (claude-authored, codex-approved)" ;;
+  *) fail=$((fail + 1)); echo "  FAIL: gate (c) rejected cross-agent Phase 4b approval — got '$got'" >&2 ;;
+esac
+
+# Case C: no Authoring-Agent header (same_agent_reviewer=""), any
+# non-author reviewer approves. Filter must NOT over-exclude.
+REVIEWS_C='[
+  {"user":{"login":"nathanpayne-cursor"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-05-15T10:00:00Z"}
+]'
+
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "" "$HEAD_SHA" "$REVIEWS_C")
+if [ "$got" = "nathanpayne-cursor" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) accepts non-author reviewer when no Authoring-Agent header"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) over-excluded with empty same_agent_reviewer — got '$got'" >&2
+fi
+
+got=$(run_filter "$GATE_C_FILTER" "nathanjohnpayne" "" "$HEAD_SHA" "$REVIEWS_C")
+case "$got" in
+  nathanpayne-cursor\|*) pass=$((pass + 1)); echo "  PASS: gate (c) accepts non-author reviewer when no Authoring-Agent header" ;;
+  *) fail=$((fail + 1)); echo "  FAIL: gate (c) over-excluded with empty same_agent_reviewer — got '$got'" >&2 ;;
+esac
+
+# Case D: explicit PR author (nathanjohnpayne) somehow posts a review
+# anyway. Filter must always reject the GitHub PR author.
+REVIEWS_D='[
+  {"user":{"login":"nathanjohnpayne"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-05-15T10:00:00Z"}
+]'
+
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_D")
+if [ -z "$got" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) rejects PR-author self-approval (nathanjohnpayne→nathanjohnpayne)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) accepted PR-author self-approval — got '$got'" >&2
+fi
+
+# Case E: same-agent reviewer's LATEST state is CHANGES_REQUESTED
+# even though they previously approved → no clearance via the bare
+# group_by/max_by/latest-state filter. (Regression guard for the
+# pre-existing latest-state-wins behavior; ensures the new
+# same_agent_reviewer exclusion doesn't change unrelated semantics.)
+REVIEWS_E='[
+  {"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-05-15T10:00:00Z"},
+  {"user":{"login":"nathanpayne-codex"},"state":"CHANGES_REQUESTED","commit_id":"abc123","submitted_at":"2026-05-15T11:00:00Z"}
+]'
+
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_E")
+if [ -z "$got" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) honors latest-state CHANGES_REQUESTED over earlier APPROVED (regression)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) used stale APPROVED instead of latest CHANGES_REQUESTED — got '$got'" >&2
+fi
+
+echo
+echo "Bug 2 production parser path: AUTHORING_AGENT extraction under set -eo pipefail"
+
+# ── Bug 2 augmentation (nathanpayne-codex Phase 4b r2 on #283) ───────
+#
+# The original Case A–E above exercised only the jq filter literals
+# with `same_agent_reviewer` injected directly — they did NOT prove
+# the production code reaches the filter at all. Codex r2 caught
+# that the AUTHORING_AGENT parser at line ~286 of the script
+# (`echo "$PR_BODY" | grep ... | sed ... | tr ...`) aborts under
+# `set -eo pipefail` when the body has no `Authoring-Agent:` header
+# (grep rc=1 → pipefail bubbles it → assignment inherits rc=1 →
+# `set -e` aborts BEFORE `SAME_AGENT_REVIEWER=""` runs).
+#
+# Inline-literal pattern: the parser snippet below is duplicated
+# verbatim from `scripts/codex-review-check.sh` lines ~286–305.
+# Keep them in lockstep — same coupling the jq literals above use.
+
+PARSER_HARNESS=$(cat <<'PARSER'
+set -eo pipefail
+# Verbatim from scripts/codex-review-check.sh (the r4 form — tr
+# before sed, so sed sees canonical lowercase; see the multi-
+# iteration comment block above the live parser for the chain
+# r1 (initial) → r2 (pipefail abort) → r3 (SIGPIPE on producer) →
+# r4 (case coverage)).
+AUTHORING_AGENT=""
+SAME_AGENT_REVIEWER=""
+if grep -qiE '^Authoring-Agent:' <<<"$PR_BODY"; then
+  AUTHORING_AGENT=$(grep -i -m1 -E '^Authoring-Agent:' <<<"$PR_BODY" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/^authoring-agent:[[:space:]]*([a-z0-9_-]+).*/\1/')
+  if [ -n "$AUTHORING_AGENT" ]; then
+    SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
+  fi
+fi
+printf '%s|%s\n' "$AUTHORING_AGENT" "$SAME_AGENT_REVIEWER"
+PARSER
+)
+
+REVIEWERS_LIST=$'nathanpayne-claude\nnathanpayne-cursor\nnathanpayne-codex'
+
+run_parser() {
+  # Args: $1 = PR body. Prints "<AUTHORING_AGENT>|<SAME_AGENT_REVIEWER>".
+  # Runs in a fresh bash with set -eo pipefail so any abort surfaces
+  # as a non-zero exit code from this function.
+  PR_BODY="$1" REVIEWERS="$REVIEWERS_LIST" bash -c "$PARSER_HARNESS"
+}
+
+# Case F: no Authoring-Agent header. The pre-fix code aborts here
+# (grep rc=1 → pipefail → set -e abort). Post-fix: AUTHORING_AGENT=""
+# AND SAME_AGENT_REVIEWER="" AND non-zero exit propagates as failure.
+set +e
+got=$(run_parser "Some PR body with no Authoring-Agent line.
+Just regular content here.")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "|" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: no-header PR body → AUTHORING_AGENT='' SAME_AGENT_REVIEWER='' (no abort under pipefail)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: no-header parser aborted or produced unexpected output (rc=$rc, got='$got')" >&2
+fi
+
+# Case G: empty PR body. Same expectation.
+set +e
+got=$(run_parser "")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "|" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: empty PR body → AUTHORING_AGENT='' SAME_AGENT_REVIEWER='' (no abort)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: empty-body parser aborted or produced unexpected output (rc=$rc, got='$got')" >&2
+fi
+
+# Case H: Authoring-Agent: claude → maps to nathanpayne-claude.
+set +e
+got=$(run_parser "Authoring-Agent: claude
+
+## Summary
+Something.")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "claude|nathanpayne-claude" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: Authoring-Agent: claude → AUTHORING_AGENT='claude' SAME_AGENT_REVIEWER='nathanpayne-claude'"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: claude-header parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case I: case-insensitive header key + capitalized value.
+set +e
+got=$(run_parser "authoring-agent: Codex
+
+body")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "codex|nathanpayne-codex" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: case-insensitive header → AUTHORING_AGENT='codex' SAME_AGENT_REVIEWER='nathanpayne-codex'"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: case-insensitive parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case J: header value that doesn't match any available_reviewer.
+# AUTHORING_AGENT populated but SAME_AGENT_REVIEWER stays empty.
+set +e
+got=$(run_parser "Authoring-Agent: jules
+
+body")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "jules|" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: unknown agent → AUTHORING_AGENT='jules' SAME_AGENT_REVIEWER='' (awk no-match is pipefail-safe)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: unknown-agent parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case K: header not at start-of-body (regression for the -m1 + ^
+# anchors). The line IS at start-of-line, just not start-of-body.
+set +e
+got=$(run_parser "Some preface line.
+Authoring-Agent: cursor
+Trailing line.")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "cursor|nathanpayne-cursor" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: header on non-first line still parses (cursor → nathanpayne-cursor)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: mid-body header parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case M: fully-uppercase header key, capitalized value
+# (nathanpayne-codex Phase 4b r4 finding via CodeRabbit). The r3
+# pipeline (`grep -i | sed [Aa]uthoring | tr upper→lower`) silently
+# produced `authoring-agent: claude` for `AUTHORING-AGENT: Claude`
+# because sed's per-letter `[Aa]` only covered first-of-word casing
+# — the rest of the line fell through unchanged, then the trailing
+# `tr` lowercased the whole "header: value" string into the
+# AUTHORING_AGENT variable, so the awk suffix match against
+# `nathanpayne-claude` failed and SAME_AGENT_REVIEWER stayed "".
+# The r4 reorder (tr before sed) canonicalizes the line to lowercase
+# before extraction, so any case-permutation of the header key works.
+set +e
+got=$(run_parser "AUTHORING-AGENT: Claude
+
+## Summary")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "claude|nathanpayne-claude" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: AUTHORING-AGENT: Claude (uppercase key) → claude (canonical extraction)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: uppercase-key header parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case N: uppercase value
+set +e
+got=$(run_parser "Authoring-Agent: CLAUDE
+
+body")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "claude|nathanpayne-claude" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: Authoring-Agent: CLAUDE (uppercase value) → claude"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: uppercase-value parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case O: fully-uppercase key AND value (worst case)
+set +e
+got=$(run_parser "AUTHORING-AGENT: CODEX
+
+body")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "codex|nathanpayne-codex" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: AUTHORING-AGENT: CODEX (fully upper) → codex"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: full-uppercase parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case P: mixed-case key in the middle of the word
+set +e
+got=$(run_parser "AuThOrInG-aGeNt: Cursor
+
+body")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "cursor|nathanpayne-cursor" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: mixed-case AuThOrInG-aGeNt → cursor (canonical extraction)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: mixed-case parse wrong (rc=$rc, got='$got')" >&2
+fi
+
+# Case L: LARGE PR body (>64KB pipe buffer) with Authoring-Agent near
+# the top. This is the regression nathanpayne-codex r3 flagged: r2
+# used `printf '%s\n' "$PR_BODY" | grep -q…`, a producer-pipe shape.
+# When the body crosses the OS pipe buffer (typically 64KB) and grep
+# matches near the top, grep exits early, printf gets SIGPIPE (141),
+# pipefail bubbles 141 as the pipeline's exit, the guard's `if` test
+# evaluates false even though the header IS present, and
+# SAME_AGENT_REVIEWER stays "" — reopening the same-agent self-
+# approval hole that #283 was meant to close. r3 replaced the
+# producer pipe with a bash herestring `<<<"$PR_BODY"`, which feeds
+# grep directly from the shell with no producer process to receive
+# SIGPIPE.
+#
+# Construct the body in a pipefail-safe way: `head -c N < /dev/zero`
+# has no upstream producer, so it can't be killed by SIGPIPE itself,
+# and `tr` reads to EOF.
+LARGE_FILLER=$(head -c 70000 < /dev/zero | tr '\0' 'x')
+LARGE_BODY="Authoring-Agent: claude"$'\n\n'"$LARGE_FILLER"
+
+set +e
+got=$(run_parser "$LARGE_BODY")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && [ "$got" = "claude|nathanpayne-claude" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: >64KB PR body with header still parses (no SIGPIPE on producer; pipefail safe)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: large-body parser regressed — header silently lost (rc=$rc, got='$got')" >&2
+  echo "        body size was ${#LARGE_BODY} bytes; r2 producer-pipe shape would fail here." >&2
+fi
+
+echo
+total=$((pass + fail))
+if [ "$fail" -gt 0 ]; then
+  echo "check_canonical_bugs_263caf3: FAIL ($fail/$total failed)"
+  exit 1
+fi
+echo "check_canonical_bugs_263caf3: PASS ($total tests)"
+exit 0

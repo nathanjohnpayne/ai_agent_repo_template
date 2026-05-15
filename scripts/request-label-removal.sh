@@ -92,7 +92,23 @@ if [ "$allowed" -ne 1 ]; then
 fi
 
 REPO_FLAG=()
-if [ -n "$REPO" ]; then REPO_FLAG=(--repo "$REPO"); fi
+REPO_HINT_FOR_BODY=""
+if [ -n "$REPO" ]; then
+  REPO_FLAG=(--repo "$REPO")
+  REPO_HINT_FOR_BODY=" --repo $REPO"
+fi
+# Plain string (set -e safe). The previous form embedded
+# `$([ -n "$REPO" ] && echo "--repo $REPO")` directly inside the BODY
+# heredoc. In the default no-`--repo` case the inline `[` returns 1,
+# the `&&` short-circuits with rc=1, the command substitution's
+# rc=1 propagates as the assignment's exit status, and `set -e`
+# aborts the whole script BEFORE `gh pr comment` ever runs — so
+# every `request-label-removal.sh <PR#> <label>` call without
+# `--repo` silently failed (no PR comment, no iMessage, no error
+# message to chat past the bash trace). Compute the hint string
+# once in a normal `if` block so the assignment can never inherit
+# a non-zero exit from a tested-empty command substitution.
+# (nathanpayne-codex Phase 4b finding on the 263caf3 sync wave.)
 
 # Token policy (CodeRabbit Major, #271/#272):
 #  - The `gh pr view` READ below is pinned to a PAT
@@ -132,7 +148,7 @@ BODY="@nathanjohnpayne — this PR is blocked only on the \`$LABEL\` label.
 Per [REVIEW_POLICY.md § Agent prohibitions](https://github.com/nathanjohnpayne/mergepath/blob/main/REVIEW_POLICY.md), agents do not remove this label. When you're ready, clear it from any device:
 
 - GitHub UI: Labels sidebar → click \`x\` on \`$LABEL\`
-- CLI: \`gh pr edit $PR_NUM --remove-label $LABEL\` $([ -n "$REPO" ] && echo "--repo $REPO")
+- CLI: \`gh pr edit $PR_NUM --remove-label $LABEL${REPO_HINT_FOR_BODY}\`
 
 Auto-merge will fire as soon as the label is gone.${REASON_BLOCK}${AUTOCLEAR_NOTE}
 
