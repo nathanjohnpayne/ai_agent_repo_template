@@ -353,6 +353,32 @@ jobs:
                   }
                 }
 
+                // ─────────────────────────────────────────────────
+                // Dual-violation note (#287):
+                //
+                // The two `prViolations.push(...)` blocks below can
+                // BOTH fire for a single PR — specifically, a
+                // Dependabot PR that also carries the
+                // `needs-external-review` label and merged with zero
+                // reviewer-identity approvals. In that case the audit
+                // emits both:
+                //
+                //   1. "External-review PR merged with no APPROVED
+                //      review …" (from the hadExternalLabel branch)
+                //   2. "Dependabot PR merged with no reviewer identity
+                //      approval …" (from the dependabotNeedsApproval
+                //      branch)
+                //
+                // This is INTENTIONAL, not an over-emit bug. The two
+                // policy conditions are independent: one comes from
+                // the external-review label being present at merge,
+                // the other from Dependabot's narrower clearance rule
+                // (Codex doesn't count for Dependabot — only a CLI
+                // reviewer-identity APPROVED review does). When both
+                // are simultaneously true, the audit correctly
+                // surfaces both — collapsing them into a single line
+                // would hide which gate the merge bypassed.
+                // ─────────────────────────────────────────────────
                 if (hadExternalLabel &&
                     cliApprovedReviews.length === 0 &&
                     !codexCleared &&
@@ -378,6 +404,11 @@ jobs:
                 // the Phase 4a flow, so this is just defensive
                 // against future weirdness — and reuses the
                 // cliApprovedReviews array computed above.
+                //
+                // See the dual-violation note above: a Dependabot PR
+                // also carrying `needs-external-review` will trip
+                // both pushes on the same iteration. By design — the
+                // two pushes report independent policy conditions.
                 if (dependabotNeedsApproval && cliApprovedReviews.length === 0) {
                   prViolations.push(
                     'Dependabot PR merged with no reviewer identity approval (auto-merge approval missing or removed)'
