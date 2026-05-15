@@ -33,10 +33,10 @@ fail=0
 
 # Run the classifier against a fixture and compare the triggers array
 # (sorted, comma-joined) to the expected list. The classifier reads
-# phase_4b_default from cwd's .github/review-policy.yml — to keep
-# fixture tests self-contained (and not depend on whatever the live
-# policy is on the branch where the test runs), set up a per-call
-# scratch dir with phase_4b_default: complex-changes and cd into it.
+# phase_4b_default from `.github/review-policy.yml` resolved relative
+# to ITS OWN script location (NOT cwd, #272). To keep fixture tests
+# self-contained, set MERGEPATH_REVIEW_POLICY_PATH per call to point
+# at a scratch fixture with phase_4b_default: complex-changes.
 SCRATCH_TRIGGERS=$(mktemp -d)
 mkdir -p "$SCRATCH_TRIGGERS/.github"
 echo "phase_4b_default: complex-changes" > "$SCRATCH_TRIGGERS/.github/review-policy.yml"
@@ -46,7 +46,7 @@ assert_triggers() {
   local out actual_triggers actual_exit
 
   set +e
-  out=$(cd "$SCRATCH_TRIGGERS" && bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/$fixture" 2>/dev/null)
+  out=$(MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_TRIGGERS/.github/review-policy.yml" bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/$fixture" 2>/dev/null)
   actual_exit=$?
   set -e
 
@@ -116,8 +116,8 @@ echo "phase-4b-classifier.sh policy short-circuit tests"
 
 # fallback-only short-circuit: the test harness uses a temp config to
 # avoid mutating the real .github/review-policy.yml. We swap the
-# config in via a temp dir + cd, since the script reads CONFIG=
-# "$.github/review-policy.yml" relative to cwd.
+# config in via MERGEPATH_REVIEW_POLICY_PATH per #272 (the script
+# resolves CONFIG relative to its own location, not cwd).
 SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH" "$SCRATCH_TRIGGERS"' EXIT
 mkdir -p "$SCRATCH/.github"
@@ -136,7 +136,7 @@ jq_get() {
 # fallback-only short-circuits without inspecting any diff.
 echo "phase_4b_default: fallback-only" > "$SCRATCH/.github/review-policy.yml"
 set +e
-out=$(cd "$SCRATCH" && bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/state-machine.json" 2>/dev/null)
+out=$(MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH/.github/review-policy.yml" bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/state-machine.json" 2>/dev/null)
 rc=$?
 set -e
 jq_get recommendation; got_rec=$got_VAL; rec_rc=$got_rc
@@ -153,7 +153,7 @@ fi
 # always short-circuits to invoke-4b regardless of fixture content.
 echo "phase_4b_default: always" > "$SCRATCH/.github/review-policy.yml"
 set +e
-out=$(cd "$SCRATCH" && bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/no-trigger.json" 2>/dev/null)
+out=$(MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH/.github/review-policy.yml" bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/no-trigger.json" 2>/dev/null)
 rc=$?
 set -e
 jq_get recommendation; got_rec=$got_VAL; rec_rc=$got_rc
@@ -169,7 +169,7 @@ fi
 # Unknown phase_4b_default value rejected with exit 2.
 echo "phase_4b_default: bogus-mode" > "$SCRATCH/.github/review-policy.yml"
 set +e
-err=$(cd "$SCRATCH" && bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/no-trigger.json" 2>&1 >/dev/null)
+err=$(MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH/.github/review-policy.yml" bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/no-trigger.json" 2>&1 >/dev/null)
 rc=$?
 set -e
 if [ "$rc" = "2" ] && echo "$err" | grep -q "phase_4b_default must be one of"; then

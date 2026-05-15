@@ -36,6 +36,17 @@
 
 set -euo pipefail
 
+# Hard dependency: `jq`. The script invokes `jq` many times below to
+# parse the PR files payload and emit the recommendation. Without
+# `jq`, those calls exit 127 with `jq: command not found` and the
+# script falls through to undocumented behavior. Fail with a clear
+# error early. (CodeRabbit Major, #272.)
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: jq is required (used to parse the PR files payload + emit the recommendation)." >&2
+  echo "       Install via 'brew install jq' (macOS) or 'apt-get install jq' (Debian/Ubuntu)." >&2
+  exit 2
+fi
+
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
 PR_NUM=""
@@ -97,7 +108,30 @@ fi
 
 # ── Policy: phase_4b_default ─────────────────────────────────────────────────
 
-CONFIG=".github/review-policy.yml"
+# Resolve the policy config from the script's repo root, NOT $PWD.
+# A cwd-relative path silently falls back to `fallback-only` when the
+# script is run from a subdirectory — suppressing real Phase 4b
+# triggers. (CodeRabbit Major, #272.) An env override
+# (`MERGEPATH_REVIEW_POLICY_PATH`) lets tests point at a fixture
+# config without depending on cwd.
+#
+# Follow symlinks: `dirname "${BASH_SOURCE[0]}"` alone resolves to
+# the symlink's directory, not the real script location — so if this
+# script is invoked through a `PATH` symlink
+# (e.g. `~/bin/phase-4b-classifier.sh`), CONFIG would be looked up
+# next to the symlink and silently fall through to fallback-only.
+# Portable bash-3.2 canonicalization loop (macOS BSD readlink has no
+# `-f` everywhere). (Codex P2 on PR #278, #272.)
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  link_target="$(readlink "$src")"
+  case "$link_target" in
+    /*) src="$link_target" ;;
+    *)  src="$(cd -P "$(dirname "$src")" && pwd)/$link_target" ;;
+  esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$src")" && pwd)"
+CONFIG="${MERGEPATH_REVIEW_POLICY_PATH:-$SCRIPT_DIR/../.github/review-policy.yml}"
 PHASE_4B_DEFAULT=""
 if [ -f "$CONFIG" ]; then
   PHASE_4B_DEFAULT=$(awk '

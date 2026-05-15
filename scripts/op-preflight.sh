@@ -180,6 +180,17 @@ SESSION_FILE="$CACHE_DIR/op-preflight-$AGENT.env"
 ADC_TMPFILE="$CACHE_DIR/op-preflight-$AGENT-adc.json"
 SSH_WARM_MARKER="$CACHE_DIR/op-preflight-$AGENT.ssh-warmed"
 SSH_WARM_TTL_SECONDS="${OP_PREFLIGHT_SSH_WARM_TTL_SECONDS:-1800}"  # 30 min default; #163
+# Validate the override is a non-negative integer before any arithmetic
+# context (`[[ "$age" -lt "$SSH_WARM_TTL_SECONDS" ]]` later in the
+# script). A non-numeric override (`OP_PREFLIGHT_SSH_WARM_TTL_SECONDS=foo`)
+# would otherwise abort the run under `set -e` with a "value too great
+# for base" error — one bad local env value would break every cache-hit
+# review. Fall back to the documented default with a warning rather
+# than crashing. (CodeRabbit Major, #272.)
+if [[ ! "$SSH_WARM_TTL_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "# WARNING: OP_PREFLIGHT_SSH_WARM_TTL_SECONDS='$SSH_WARM_TTL_SECONDS' is not a non-negative integer; falling back to default 1800s" >&2
+  SSH_WARM_TTL_SECONDS=1800
+fi
 
 # ── Purge mode ────────────────────────────────────────────────────────
 if $PURGE; then
@@ -196,9 +207,20 @@ if $DRY_RUN; then
   echo "# ADC tempfile:   $ADC_TMPFILE" >&2
   echo "# TTL seconds:    $TTL_SECONDS" >&2
   if [[ -f "$SESSION_FILE" ]]; then
-    embedded=$(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$SESSION_FILE" | cut -d= -f2- | tr -d "'\"")
+    # `|| true` so a missing epoch key doesn't take down dry-run under
+    # set -e + pipefail (grep exits 1 on no match). The numeric-only
+    # validation + `10#` decimal coercion below covers the OTHER bad
+    # case CodeRabbit caught on PR #278: a key present with a garbage
+    # value (e.g. `123abc` errors in arithmetic, or `08` is parsed as
+    # invalid octal). On bad input we fall back to age=$now → huge →
+    # cache miss + refresh (the correct fallback). (CodeRabbit, #272.)
+    embedded=$(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$SESSION_FILE" | cut -d= -f2- | tr -d "'\"" || true)
     now=$(date +%s)
-    age=$((now - ${embedded:-0}))
+    if [[ "$embedded" =~ ^[0-9]+$ ]]; then
+      age=$(( now - 10#$embedded ))
+    else
+      age=$now
+    fi
     echo "# Session age:    ${age}s (TTL ${TTL_SECONDS}s)" >&2
   else
     echo "# Session age:    n/a (no session file)" >&2
@@ -229,7 +251,7 @@ chmod 700 "$CACHE_DIR" 2>/dev/null || true
 session_is_fresh() {
   [[ -f "$SESSION_FILE" ]] || return 1
   local created_at now age
-  created_at=$(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$SESSION_FILE" 2>/dev/null | cut -d= -f2- | tr -d "'\"")
+  created_at=$(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$SESSION_FILE" 2>/dev/null | cut -d= -f2- | tr -d "'\"" || true)
   [[ -z "$created_at" ]] && return 1
   [[ "$created_at" =~ ^[0-9]+$ ]] || return 1
   now=$(date +%s)
@@ -532,7 +554,19 @@ if ! $REFRESH && session_is_fresh; then
   fi
   if [[ "$rc" == "0" ]]; then
     echo "$cached_exports"
-    age=$(( $(date +%s) - $(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$SESSION_FILE" | cut -d= -f2- | tr -d "'\"") ))
+    # `|| true` + numeric-only validation + `10#` decimal coercion so
+    # neither a missing key NOR a garbage value (e.g. `123abc` errors
+    # in arithmetic; `08` is parsed as invalid octal) takes down the
+    # cache-hit path under set -e + pipefail. On bad input we fall
+    # back to age = $now → huge → cache miss + refresh (the correct
+    # fallback). (CodeRabbit Minor on PR #278, #272.)
+    epoch=$(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$SESSION_FILE" | cut -d= -f2- | tr -d "'\"" || true)
+    now=$(date +%s)
+    if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+      age=$(( now - 10#$epoch ))
+    else
+      age=$now
+    fi
     # Warm SSH keys on the cache-hit path too. The cached PATs are
     # worthless for git push/pull if SSH auth isn't also primed, and
     # the prior implementation skipped this step entirely on cache
