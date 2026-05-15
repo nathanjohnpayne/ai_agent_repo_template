@@ -62,10 +62,24 @@ else
   done < <(git ls-files -z)
 fi
 
-# Self-exclusion: skip this script (its comments necessarily mention
-# the forbidden form for documentation) and the script that owns the
-# regression test for #286's mktemp story.
+# Self-exclusion: skip files that LEGITIMATELY contain the BSD-only
+# form as part of their own purpose (documentation, regression test
+# fixtures). Without this set, the check false-flags itself and its
+# own paired test for #286 r3 — nathanpayne-codex Phase 4b finding:
+# the new tests/test_check_mktemp_portability.sh writes heredoc
+# fixtures containing `mktemp -dt mergepath-bad` (the BAD pattern
+# the regex is supposed to catch), and the check scans those
+# fixture strings and flags them.
+#
+# This script: its comments document the forbidden form by name.
+# The paired test file: its heredocs contain the forbidden form
+# AS FIXTURES — the regex catching them inside heredocs is exactly
+# the false positive r3 closes.
 SELF_REL="scripts/ci/check_mktemp_portability"
+EXCLUDE_PATHS=(
+  "scripts/ci/check_mktemp_portability"
+  "tests/test_check_mktemp_portability.sh"
+)
 
 VIOLATIONS=0
 VIOLATION_LIST=""
@@ -100,7 +114,15 @@ PATTERN='mktemp([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*t[[:space:]]+[A-Za
 
 while IFS= read -r file; do
   [[ -z "$file" ]] && continue
-  [[ "$file" == "$SELF_REL" ]] && continue
+  # Skip any path on the self-exclusion list (docs + regression
+  # fixtures that legitimately reference the BSD form). Keep the
+  # SELF_REL variable above as the primary self-skip for readability;
+  # EXCLUDE_PATHS extends it to the paired test file.
+  skip_file=0
+  for ex in "${EXCLUDE_PATHS[@]}"; do
+    if [[ "$file" == "$ex" ]]; then skip_file=1; break; fi
+  done
+  [[ "$skip_file" -eq 1 ]] && continue
   # Filter out:
   #   - comment lines (leading-whitespace `#` — both documentation
   #     comments and shebangs)
