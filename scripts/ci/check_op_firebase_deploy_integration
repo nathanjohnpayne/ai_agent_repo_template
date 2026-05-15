@@ -74,6 +74,17 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 0
 fi
 
+# Capture python3's actual directory so the hermetic per-case PATH
+# below can include it. The hermetic PATH (`$bin_dir:/usr/bin:/bin:
+# /usr/sbin:/sbin`) is correct for shim-PATH semantics but assumes
+# python3 lives under `/usr/bin` — which is true on GitHub Actions
+# runners (most distros) but not on dev macOS where python3 lives
+# under `/opt/homebrew/bin` or `/usr/local/bin`. Without this, the
+# hermetic invocation of the deploy script can't resolve `python3`
+# even though preflight just verified it exists. (nathanpayne-codex
+# Phase 4b r1 on PR #290.)
+PYTHON3_DIR="$(cd "$(dirname "$(command -v python3)")" && pwd -P)"
+
 # ----------------------------------------------------------------------
 # Test harness
 # ----------------------------------------------------------------------
@@ -162,7 +173,7 @@ STUB
   (
     cd "$case_dir"
     env -i \
-      PATH="$bin_dir:/usr/bin:/bin:/usr/sbin:/sbin" \
+      PATH="$bin_dir:$PYTHON3_DIR:/usr/bin:/bin:/usr/sbin:/sbin" \
       HOME="$home_dir" \
       TMPDIR="$tmp_dir" \
       "$DEPLOY_SCRIPT" \
@@ -348,7 +359,7 @@ RUNNER
 
   (
     env -i \
-      PATH="$bin_dir:/usr/bin:/bin:/usr/sbin:/sbin" \
+      PATH="$bin_dir:$PYTHON3_DIR:/usr/bin:/bin:/usr/sbin:/sbin" \
       HOME="$home_dir" \
       TMPDIR="$tmp_dir" \
       "$case_dir/runner.sh" \
