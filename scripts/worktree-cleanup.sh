@@ -214,8 +214,14 @@ worktree_records() {
 }
 
 # ── Gather state ──────────────────────────────────────────────────────
-GONE_FILE=$(mktemp -t wcleanup-gone.XXXXXX)
-REC_FILE=$(mktemp -t wcleanup-rec.XXXXXX)
+# Portable mktemp template (#286 r5): BSD-only `mktemp -t <prefix>`
+# fails closed on GNU coreutils because the template lacks `XXXXXX`
+# placeholders in the right position. The portable form below works
+# on both. Caught by check_mktemp_portability once that check landed
+# from #286 — this fix closes the cross-PR gap (#298 merged the
+# bad form before #286's check was wired into CI).
+GONE_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-gone.XXXXXX")
+REC_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-rec.XXXXXX")
 trap 'rm -f "$GONE_FILE" "$REC_FILE"' EXIT
 
 gone_branches >"$GONE_FILE"
