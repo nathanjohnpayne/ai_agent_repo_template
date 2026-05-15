@@ -62,6 +62,10 @@ command -v gh >/dev/null 2>&1 || {
   echo "post-phase-4b-handoff.sh: gh not on PATH" >&2
   exit 3
 }
+command -v jq >/dev/null 2>&1 || {
+  echo "post-phase-4b-handoff.sh: jq not on PATH (every metadata parse below pipes through jq)" >&2
+  exit 3
+}
 
 # ---------------------------------------------------------------------------
 # Resolve current-repo owner/name once for bare <num> refs. Lazy: if no
@@ -152,30 +156,72 @@ fetch_pr_metadata() {
 
   # Unresolved review threads — best-effort via GraphQL. On failure
   # (auth scope, network), emit "?" rather than hard-failing the
-  # handoff render.
+  # handoff render. Paginate beyond 100 — the prior `first: 100` form
+  # silently undercounted on PRs with >100 review threads (rare but
+  # observable on long-running canonical PRs after multi-round Phase 4b
+  # iterations + heavy CodeRabbit traffic). (nathanpayne-codex Phase 4b
+  # r1 on PR #291.)
   local unresolved="?"
   local owner repo_name
   owner="${owner_name%%/*}"
   repo_name="${owner_name#*/}"
-  local gql
-  gql=$(gh api graphql -f query="
-    query(\$owner: String!, \$name: String!, \$num: Int!) {
-      repository(owner: \$owner, name: \$name) {
-        pullRequest(number: \$num) {
-          reviewThreads(first: 100) {
-            nodes { isResolved }
+  local cursor="null"  # GraphQL `after: null` = start of stream
+  local running_total=0
+  local pages=0
+  local saw_error=0
+  while :; do
+    local gql
+    gql=$(gh api graphql -f query="
+      query(\$owner: String!, \$name: String!, \$num: Int!, \$cursor: String) {
+        repository(owner: \$owner, name: \$name) {
+          pullRequest(number: \$num) {
+            reviewThreads(first: 100, after: \$cursor) {
+              pageInfo { hasNextPage endCursor }
+              nodes { isResolved }
+            }
           }
         }
-      }
-    }" -F owner="$owner" -F name="$repo_name" -F num="$num" 2>/dev/null || true)
-  if [[ -n "$gql" ]]; then
-    local count
-    count=$(printf '%s' "$gql" \
+      }" -F owner="$owner" -F name="$repo_name" -F num="$num" \
+         -F cursor="$cursor" 2>/dev/null || true)
+    if [[ -z "$gql" ]]; then
+      saw_error=1
+      break
+    fi
+    local page_count
+    page_count=$(printf '%s' "$gql" \
       | jq -r '[.data.repository.pullRequest.reviewThreads.nodes[]?
                 | select(.isResolved == false)] | length' 2>/dev/null || echo "")
-    if [[ "$count" =~ ^[0-9]+$ ]]; then
-      unresolved="$count"
+    if [[ ! "$page_count" =~ ^[0-9]+$ ]]; then
+      saw_error=1
+      break
     fi
+    running_total=$((running_total + page_count))
+    local has_next
+    has_next=$(printf '%s' "$gql" \
+      | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false' 2>/dev/null)
+    if [[ "$has_next" != "true" ]]; then
+      break
+    fi
+    cursor=$(printf '%s' "$gql" \
+      | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty' 2>/dev/null)
+    if [[ -z "$cursor" || "$cursor" == "null" ]]; then
+      # Defensive: hasNextPage=true but no cursor returned — bail
+      # rather than infinite-loop.
+      saw_error=1
+      break
+    fi
+    pages=$((pages + 1))
+    if [[ "$pages" -gt 100 ]]; then
+      # Cap at 10,000 threads (100 pages × 100 per page) to prevent
+      # runaway loops on pathological inputs. Vanishingly unlikely to
+      # hit in practice — Phase 4b handoff renders don't fire on PRs
+      # this large — but the cap is cheap insurance.
+      saw_error=1
+      break
+    fi
+  done
+  if [[ "$saw_error" -eq 0 ]]; then
+    unresolved="$running_total"
   fi
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
