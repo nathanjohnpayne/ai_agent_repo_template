@@ -154,6 +154,19 @@ Auto-merge will fire as soon as the label is gone.${REASON_BLOCK}${AUTOCLEAR_NOT
 
 — posted by \`scripts/request-label-removal.sh\`"
 
+# Identity check (#284): the structured ask is a keyring-byline write
+# (per the token policy block above, `gh pr comment` is intentionally
+# unpinned — the byline IS the keyring's active account). Fail closed
+# BEFORE the write if the keyring has drifted from the agent's reviewer
+# identity. Opt-out via REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK=1.
+if [ "${REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK:-0}" != "1" ] && \
+   [ -x "$(dirname "${BASH_SOURCE[0]}")/identity-check.sh" ]; then
+  if ! "$(dirname "${BASH_SOURCE[0]}")/identity-check.sh" --expect-reviewer; then
+    echo "identity-check failed before posting label-removal ask; see stderr above." >&2
+    exit 2
+  fi
+fi
+
 if ! gh pr comment "$PR_NUM" "${REPO_FLAG[@]}" --body "$BODY" >/dev/null; then
   echo "Failed to post comment on PR #$PR_NUM" >&2
   exit 2

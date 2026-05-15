@@ -522,6 +522,18 @@ post_retry_trigger() {
   # triggering identities. See #140 round-3 Codex finding (P2, line 320).
   local mention="@${BOT_LOGIN%\[bot\]}"
   local body="${mention}, try again."
+  # Identity check (#284): the retry trigger is a keyring-byline write
+  # (`gh api -X POST ../comments` attributes to whatever signs the
+  # call; in this helper that's whoever the configured GH_TOKEN
+  # resolves to, but the agent's reviewer identity is the expected
+  # byline). Fail closed BEFORE the write if the keyring has drifted.
+  # Opt-out via CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 (for CI / test
+  # harnesses without a real keyring).
+  if [ "${CODERABBIT_WAIT_SKIP_IDENTITY_CHECK:-0}" != "1" ] && \
+     [ -x "$(dirname "${BASH_SOURCE[0]}")/identity-check.sh" ]; then
+    "$(dirname "${BASH_SOURCE[0]}")/identity-check.sh" --expect-reviewer \
+      || die 3 "identity-check failed before retry-trigger write; see stderr above."
+  fi
   log "posting retry trigger comment to PR #$PR_NUMBER as $mention"
   gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
     -f body="$body" >/dev/null 2>&1 \

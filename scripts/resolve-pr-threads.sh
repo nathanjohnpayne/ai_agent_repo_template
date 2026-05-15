@@ -380,6 +380,28 @@ while IFS= read -r thread; do
     continue
   fi
 
+  # Identity check (#284): the resolveReviewThread mutation is a
+  # graphql write — its byline follows the PAT in GH_TOKEN, NOT the
+  # keyring's active account. Verify the PAT resolves to the expected
+  # reviewer identity before issuing the mutation. Opt-out via
+  # RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1.
+  if [ "${RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK:-0}" != "1" ] && \
+     [ -x "$(dirname "${BASH_SOURCE[0]}")/identity-check.sh" ] && \
+     [ "${IDENTITY_CHECK_FIRED:-0}" != "1" ]; then
+    # Compute expected login from MERGEPATH_AGENT (default claude),
+    # then assert the token in PAT_GH_TOKEN authenticates as that login.
+    expected_login="nathanpayne-${MERGEPATH_AGENT:-claude}"
+    if ! GH_TOKEN="$PAT_GH_TOKEN" \
+         "$(dirname "${BASH_SOURCE[0]}")/identity-check.sh" \
+         --expect-token-identity "$expected_login"; then
+      echo "FAILED [$AUTHOR] $PATH_ — identity-check failed before mutation; see stderr above." >&2
+      FAILED_COUNT=$((FAILED_COUNT + 1))
+      # Mark so we don't re-check inside the same script run.
+      IDENTITY_CHECK_FIRED=1
+      continue
+    fi
+    IDENTITY_CHECK_FIRED=1
+  fi
   if gh_pat api graphql -f query='
     mutation($id: ID!) {
       resolveReviewThread(input: {threadId: $id}) {

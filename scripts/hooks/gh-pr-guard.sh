@@ -32,6 +32,43 @@
 #      merge past Label Gate by removing the label without running
 #      the gate check first.
 #
+# Byline-sensitive command coverage (#284):
+#
+#   Beyond the pr-create / pr-merge gates above, the hook ALSO
+#   guards a class of commands whose byline is identity-load-bearing
+#   in this codebase:
+#
+#     - gh pr comment <PR#> --body "..."
+#     - gh pr review <PR#> --comment / --approve / --request-changes
+#     - gh issue comment <issue#> --body "..."
+#
+#   For all three, the keyring's active account must be the agent's
+#   REVIEWER identity (nathanpayne-<agent>, default nathanpayne-claude;
+#   override via GH_PR_GUARD_EXPECTED_REVIEWER). Posting these as the
+#   AUTHOR identity (nathanjohnpayne) breaks the audit-trail
+#   convention REVIEW_POLICY.md depends on — reviewer comments must
+#   attribute to the reviewer. The check fires before the keyring
+#   write so misattributed comments never land.
+#
+#   Additionally, `gh pr review --approve` is blocked when the
+#   target PR is OVER-threshold AND the keyring is the agent's own
+#   reviewer identity AND the PR's body contains an `Authoring-Agent:`
+#   line that names the SAME agent. This is the no-self-approve
+#   policy from REVIEW_POLICY.md § No-self-approve scoping enforced
+#   at the hook layer: a `claude` reviewer must not approve a PR
+#   whose `Authoring-Agent: claude` line means claude wrote it. The
+#   over/under-threshold determination uses .github/review-policy.yml
+#   if present; without the file the hook conservatively assumes
+#   over-threshold so the self-approve block fires on safer side.
+#
+#   These guards are scoped to `gh pr comment` / `gh pr review` /
+#   `gh issue comment` exactly. Raw `gh api -X POST .../comments` is
+#   intentionally NOT covered in this PR — the token/keyring auth
+#   matrix for raw `gh api` writes is not yet precise enough to
+#   block on without false positives. See REVIEW_POLICY.md
+#   § Operation-to-Identity Matrix (graphql write — PAT-attributed)
+#   for the auth-split context and the follow-up tracked under #284.
+#
 # The identity check (1a) honors a
 # BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK=1 escape hatch for tests
 # that PATH-shim gh and have no real keyring. Production code should
@@ -316,6 +353,7 @@ PR_SUBCOMMAND=""
 PR_SUBCOMMAND_INDEX=-1    # index in TOKENS where the gh pr subcommand was found
 SAW_GH=0
 SAW_PR=0
+SAW_ISSUE=0
 SKIP_GLOBAL_AS=""        # "" | "repo"
 AT_COMMAND_POSITION=1    # 1 = at command position, 0 = walking unrelated-command args
 SEGMENT_HAS_COMMAND=0    # 1 = this segment has seen a non-assignment command (echo, cat, etc.)
@@ -330,10 +368,17 @@ for i in "${!TOKENS[@]}"; do
       SKIP_GLOBAL_AS=""
       continue
     fi
-    if [ "$SAW_PR" -eq 0 ]; then
+    if [ "$SAW_PR" -eq 0 ] && [ "$SAW_ISSUE" -eq 0 ]; then
       case "$tok" in
         pr)
           SAW_PR=1
+          continue
+          ;;
+        issue)
+          # We only guard `gh issue comment`; other gh issue
+          # subcommands fall through to allow. Track that we saw
+          # `issue` so the next iteration captures the subcommand.
+          SAW_ISSUE=1
           continue
           ;;
         -R|--repo)
@@ -356,14 +401,14 @@ for i in "${!TOKENS[@]}"; do
           continue
           ;;
         *)
-          # Non-flag, non-pr token before `pr`. Either gh aliases
-          # are in play (out of scope) or the command isn't a `gh
-          # pr` invocation. Allow.
+          # Non-flag, non-pr, non-issue token before the parent. Either
+          # gh aliases are in play (out of scope) or this is a gh
+          # subcommand we don't guard (repo, workflow, etc.). Allow.
           exit 0
           ;;
       esac
     fi
-    # SAW_PR=1 — this token IS the pr subcommand.
+    # SAW_PR=1 OR SAW_ISSUE=1 — this token IS the subcommand.
     PR_SUBCOMMAND="$tok"
     PR_SUBCOMMAND_INDEX=$i
     break
@@ -531,8 +576,239 @@ EFFECTIVE_CODEX_CLEARED="${CODEX_CLEARED:-${INLINE_CODEX_CLEARED:-}}"
 EFFECTIVE_BREAK_GLASS_ADMIN="${BREAK_GLASS_ADMIN:-${INLINE_BREAK_GLASS_ADMIN:-}}"
 EFFECTIVE_BREAK_GLASS_MERGE_STATE="${BREAK_GLASS_MERGE_STATE:-${INLINE_BREAK_GLASS_MERGE_STATE:-}}"
 
-# Not a pr create/merge command? Allow.
-if [ "$PR_SUBCOMMAND" != "create" ] && [ "$PR_SUBCOMMAND" != "merge" ]; then
+# Distinguish `gh pr comment` from `gh issue comment` — both share the
+# same subcommand label `comment` but route through different parent
+# tokens. We track this with IS_ISSUE_COMMENT so downstream guard
+# branches can emit the right diagnostic label.
+IS_ISSUE_COMMENT=0
+if [ "$SAW_ISSUE" -eq 1 ] && [ "$PR_SUBCOMMAND" = "comment" ]; then
+  IS_ISSUE_COMMENT=1
+fi
+
+# A `gh issue <X>` invocation where X is anything OTHER than `comment`
+# (issue create / close / view / list / etc.) is out of scope for this
+# PR. Allow.
+if [ "$SAW_ISSUE" -eq 1 ] && [ "$IS_ISSUE_COMMENT" -eq 0 ]; then
+  exit 0
+fi
+
+# Not a covered command? Allow.
+if [ "$PR_SUBCOMMAND" != "create" ] && \
+   [ "$PR_SUBCOMMAND" != "merge" ] && \
+   [ "$PR_SUBCOMMAND" != "comment" ] && \
+   [ "$PR_SUBCOMMAND" != "review" ] && \
+   [ "$IS_ISSUE_COMMENT" -eq 0 ]; then
+  exit 0
+fi
+
+# --- byline guard for pr comment / pr review / issue comment ----------
+#
+# These three subcommands share a single policy: the keyring's active
+# account must be the agent's REVIEWER identity (not the author
+# identity). Posting any of them under nathanjohnpayne mis-attributes
+# the byline in a way that breaks the audit-trail invariant
+# REVIEW_POLICY.md depends on.
+#
+# The `gh pr review --approve` self-approve sub-guard runs after this
+# block — only if we made it past the basic byline check does the
+# self-approve question even arise.
+EXPECTED_REVIEWER="${GH_PR_GUARD_EXPECTED_REVIEWER:-nathanpayne-claude}"
+if [ "$PR_SUBCOMMAND" = "comment" ] || [ "$PR_SUBCOMMAND" = "review" ] || [ "$IS_ISSUE_COMMENT" -eq 1 ]; then
+  if [ "${BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
+    ACTIVE_GH_USER=$(gh config get -h github.com user 2>/dev/null || echo "")
+    if [ -z "$ACTIVE_GH_USER" ]; then
+      echo "BLOCKED: gh-pr-guard could not read the active gh account from 'gh config get -h github.com user'." >&2
+      echo "  Either gh is not installed/authenticated, or the keyring config is corrupt." >&2
+      echo "  Run 'gh auth login' for the $EXPECTED_REVIEWER identity, then retry." >&2
+      exit 2
+    fi
+    # Block when active is the author identity. Any other identity is
+    # allowed through here (the reviewer-vs-author split is the
+    # load-bearing distinction in this codebase); a downstream consumer
+    # that wires up a third identity per agent can override
+    # GH_PR_GUARD_EXPECTED_REVIEWER to match.
+    EXPECTED_AUTHOR_FOR_BLOCK="${GH_PR_GUARD_EXPECTED_AUTHOR:-nathanjohnpayne}"
+    if [ "$ACTIVE_GH_USER" = "$EXPECTED_AUTHOR_FOR_BLOCK" ]; then
+      cmd_label=""
+      case "$PR_SUBCOMMAND" in
+        comment) cmd_label="gh pr comment" ;;
+        review)  cmd_label="gh pr review" ;;
+      esac
+      [ "$IS_ISSUE_COMMENT" -eq 1 ] && cmd_label="gh issue comment"
+      echo "BLOCKED: $cmd_label is about to run under active account '$ACTIVE_GH_USER' (the AUTHOR identity)." >&2
+      echo "" >&2
+      echo "  Reviewer-byline commands (pr comment / pr review / issue comment) must attribute to the" >&2
+      echo "  agent's REVIEWER identity ('$EXPECTED_REVIEWER' by default), not the author identity." >&2
+      echo "  Posting as '$EXPECTED_AUTHOR_FOR_BLOCK' breaks the audit-trail convention" >&2
+      echo "  REVIEW_POLICY.md depends on." >&2
+      echo "" >&2
+      echo "  Fix once: gh auth switch -u $EXPECTED_REVIEWER" >&2
+      echo "  Or wrap the single call: scripts/gh-as-reviewer.sh -- $cmd_label ..." >&2
+      echo "  See REVIEW_POLICY.md § Operation-to-Identity Matrix." >&2
+      exit 2
+    fi
+  fi
+fi
+
+# --- gh pr review --approve self-approve sub-guard --------------------
+#
+# Over-threshold PRs may NOT be approved by the agent that authored
+# them, per REVIEW_POLICY.md § No-self-approve scoping. The hook
+# detects:
+#   - PR_SUBCOMMAND=review with --approve in the args
+#   - active keyring identity = nathanpayne-<agent>
+#   - PR body contains `Authoring-Agent: <agent>` matching the same
+#     agent suffix
+#   - PR is over-threshold (determined from .github/review-policy.yml
+#     when readable; assumed over-threshold when the file is missing)
+#
+# When all four conditions hold the hook blocks. The author of the PR
+# must use a DIFFERENT reviewer identity (the cross-agent review path
+# in Phase 4) to approve.
+if [ "$PR_SUBCOMMAND" = "review" ]; then
+  # Walk tokens AFTER the literal `review` subcommand looking for
+  # `--approve` and a PR selector (first non-flag positional).
+  REVIEW_APPROVE=0
+  REVIEW_PR_SELECTOR=""
+  REVIEW_REPO=""
+  review_skip_next=""
+  review_walk_start=$((PR_SUBCOMMAND_INDEX + 1))
+  for j in "${!TOKENS[@]}"; do
+    if [ "$j" -lt "$review_walk_start" ]; then
+      continue
+    fi
+    tok="${TOKENS[$j]}"
+    if [ "$review_skip_next" = "skip" ]; then
+      review_skip_next=""
+      continue
+    fi
+    if [ "$review_skip_next" = "repo" ]; then
+      REVIEW_REPO="$tok"
+      review_skip_next=""
+      continue
+    fi
+    case "$tok" in
+      --approve|-a)
+        REVIEW_APPROVE=1
+        continue
+        ;;
+      --repo|-R)
+        review_skip_next="repo"
+        continue
+        ;;
+      --repo=*)
+        REVIEW_REPO="${tok#--repo=}"
+        continue
+        ;;
+      -R=*)
+        REVIEW_REPO="${tok#-R=}"
+        continue
+        ;;
+      --body|-b|--body-file|-F)
+        review_skip_next="skip"
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+    esac
+    if [ -z "$REVIEW_PR_SELECTOR" ]; then
+      REVIEW_PR_SELECTOR="$tok"
+    fi
+  done
+  if [ -z "$REVIEW_REPO" ] && [ -n "$GLOBAL_REPO" ]; then
+    REVIEW_REPO="$GLOBAL_REPO"
+  fi
+
+  if [ "$REVIEW_APPROVE" -eq 1 ] && [ "${BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
+    # The keyring read above (in the byline guard) ran a check, but
+    # we need to re-read here in case the byline guard was bypassed.
+    ACTIVE_GH_USER=$(gh config get -h github.com user 2>/dev/null || echo "")
+
+    # Extract the agent suffix from the active identity. We only
+    # apply self-approve detection when the active identity matches
+    # the nathanpayne-<agent> pattern; other identities go through
+    # without this sub-guard.
+    KEYRING_AGENT=""
+    case "$ACTIVE_GH_USER" in
+      nathanpayne-*) KEYRING_AGENT="${ACTIVE_GH_USER#nathanpayne-}" ;;
+    esac
+
+    if [ -n "$KEYRING_AGENT" ]; then
+      # Fetch PR body + lines-changed to determine (a) the
+      # Authoring-Agent line and (b) over-threshold status.
+      review_gh_args=(pr view --json body,additions,deletions,files --jq '{body: .body, additions: .additions, deletions: .deletions, files: [.files[].path]}')
+      if [ -n "$REVIEW_PR_SELECTOR" ]; then
+        review_gh_args=(pr view "$REVIEW_PR_SELECTOR" --json body,additions,deletions,files --jq '{body: .body, additions: .additions, deletions: .deletions, files: [.files[].path]}')
+      fi
+      if [ -n "$REVIEW_REPO" ]; then
+        review_gh_args+=(--repo "$REVIEW_REPO")
+      fi
+      REVIEW_GH_STDERR=$(mktemp)
+      # Append to the EXIT trap (the merge path may overwrite it
+      # below; we do this here so it works on the review-only exit
+      # path too).
+      trap 'rm -f "$TMP_TOKENS" "$TMP_TOKENS_ERR" "$REVIEW_GH_STDERR"' EXIT
+      if ! REVIEW_PR_JSON=$(gh "${review_gh_args[@]}" 2>"$REVIEW_GH_STDERR"); then
+        echo "BLOCKED: gh-pr-guard could not fetch PR metadata for self-approve check." >&2
+        echo "  stderr: $(cat "$REVIEW_GH_STDERR")" >&2
+        echo "  command: gh ${review_gh_args[*]}" >&2
+        exit 2
+      fi
+
+      PR_AUTHORING_AGENT=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oiE 'Authoring-Agent:[[:space:]]*[A-Za-z0-9_-]+' | head -1 | sed -E 's/Authoring-Agent:[[:space:]]*//I' | tr '[:upper:]' '[:lower:]' || true)
+
+      if [ -n "$PR_AUTHORING_AGENT" ] && [ "$PR_AUTHORING_AGENT" = "$KEYRING_AGENT" ]; then
+        # Same-agent author + reviewer. Decide over/under-threshold.
+        # Heuristic: parse `external_review_threshold` from
+        # .github/review-policy.yml (line count); compute
+        # additions + deletions from the PR JSON; over if sum >= threshold
+        # OR threshold can't be determined (fail safe).
+        threshold=""
+        policy_path=".github/review-policy.yml"
+        if [ -f "$policy_path" ]; then
+          threshold=$(grep -oE '^[[:space:]]*external_review_threshold:[[:space:]]*[0-9]+' "$policy_path" | head -1 | grep -oE '[0-9]+$' || true)
+        fi
+        additions=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oE '"additions"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' | head -1 || true)
+        deletions=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oE '"deletions"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' | head -1 || true)
+        additions=${additions:-0}
+        deletions=${deletions:-0}
+        total=$((additions + deletions))
+
+        is_over=1
+        if [ -n "$threshold" ] && [ "$total" -lt "$threshold" ]; then
+          is_over=0
+        fi
+
+        if [ "$is_over" -eq 1 ]; then
+          echo "BLOCKED: self-approve detected on an over-threshold PR." >&2
+          echo "" >&2
+          echo "  Active keyring identity: $ACTIVE_GH_USER" >&2
+          echo "  PR Authoring-Agent:      $PR_AUTHORING_AGENT" >&2
+          echo "  PR size:                 $total lines changed (threshold: ${threshold:-unknown})" >&2
+          echo "" >&2
+          echo "  REVIEW_POLICY.md § No-self-approve scoping forbids the same agent identity that authored" >&2
+          echo "  a Phase 4 (over-threshold) PR from approving it. Post --comment instead, and let the" >&2
+          echo "  cross-agent merge gate (Codex 👍 for Phase 4a, or external CLI APPROVED for Phase 4b)" >&2
+          echo "  carry the approval." >&2
+          echo "" >&2
+          echo "  If this PR is actually under-threshold and the heuristic mis-classified it, set" >&2
+          echo "  BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK=1 for the single call (the identity check" >&2
+          echo "  bypass also disables this sub-guard)." >&2
+          exit 2
+        fi
+      fi
+    fi
+  fi
+
+  # gh pr review (any flavor) is a write — but it's not a merge or
+  # create, so the rest of the merge guard doesn't apply. Allow.
+  exit 0
+fi
+
+# gh pr comment / gh issue comment: byline guard already ran. No
+# further checks apply.
+if [ "$PR_SUBCOMMAND" = "comment" ] || [ "$IS_ISSUE_COMMENT" -eq 1 ]; then
   exit 0
 fi
 

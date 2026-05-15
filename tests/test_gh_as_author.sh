@@ -76,6 +76,14 @@ case "$1 $2" in
     # Args: auth switch -u <user>
     rc="${GH_SWITCH_RC:-0}"
     if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+    # #284 silent-no-op flavor: when GH_SWITCH_SILENT_NOOP=1, return 0
+    # without updating the ACTIVE_STATE_FILE. This simulates the
+    # observed adversarial failure mode (corrupt hosts.yml, mocked
+    # gh, concurrent-switch race) that the post-switch verification
+    # is designed to catch.
+    if [ "${GH_SWITCH_SILENT_NOOP:-0}" = "1" ]; then
+      exit 0
+    fi
     # Find -u value
     shift; shift # consume `auth switch`
     while [ "$#" -gt 0 ]; do
@@ -371,6 +379,36 @@ if grep -qE $'^gh\tauth\tswitch\t-u\tnathanpayne-claude$' "$WORKDIR/calls.log"; 
 else
   fail "fail-closed (gh pr view error): trap EXIT switch-back did NOT fire"
   cat "$WORKDIR/calls.log" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 9 (#284): post-switch verification failure. The stub returns 0
+# from `gh auth switch` WITHOUT updating the active-state file —
+# simulating a silent-no-op switch (corrupt hosts.yml / mocked gh /
+# concurrent-switch race). The wrapper must fail closed before
+# running the wrapped command, NOT proceed to gh pr create under the
+# wrong identity. Exit code 2 (switch failure) and a clear diagnostic.
+# ---------------------------------------------------------------------------
+GH_INITIAL_ACTIVE="nathanpayne-claude" \
+reset_state
+
+set +e
+stderr_capture=$(
+  GH_INITIAL_ACTIVE="nathanpayne-claude" \
+  GH_SWITCH_SILENT_NOOP=1 \
+    run_wrapper -- gh pr merge 1 --squash 2>&1 1>/dev/null
+)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "post-switch verify (silent no-op): wrapper exited $rc, expected 2"
+elif ! echo "$stderr_capture" | grep -qi "POST-SWITCH VERIFICATION FAILED"; then
+  fail "post-switch verify (silent no-op): missing 'POST-SWITCH VERIFICATION FAILED' diagnostic; stderr: $stderr_capture"
+elif grep -qE $'^gh\tpr\tmerge\t' "$WORKDIR/calls.log"; then
+  fail "post-switch verify (silent no-op): wrapped gh pr merge SHOULD NOT have run"
+  cat "$WORKDIR/calls.log" >&2
+else
+  pass "post-switch verify (silent no-op): exit 2 BEFORE wrapped command runs"
 fi
 
 # ---------------------------------------------------------------------------

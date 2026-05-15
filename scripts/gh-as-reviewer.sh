@@ -61,6 +61,24 @@ if ! gh auth switch -u "$REVIEWER" >/dev/null 2>&1; then
   exit 2
 fi
 
+# Post-switch verification (#284). `gh auth switch` can silently no-op
+# under adversarial conditions (corrupt hosts.yml, concurrent switch
+# in another process, mock gh in PATH). The post-switch read closes
+# the loop: if `gh config get -h github.com user` does NOT equal the
+# identity we just asked for, fail closed BEFORE running the wrapped
+# command. Same shape as the gh-as-author.sh check.
+POST_SWITCH_USER=$(gh config get -h github.com user 2>/dev/null || echo "")
+if [ "$POST_SWITCH_USER" != "$REVIEWER" ]; then
+  echo "gh-as-reviewer: POST-SWITCH VERIFICATION FAILED." >&2
+  echo "gh-as-reviewer:   Requested: gh auth switch -u $REVIEWER" >&2
+  echo "gh-as-reviewer:   Actual active after switch: '$POST_SWITCH_USER'" >&2
+  echo "gh-as-reviewer:   The switch returned 0 but the keyring's active account is unchanged." >&2
+  echo "gh-as-reviewer:   Likely causes: corrupt ~/.config/gh/hosts.yml, a concurrent" >&2
+  echo "gh-as-reviewer:   gh auth switch in another process, or a mock 'gh' in PATH that" >&2
+  echo "gh-as-reviewer:   silently no-ops auth switch. Investigate before retrying." >&2
+  exit 2
+fi
+
 [ "${1:-}" = "--" ] && shift
 
 # Fail fast on an empty wrapped command. Without this, `"$@"` below

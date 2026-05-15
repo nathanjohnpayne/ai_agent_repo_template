@@ -96,6 +96,16 @@ paths:
   - path: scripts/gh-as-reviewer.sh
     type: canonical
     consumers: all
+  # Pre-action identity check (#284) — the assertion helper that every
+  # WRITE-path helper script calls at the top to fail-close on
+  # active-account drift. Travels with the helper scripts that depend
+  # on it (coderabbit-wait, codex-review-request, resolve-pr-threads,
+  # request-label-removal, gh-as-*); without this propagated, those
+  # helpers' identity-check call would silently no-op (the -x test
+  # would return false).
+  - path: scripts/identity-check.sh
+    type: canonical
+    consumers: all
   - path: scripts/hooks/gh-pr-guard.sh
     type: canonical
     consumers: all
@@ -120,6 +130,13 @@ paths:
     type: canonical
     consumers: all
   - path: tests/test_gh_as_reviewer.sh
+    type: canonical
+    consumers: all
+  # Pairs with scripts/identity-check.sh (#284). The helper is called
+  # from the top of every WRITE-path helper script; the test exercises
+  # all four assert modes against `gh config get` shims plus an
+  # `--expect-token-identity` mismatch case.
+  - path: tests/test_identity_check.sh
     type: canonical
     consumers: all
   # Pairs with scripts/workflow/verify-propagation-pr.sh (under the

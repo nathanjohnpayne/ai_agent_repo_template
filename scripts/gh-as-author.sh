@@ -106,6 +106,27 @@ if ! gh auth switch -u "$AUTHOR" >/dev/null 2>&1; then
   exit 2
 fi
 
+# Post-switch verification (#284). `gh auth switch` can silently no-op
+# in adversarial conditions: a corrupted hosts.yml, a concurrent
+# `gh auth switch` racing with this one, or (most commonly) a CI
+# environment where the keyring is mocked/stubbed and the switch is a
+# no-op. The post-switch read closes the loop: if `gh config get -h
+# github.com user` does NOT equal the identity we just asked for,
+# fail closed BEFORE running the wrapped write command. This catches
+# the silent-failure flavor of the #241 footgun that rc-check alone
+# misses.
+POST_SWITCH_USER=$(gh config get -h github.com user 2>/dev/null || echo "")
+if [ "$POST_SWITCH_USER" != "$AUTHOR" ]; then
+  echo "gh-as-author: POST-SWITCH VERIFICATION FAILED." >&2
+  echo "gh-as-author:   Requested: gh auth switch -u $AUTHOR" >&2
+  echo "gh-as-author:   Actual active after switch: '$POST_SWITCH_USER'" >&2
+  echo "gh-as-author:   The switch returned 0 but the keyring's active account is unchanged." >&2
+  echo "gh-as-author:   Likely causes: corrupt ~/.config/gh/hosts.yml, a concurrent" >&2
+  echo "gh-as-author:   gh auth switch in another process, or a mock 'gh' in PATH that" >&2
+  echo "gh-as-author:   silently no-ops auth switch. Investigate before retrying." >&2
+  exit 2
+fi
+
 # Strip leading `--` if present so callers can use the conventional
 # disambiguator `scripts/gh-as-author.sh -- gh pr create ...`.
 [ "${1:-}" = "--" ] && shift

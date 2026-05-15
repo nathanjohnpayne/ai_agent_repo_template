@@ -143,6 +143,87 @@ process-overkill approve on a small, self-contained PR. This matches
 the Phase 2 "Steps 4–6 repeat until the reviewer identity approves"
 text below.
 
+### Operation-to-Identity Matrix
+
+The narrative above (and the rest of this document) talks about
+"reviewer identity" vs "author identity" as if every `gh` write went
+through the same auth layer. It doesn't. `gh` resolves byline
+attribution along two distinct axes depending on which subcommand is
+running:
+
+- **Keyring-attributed writes.** Every `gh pr ...` and `gh issue ...`
+  subcommand attributes its byline to the keyring's **active**
+  account (read with `gh config get -h github.com user`). `GH_TOKEN`
+  is ignored for byline purposes on this path; it only authenticates
+  the API call. To change the byline you change the active account
+  (`gh auth switch -u <login>`), wrapped via `scripts/gh-as-author.sh`
+  or `scripts/gh-as-reviewer.sh` for safety.
+
+- **PAT-attributed writes.** `gh api graphql` mutations (the most
+  common is `resolveReviewThread`) attribute their byline to the
+  identity that owns the **PAT in `GH_TOKEN`**, NOT the keyring's
+  active account. To change the byline you change `GH_TOKEN`. The
+  keyring's active account is irrelevant on this path.
+
+The matrix below names the canonical operations the codebase uses and
+their required identity on each axis. "(graphql write — PAT-attributed)"
+in the keyring column means the keyring's active account does not
+affect the byline for that row; the byline follows `GH_TOKEN`.
+
+| Operation | Keyring active (`gh config get`) | `GH_TOKEN` PAT (read-path) |
+|-----------|----------------------------------|----------------------------|
+| `gh pr create` | `nathanjohnpayne` (use `scripts/gh-as-author.sh`) | any author-readable PAT |
+| `gh pr merge` (squash/rebase) | `nathanjohnpayne` (use `scripts/gh-as-author.sh`) | any author-readable PAT |
+| `gh pr edit` (general — title/body) | `nathanjohnpayne` (use `scripts/gh-as-author.sh`) | any author-readable PAT |
+| `gh pr edit --remove-label <protected>` | **BLOCKED** by `scripts/hooks/label-removal-guard.sh` for `needs-external-review` / `needs-human-review` / `policy-violation`; use `scripts/request-label-removal.sh` | n/a |
+| `gh pr comment` | `nathanpayne-<agent>` (agent identity); blocked when active is `nathanjohnpayne` per `scripts/hooks/gh-pr-guard.sh` (#284) | reviewer PAT (`$OP_PREFLIGHT_REVIEWER_PAT`) |
+| `gh pr review --comment` | `nathanpayne-<agent>`; blocked when active is `nathanjohnpayne` (#284) | reviewer PAT |
+| `gh pr review --approve` (under-threshold) | `nathanpayne-<agent>`; allowed when PR's `Authoring-Agent:` matches the agent (the intended path) | reviewer PAT |
+| `gh pr review --approve` (over-threshold, same agent) | **BLOCKED** by `scripts/hooks/gh-pr-guard.sh` per § No-self-approve scoping (#284) | n/a |
+| `gh pr review --approve` (over-threshold, cross-agent) | `nathanpayne-<other-agent>`; the cross-agent reviewer identity per Phase 4 | reviewer PAT |
+| `gh pr view` (read) | any (does not write) | any read-capable PAT |
+| `gh issue create` | `nathanpayne-<agent>` (agent files the issue, e.g. post-merge follow-ups per AGENTS.md step 11) | reviewer PAT |
+| `gh issue comment` | `nathanpayne-<agent>`; blocked when active is `nathanjohnpayne` (#284) | reviewer PAT |
+| `gh issue close` | any (out of #284 scope — not yet hook-gated) | any |
+| `gh api GET ...` | irrelevant (read-only) | any read-capable PAT |
+| `gh api -X POST repos/.../issues/<N>/comments` | keyring-active byline (same as `gh pr comment`) | reviewer PAT for auth |
+| `gh api -X POST repos/.../pulls/<N>/reviews` | keyring-active byline (same as `gh pr review`) | reviewer PAT for auth |
+| `gh api graphql resolveReviewThread` | (graphql write — PAT-attributed) | reviewer PAT — `GH_TOKEN` IS the byline |
+| `gh workflow run` | n/a (dispatches GHA workflow; no comment byline) | author or reviewer PAT with `workflow` scope |
+
+Notes on auth-split nuance:
+
+- **Why `gh api graphql` is PAT-attributed.** The REST endpoints under
+  `gh pr` / `gh issue` use the `users` byline from the API call's
+  authenticating identity, which `gh` resolves from the keyring's
+  active account on those paths. The graphql endpoints (`POST
+  /graphql` underneath `gh api graphql ...`) authenticate solely via
+  the bearer token in `Authorization: Bearer <token>` — there is no
+  keyring fallback. As a result, the byline of a mutation like
+  `resolveReviewThread` follows whatever PAT signs the call. `scripts/
+  resolve-pr-threads.sh` pins `GH_TOKEN` to `$OP_PREFLIGHT_REVIEWER_PAT`
+  before the mutation, and the pre-action identity check uses
+  `--expect-token-identity` (NOT `--expect-reviewer`) to verify.
+
+- **Why `gh pr comment` is keyring-attributed even when `GH_TOKEN` is
+  set.** When the keyring has an authenticated entry, `gh` prefers
+  it over `GH_TOKEN` for byline purposes on REST writes. Empirically
+  observed on PRs #181/#182: with `GH_TOKEN` set to the reviewer PAT
+  and the keyring's active account = `nathanjohnpayne`, `gh pr
+  review` posted as `nathanjohnpayne`, not as the reviewer identity
+  the PAT belonged to. See `op-preflight.sh` for the auto-restore
+  that closes this drift window (#284).
+
+- **Pre-action identity check.** Every helper that posts a write
+  (`coderabbit-wait.sh`, `codex-review-request.sh`,
+  `resolve-pr-threads.sh`, `request-label-removal.sh`, `gh-as-*.sh`)
+  calls `scripts/identity-check.sh` BEFORE the write. The check is
+  fail-closed: if the keyring's active account (or `GH_TOKEN`'s
+  resolved login, depending on the auth path) doesn't match the
+  expected identity, the helper exits with a diagnostic rather than
+  landing a misattributed write. See #283 for the in-session
+  incidents that motivated the check, and #284 for the implementation.
+
 ## Workflow
 
 ### Phase 0: Credential Preflight
