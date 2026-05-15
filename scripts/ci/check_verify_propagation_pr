@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# scripts/ci/check_verify_propagation_pr — CI entry point for the
+# propagation-PR review lane's faithful-mirror verifier (#264 / #268).
+#
+# Wraps tests/test_verify_propagation_pr.sh so the repo_lint workflow's
+# "run all scripts/ci/check_*" loop picks it up. The verifier
+# (scripts/workflow/verify-propagation-pr.sh) is security-load-bearing
+# — it is what makes it safe for the lane to skip Phase 4 external
+# review — so its test suite is a hard CI gate.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_verify_propagation_pr.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  # Missing test script is a hard error, not a skip — silent-skip
+  # would let an accidental delete/rename disable this check
+  # without surfacing in CI.
+  echo "check_verify_propagation_pr: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"

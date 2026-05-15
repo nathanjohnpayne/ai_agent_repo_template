@@ -110,22 +110,32 @@ if ! [[ "$PR_NUM" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
-# Resolve the read PAT once + define the wrapper before any `gh`
+# Resolve the reviewer PAT once + define the wrapper before any `gh`
 # call. CR Major on PR #194 r4 caught that the bare `gh repo view`
 # and `gh api` invocations below this point would still hit the
 # empty-GH_TOKEN keyring-fallback trap. Centralizing the wrapper
-# above all read-path gh calls fixes it.
-READ_GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}"
-gh_read() {
-  if [ -n "$READ_GH_TOKEN" ]; then
-    GH_TOKEN="$READ_GH_TOKEN" gh "$@"
+# above all gh calls fixes it.
+#
+# `gh_pat` (renamed from `gh_read` — CodeRabbit Major #271/#272) is
+# used for BOTH the read-path calls AND the resolveReviewThread
+# WRITE mutation. The mutation previously used a bare `gh api
+# graphql`: in a CI context where only OP_PREFLIGHT_REVIEWER_PAT is
+# populated (no ambient GH_TOKEN), that bare call would fall back to
+# the keyring — wrong identity, or an outright failure — after every
+# read had passed. Pinning the same PAT on the mutation keeps reads
+# and the write consistent. The name is now token-centric, not
+# read-centric, to reflect that.
+PAT_GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}"
+gh_pat() {
+  if [ -n "$PAT_GH_TOKEN" ]; then
+    GH_TOKEN="$PAT_GH_TOKEN" gh "$@"
   else
     gh "$@"
   fi
 }
 
 if [ -z "$REPO" ]; then
-  REPO=$(gh_read repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
+  REPO=$(gh_pat repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
     echo "Could not resolve repo. Pass --repo owner/name." >&2
     exit 2
   }
@@ -148,7 +158,7 @@ NAME="${REPO#*/}"
 # to verify each thread's latest comment is on the current HEAD before
 # resolving. Codex P2 on PR #172 caught that the docstring promised
 # this check but the code didn't enforce it.
-HEAD_OID=$(gh_read api "repos/$OWNER/$NAME/pulls/$PR_NUM" --jq .head.sha 2>/dev/null) || {
+HEAD_OID=$(gh_pat api "repos/$OWNER/$NAME/pulls/$PR_NUM" --jq .head.sha 2>/dev/null) || {
   echo "Could not resolve PR HEAD oid for $REPO#$PR_NUM" >&2
   exit 2
 }
@@ -237,13 +247,13 @@ while :; do
   # Read-path: pin to preflight reviewer PAT when available; otherwise
   # let gh use its keyring fallback (no empty-GH_TOKEN trap).
   if [ -z "$CURSOR" ]; then
-    PAGE=$(gh_read api graphql -f query="$QUERY" \
+    PAGE=$(gh_pat api graphql -f query="$QUERY" \
       -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -F cursor=null 2>&1) || {
       echo "GraphQL query failed: $PAGE" >&2
       exit 2
     }
   else
-    PAGE=$(gh_read api graphql -f query="$QUERY" \
+    PAGE=$(gh_pat api graphql -f query="$QUERY" \
       -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -f cursor="$CURSOR" 2>&1) || {
       echo "GraphQL query failed: $PAGE" >&2
       exit 2
@@ -370,7 +380,7 @@ while IFS= read -r thread; do
     continue
   fi
 
-  if gh api graphql -f query='
+  if gh_pat api graphql -f query='
     mutation($id: ID!) {
       resolveReviewThread(input: {threadId: $id}) {
         thread { isResolved }
@@ -410,5 +420,15 @@ echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale
 #       conversation-resolution-blocked; address and retry
 #   0 = no unresolved threads on current HEAD
 [ "$FAILED_COUNT" -gt 0 ] && exit 2
-[ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] && exit 3
+# Use an explicit `if`, not `[ a ] || [ b ] && exit 3`. In that
+# one-liner `&&` and `||` are equal-precedence and left-associative,
+# so it parses as `([ a ] || [ b ]) && exit 3` — and under
+# `set -e`, when BOTH skip counts are 0 the `[ b ]` that ends the
+# `||` chain returns non-zero, making the whole list's status
+# non-zero; whether that trips `set -e` depends on subtle list-tail
+# rules. The `if` form is unambiguous and matches the block above.
+# (CodeRabbit Major, #271/#272.)
+if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ]; then
+  exit 3
+fi
 exit 0

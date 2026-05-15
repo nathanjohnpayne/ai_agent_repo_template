@@ -1,0 +1,331 @@
+name: Weekly cross-repo drift audit
+
+# Runs `scripts/sync-to-downstream.sh --audit` weekly to surface drift
+# between mergepath's canonical/kit surface and the downstream consumers
+# declared in `.mergepath-sync.yml`. See #168 for the propagation design
+# and #215 for the `--audit` mode itself.
+#
+# Scope — read-only, on purpose:
+#   This workflow ONLY runs `--audit`. It never runs `--sync-all` and
+#   never opens consumer PRs. Auto-opening ~8 consumer PRs every week is
+#   too aggressive; the cron's job is *visibility*, not propagation. A
+#   human (or `scripts/sync-to-downstream.sh <commit-ish>`) drives the
+#   actual propagation when drift is real.
+#
+# What it does on drift (`--audit` exits 1):
+#   1. Writes a GitHub Actions job summary ($GITHUB_STEP_SUMMARY) with
+#      the full per-consumer audit output, so drift is visible directly
+#      on the run page.
+#   2. Opens-or-updates a SINGLE tracking issue labelled
+#      `propagation-drift`. It does not open a new issue every week —
+#      it finds the existing open one and updates its body, or opens
+#      one only if none exists. On a clean audit it closes any open
+#      tracking issue.
+#
+# Auth model:
+#   `scripts/sync-to-downstream.sh --audit` clones each consumer repo
+#   (`gh repo clone`) and `git fetch`es cached clones. Several consumers
+#   in `.mergepath-sync.yml` are private, so the default `GITHUB_TOKEN`
+#   (scoped to this repo only) is insufficient. We use
+#   `secrets.REVIEWER_ASSIGNMENT_TOKEN` — the cross-repo `nathanpayne-claude`
+#   PAT already wired into `pr-audit.yml` and `weekly-feedback-sweep.yml`
+#   for exactly this kind of cross-repo read. `gh auth setup-git` wires
+#   that token into git's credential helper so the script's `git fetch`
+#   on cached clones authenticates too.
+#
+# `--audit` exit codes (see scripts/sync-to-downstream.sh header):
+#   0  clean — no drift
+#   1  drift detected on at least one consumer x path
+#   2  usage error / missing prerequisite (yq, manifest, ...)
+#   3  fetch error — a consumer repo was unreachable
+# A fetch error (3) is an infrastructure failure, NOT drift: the
+# workflow fails loudly on 2 and 3 and does NOT touch the tracking
+# issue, so a transient outage never gets mislabelled as drift.
+
+on:
+  schedule:
+    # Mondays 08:00 UTC — an hour before pr-audit.yml / the feedback
+    # sweep (both 09:00 UTC), so a drift issue is already open when
+    # the human's weekly planning window starts.
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    name: Audit downstream consumers for drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TRACKING_LABEL: propagation-drift
+      ISSUE_TITLE: 'Cross-repo propagation drift detected'
+    steps:
+      - name: Checkout mergepath
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install yq (mikefarah/yq v4)
+        # sync-to-downstream.sh requires mikefarah/yq v4+. The
+        # ubuntu-latest runner ships a 4.x today, but pin so a
+        # base-image change can't silently swap the parser.
+        run: |
+          set -euo pipefail
+          # Accept an already-present yq ONLY if it is mikefarah/yq AND
+          # major version 4+ — sync-to-downstream.sh's own require_yq()
+          # rejects the kislyuk Python yq, and v3/v5 would parse the
+          # manifest differently. A bare "mikefarah/yq" grep would let a
+          # v3 install through.
+          if command -v yq >/dev/null 2>&1 \
+             && yq --version 2>&1 | grep -Eq 'mikefarah/yq.*version v[4-9]\.'; then
+            echo "yq already present: $(yq --version)"
+          else
+            YQ_VERSION="v4.44.3"
+            YQ_ASSET="yq_linux_amd64"
+            tmp_yq="$(mktemp)"
+            tmp_sums="$(mktemp)"
+            tmp_order="$(mktemp)"
+            # Download the binary + the release `checksums` and
+            # `checksums_hashes_order` files and verify sha256 before
+            # installing — the binary runs with sudo, so an unverified
+            # download is a supply-chain hole.
+            curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_ASSET}" -o "$tmp_yq"
+            curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/checksums" -o "$tmp_sums"
+            curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/checksums_hashes_order" -o "$tmp_order"
+            # mikefarah/yq's `checksums` rows are multi-hash:
+            #   <asset> <hash_1> <hash_2> ... <hash_N>
+            # where the hash column order is given by
+            # `checksums_hashes_order` (one hash name per line, 1-based).
+            # SHA-256 is NOT the last column, so derive its index from
+            # the order file rather than hard-coding it — that survives
+            # mikefarah adding/reordering hash algorithms in a future
+            # release. The +1 accounts for the leading asset-name field.
+            sha_line="$(grep -nx 'SHA-256' "$tmp_order" | cut -d: -f1)"
+            if [ -z "$sha_line" ]; then
+              echo "ERROR: SHA-256 not listed in the yq ${YQ_VERSION} checksums_hashes_order file" >&2
+              exit 1
+            fi
+            sha_col=$((sha_line + 1))
+            expected="$(awk -v a="$YQ_ASSET" -v c="$sha_col" '$1 == a { print $c }' "$tmp_sums")"
+            if [ -z "$expected" ]; then
+              echo "ERROR: no SHA-256 checksum for ${YQ_ASSET} in the yq ${YQ_VERSION} checksums file" >&2
+              exit 1
+            fi
+            echo "${expected}  ${tmp_yq}" | sha256sum -c -
+            sudo install -m 0755 "$tmp_yq" /usr/local/bin/yq
+            rm -f "$tmp_yq" "$tmp_sums" "$tmp_order"
+            yq --version
+          fi
+
+      - name: Verify gh is present
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "ERROR: gh not installed on runner" >&2
+            exit 1
+          fi
+          gh --version
+
+      - name: Run the drift audit
+        id: audit
+        env:
+          # Cross-repo READ path. REVIEWER_ASSIGNMENT_TOKEN is the
+          # nathanpayne-claude PAT (CLAUDE.md § 1Password Reviewer PAT
+          # Lookup). gh consumes it via GH_TOKEN; `gh auth setup-git`
+          # below also makes the script's `git fetch` on cached clones
+          # use it. Fail loudly if it's empty — a missing token would
+          # otherwise surface as a string of fetch errors that look
+          # like infrastructure flakiness.
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::REVIEWER_ASSIGNMENT_TOKEN secret is empty — the audit needs cross-repo read access to clone private consumers."
+            echo "        Set it in repo Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+          # Wire the PAT into git's credential helper so the script's
+          # `git fetch` on cached consumer clones authenticates the
+          # same way `gh repo clone` does.
+          gh auth setup-git
+
+          chmod +x scripts/sync-to-downstream.sh
+
+          # Capture stdout+stderr to a file (for the job summary and the
+          # tracking-issue body) while still streaming to the run log.
+          set +e
+          scripts/sync-to-downstream.sh --audit 2>&1 | tee audit-output.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"
+          echo "Audit exited with code ${rc}"
+
+          case "${rc}" in
+            0)
+              echo "result=clean" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "result=drift" >> "$GITHUB_OUTPUT"
+              ;;
+            2)
+              echo "::error::sync-to-downstream.sh --audit exited 2 (usage error / missing prerequisite). This is NOT drift — failing the workflow."
+              exit 2
+              ;;
+            3)
+              echo "::error::sync-to-downstream.sh --audit exited 3 (consumer fetch error). This is an infrastructure failure, NOT drift — failing the workflow without touching the tracking issue."
+              exit 3
+              ;;
+            *)
+              echo "::error::sync-to-downstream.sh --audit exited with unexpected code ${rc} (contract drift). Failing the workflow."
+              exit "${rc}"
+              ;;
+          esac
+
+      - name: Write job summary
+        # Runs for both clean (result=clean) and drift (result=drift).
+        # The exit-2/3 paths above already failed the job and never
+        # reach here, so the summary only ever reflects a real audit
+        # verdict.
+        if: steps.audit.outputs.result == 'clean' || steps.audit.outputs.result == 'drift'
+        env:
+          RESULT: ${{ steps.audit.outputs.result }}
+        run: |
+          {
+            echo "# Weekly cross-repo drift audit"
+            echo
+            if [ "${RESULT}" = "clean" ]; then
+              echo ":white_check_mark: **No drift.** Every consumer's canonical/kit surface matches mergepath HEAD."
+            else
+              echo ":warning: **Drift detected.** One or more consumers have diverged from mergepath's canonical/kit surface."
+              echo
+              echo "A tracking issue (label \`${TRACKING_LABEL}\`) has been opened or updated. Drive propagation with"
+              echo "\`scripts/sync-to-downstream.sh <commit-ish>\` — this cron only reports, it does not open consumer PRs."
+            fi
+            echo
+            echo "## Audit output"
+            echo
+            echo '```'
+            cat audit-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ensure tracking label exists
+        if: steps.audit.outputs.result == 'drift'
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Idempotent: `gh label create` errors if the label already
+          # exists, so swallow that specific case. Any other failure
+          # is real and should surface.
+          #
+          # `--limit 500` overrides gh's default 30-item cap — without
+          # it the existence check could miss an already-present
+          # `propagation-drift` label in a repo with >30 labels, fall
+          # into the create branch, and abort the drift path on the
+          # resulting "already exists" error. 500 is comfortably above
+          # any realistic label count. (Matches the `--limit` hardening
+          # already in auto-clear-blocking-labels.yml's PR enumeration.)
+          if gh label list --repo "$REPO" --limit 500 --json name --jq '.[].name' | grep -qx "$TRACKING_LABEL"; then
+            echo "Label '$TRACKING_LABEL' already exists."
+          else
+            echo "Creating label '$TRACKING_LABEL'."
+            gh label create "$TRACKING_LABEL" --repo "$REPO" \
+              --color C5DEF5 \
+              --description "Canonical/kit surface has drifted in a downstream consumer (weekly-drift-audit.yml)"
+          fi
+
+      - name: Open or update the drift tracking issue
+        if: steps.audit.outputs.result == 'drift'
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          today="$(date -u '+%Y-%m-%d')"
+
+          # Build the issue body from the captured audit output.
+          {
+            echo "## Cross-repo propagation drift"
+            echo
+            echo "\`scripts/sync-to-downstream.sh --audit\` found drift between mergepath's"
+            echo "canonical/kit surface and one or more downstream consumers declared in"
+            echo "\`.mergepath-sync.yml\`."
+            echo
+            echo "- **Last audit:** ${today} (UTC)"
+            echo "- **Run:** ${RUN_URL}"
+            echo
+            echo "### Audit output"
+            echo
+            echo '```'
+            cat audit-output.txt
+            echo '```'
+            echo
+            echo "---"
+            echo
+            echo "This issue is **maintained in place** by"
+            echo "[\`.github/workflows/weekly-drift-audit.yml\`](.github/workflows/weekly-drift-audit.yml):"
+            echo "each weekly run updates this body rather than opening a new issue, and a"
+            echo "clean audit closes it automatically. To resolve drift, propagate the"
+            echo "relevant mergepath commit(s) with \`scripts/sync-to-downstream.sh <commit-ish>\`"
+            echo "(see #168). The cron is read-only and never opens consumer PRs itself."
+            echo
+            echo "cc @nathanjohnpayne"
+          } > issue-body.txt
+
+          # Find an existing OPEN tracking issue. Single source of truth:
+          # the `propagation-drift` label. Take the lowest-numbered match
+          # if (unexpectedly) more than one exists. `--limit 500`
+          # overrides gh's default 30-item cap so the lookup can't miss
+          # the tracking issue behind a backlog of >30 open issues.
+          existing="$(gh issue list --repo "$REPO" --state open --limit 500 \
+            --label "$TRACKING_LABEL" --json number --jq 'sort_by(.number) | .[0].number // ""')"
+
+          if [ -n "$existing" ]; then
+            echo "Updating existing drift issue #${existing}."
+            gh issue edit "$existing" --repo "$REPO" \
+              --title "${ISSUE_TITLE}" \
+              --body-file issue-body.txt
+            gh issue comment "$existing" --repo "$REPO" \
+              --body ":warning: Drift still present as of ${today} (UTC). Issue body refreshed — see [latest run](${RUN_URL})."
+            echo "issue=${existing}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No open drift issue — opening one."
+            gh issue create --repo "$REPO" \
+              --title "${ISSUE_TITLE}" \
+              --label "$TRACKING_LABEL" \
+              --body-file issue-body.txt
+          fi
+
+      - name: Close stale drift tracking issue on a clean audit
+        if: steps.audit.outputs.result == 'clean'
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          today="$(date -u '+%Y-%m-%d')"
+
+          # Close every open tracking issue (normally zero or one).
+          # No-op when none exist — the common steady-state case.
+          # `--limit 500` overrides gh's default 30-item cap so the
+          # cleanup can't leave a stale tracking issue open behind a
+          # backlog of >30 open issues.
+          mapfile -t open_issues < <(gh issue list --repo "$REPO" --state open --limit 500 \
+            --label "$TRACKING_LABEL" --json number --jq '.[].number')
+
+          if [ "${#open_issues[@]}" -eq 0 ]; then
+            echo "Audit clean and no open drift issue — nothing to do."
+            exit 0
+          fi
+
+          for n in "${open_issues[@]}"; do
+            echo "Audit clean — closing drift issue #${n}."
+            gh issue close "$n" --repo "$REPO" \
+              --comment ":white_check_mark: Audit clean as of ${today} (UTC) — all consumers back in sync with mergepath's canonical/kit surface. Closing automatically. See [run](${RUN_URL})."
+          done

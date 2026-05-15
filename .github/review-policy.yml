@@ -31,6 +31,47 @@ external_review_paths:
   - ".github/**"
 
 # ---------------------------------------------------------------------------
+# Propagation PR review lane (#264)
+# ---------------------------------------------------------------------------
+# A PR opened by scripts/sync-to-downstream.sh is a verbatim mirror of
+# canonical/kit paths from mergepath — its content was ALREADY reviewed
+# in the upstream mergepath PR that introduced it. Such a PR is huge by
+# design and always touches `.github/**`, so without this lane the
+# line-count threshold AND the external_review_paths check above would
+# flag every sync PR for a redundant Phase 4 review of non-novel code.
+#
+# When enabled, `.github/workflows/pr-review-policy.yml`'s External
+# Review Check recognizes a propagation PR by a deterministic
+# fingerprint and exempts it from the `needs-external-review` label —
+# IFF ALL of the following hold:
+#   1. enabled: true (below)
+#   2. the PR branch name starts with `branch_prefix`
+#   3. the PR author is `author_identity`
+#   4. EVERY changed file is under a path the manifest
+#      (.mergepath-sync.yml) declares as propagation surface
+#      (canonical / kit / templated). This is the teeth: a "sync" PR
+#      that touches a non-manifest path is not a faithful mirror and
+#      falls through to normal external review.
+#
+# A lane PR is still subject to CI green + CodeRabbit advisory review +
+# an internal reviewer-identity APPROVED — the standard under-threshold
+# path. The lane only removes the *cross-agent Phase 4* requirement,
+# because the content is not novel. See REVIEW_POLICY.md § Propagation
+# PR review lane.
+#
+# Set enabled: false to require full external review on sync PRs too
+# (e.g. a security-sensitive consumer that wants every byte re-reviewed
+# on arrival regardless of upstream provenance).
+propagation_prs:
+  enabled: true
+
+  # Branch-name prefix that scripts/sync-to-downstream.sh uses for the
+  # PRs it opens. Must match SYNC_BRANCH_PREFIX in that script
+  # (currently "mergepath-sync"). The trailing slash anchors the match
+  # to the directory boundary.
+  branch_prefix: "mergepath-sync/"
+
+# ---------------------------------------------------------------------------
 # Reviewer Identities
 # ---------------------------------------------------------------------------
 # Registered GitHub accounts that may post reviews. Each agent has exactly
@@ -287,6 +328,32 @@ codex:
   # App provides domain-specific checks no other reviewer matches).
   # See nathanjohnpayne/mergepath#218.
   allow_phase_4b_substitute: true
+
+  # Codex P1 merge gate (nathanjohnpayne/mergepath#235).
+  #
+  # When enabled, scripts/codex-p1-gate.sh runs as the required CI check
+  # `Codex P1 Gate / Codex P1 unresolved threads` and blocks merge if
+  # any Codex P1 inline-finding thread on the current HEAD is
+  # unresolved. The override path is the standard GitHub UI "Resolve
+  # conversation" button (or the GraphQL `resolveReviewThread`
+  # mutation) — same mechanism the author or any collaborator already
+  # uses to clear other review threads. Resolving a thread that
+  # legitimately doesn't apply (already-fixed in a later commit,
+  # rejected with documented rationale, moot, deferred to a follow-up
+  # issue) clears the gate.
+  #
+  # Default everywhere except mergepath: false. The narrow-start
+  # strategy of #235 enables this in mergepath first to shake out the
+  # override pattern before propagating via .mergepath-sync.yml to
+  # downstream consumers.
+  #
+  # Context: the 2026-05-13 sweep (#234) found 62 unresolved Codex P1
+  # findings sitting on closed/merged PRs across 9 repos. P1 is
+  # Codex's blocking-severity tag; 62 of them riding through to merge
+  # is direct evidence the label was advisory, not enforced. This
+  # knob flips it to enforced.
+  p1_gate:
+    enabled: true
 
 # ---------------------------------------------------------------------------
 # Phase 4b proactive triggers (#158)

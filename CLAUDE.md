@@ -41,11 +41,31 @@ time `gh auth login` per identity per machine). With this convention:
 - Reviewer-identity writes (`gh pr review --comment` from your agent
   identity) just work — no `GH_TOKEN` switch, no `gh auth switch`.
 - Author-identity writes (`gh pr create`, `gh pr merge`, `gh pr edit`
-  for label changes) need a temporary switch-around so the byline is
-  the author identity, paired with a switch-back so the active state
-  never lingers wrong:
+  for label changes) **MUST** use `scripts/gh-as-author.sh` — a single
+  bash process that switches to the author identity, runs the wrapped
+  command, then restores the prior active account via `trap EXIT`:
 
   ```bash
+  scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
+  scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch
+  ```
+
+  Bundling the switch + write + switch-back into one wrapper process
+  is a HARD RULE, not a soft recommendation. Splitting the three
+  steps across two or more Bash tool calls has been observed to land
+  the PR under the wrong identity — see #241 (and the concrete
+  incident on `friends-and-family-billing#262`) for the failure
+  mechanism and consequences (self-approval blocked, policy
+  fingerprint inversion, destructive recovery). The `gh-pr-guard.sh`
+  PreToolUse hook now enforces this: a `gh pr create` while the
+  keyring's active account is not `nathanjohnpayne` is blocked with
+  a diagnostic pointing at `gh-as-author.sh`. The wrapper also runs
+  a post-create `gh pr view --json author` verification to catch the
+  failure within seconds if it slips through. If you ever need the
+  unwrapped form, do it in one bash invocation:
+
+  ```bash
+  # Equivalent, only acceptable if gh-as-author.sh is unavailable for some reason:
   gh auth switch -u nathanjohnpayne && \
     gh pr merge <PR#> --squash --delete-branch && \
     gh auth switch -u nathanpayne-claude
@@ -310,11 +330,14 @@ keyring active is your agent identity. No switch needed for commits.
       condition before coming back to merge. If `fallback-only`, skip
       directly to merge.
    h. With the gate passing AND the 4b checkpoint cleared, merge as
-      nathanjohnpayne with the switch-around per the active-account
-      convention:
-      `gh auth switch -u nathanjohnpayne && \
-       gh pr merge <PR#> --squash --delete-branch && \
-       gh auth switch -u nathanpayne-claude`
+      nathanjohnpayne via `scripts/gh-as-author.sh` per the active-
+      account convention above (HARD RULE — splitting the switch +
+      merge + switch-back across Bash tool calls has been observed
+      to leave the keyring on the wrong identity, see #241):
+
+      ```
+      scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch
+      ```
 
    **Phase 4b — Manual CLI fallback.** Applies when Phase 4a is
    unavailable (`codex.enabled: false`, either helper script missing,
@@ -329,9 +352,9 @@ keyring active is your agent identity. No switch needed for commits.
    d. Wait for the external reviewer identity to post an `APPROVED` review.
    e. If the external reviewer flags observations or risks, file the
       post-merge GitHub Issues per step 11 below.
-   f. Merge as nathanjohnpayne via the switch-around per the
-      active-account convention (`gh auth switch -u nathanjohnpayne &&
-      gh pr merge ... && gh auth switch -u nathanpayne-claude`).
+   f. Merge as nathanjohnpayne via `scripts/gh-as-author.sh` per the
+      active-account convention above (HARD RULE per #241):
+      `scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch`.
 
 10. Never use `--admin` to merge unless the human explicitly authorizes it
     in chat as a break-glass exception. The hook will block it otherwise.

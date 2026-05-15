@@ -1,0 +1,27 @@
+{
+  "description": "Same reviewer reversed CHANGES_REQUESTED to APPROVED on HEAD. Latest-per-reviewer collapses to APPROVED; no disagreement.",
+  "headSha": "deafbeef00headsha00000000000000000000dead",
+  "hasLabel": false,
+  "reviewerAccounts": [
+    "nathanpayne-claude",
+    "nathanpayne-codex",
+    "nathanpayne-cursor"
+  ],
+  "expected_decision": "noop",
+  "reviews": [
+    {
+      "id": 10,
+      "state": "CHANGES_REQUESTED",
+      "commit_id": "old111staleshastaleshastalesha111111111",
+      "submitted_at": "2026-05-09T08:00:00Z",
+      "user": { "login": "nathanpayne-codex" }
+    },
+    {
+      "id": 11,
+      "state": "APPROVED",
+      "commit_id": "deafbeef00headsha00000000000000000000dead",
+      "submitted_at": "2026-05-12T15:00:00Z",
+      "user": { "login": "nathanpayne-codex" }
+    }
+  ]
+}

@@ -88,9 +88,15 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
 # for the byline. Just run the command.
 gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
 
-# Author-identity write: switch around the call so the byline is the
-# author identity, then switch back so the active state is correct
-# for subsequent reviewer-identity writes.
+# Author-identity write: MUST use scripts/gh-as-author.sh, which
+# switches + runs + restores inside ONE bash process via trap EXIT.
+# Splitting the switch and the write across two Bash invocations has
+# been observed to land the PR under the wrong identity (#241). The
+# gh-pr-guard.sh PreToolUse hook now enforces this for gh pr create.
+scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
+
+# Only when gh-as-author.sh is unavailable, the equivalent inline
+# form is acceptable — but it MUST stay inside one bash invocation:
 gh auth switch -u nathanjohnpayne && \
   gh pr create --title "..." --body "..." && \
   gh auth switch -u nathanpayne-claude
@@ -157,7 +163,7 @@ Replace `claude` with `cursor` or `codex` depending on which agent is running. T
 
 After preflight, these environment variables are set:
 - `OP_PREFLIGHT_REVIEWER_PAT` — use with `GH_TOKEN=` for reviewer-identity **read-path** API calls and helper scripts (`coderabbit-wait.sh`, `codex-review-request.sh`, `codex-review-check.sh`). Write paths (`gh pr review` / `create` / `merge` / `edit`) use the active keyring account regardless of `GH_TOKEN` — see [Reviewer PAT Quick Start](#reviewer-pat-quick-start).
-- `OP_PREFLIGHT_AUTHOR_PAT` — use with `GH_TOKEN=` for author-identity read-path API calls. For author-identity writes (PR create / merge / label edit), use the `gh auth switch -u nathanjohnpayne && ... && gh auth switch -u nathanpayne-<agent>` switch-around pattern.
+- `OP_PREFLIGHT_AUTHOR_PAT` — use with `GH_TOKEN=` for author-identity read-path API calls. For author-identity **writes** (PR create / merge / label edit), wrap the call in `scripts/gh-as-author.sh` — the wrapper switches the gh keyring to the author identity, runs the wrapped command, and restores the prior active account via `trap EXIT`, all in a single bash process. This is the canonical pattern (the `gh-pr-guard.sh` PreToolUse hook enforces it for `gh pr create`). The inline `gh auth switch -u nathanjohnpayne && ... && gh auth switch -u nathanpayne-<agent>` switch-around pattern remains acceptable as a fallback only when the wrapper is unavailable, and only when it stays inside one bash invocation — see [Recovery: PR created under the wrong identity](#recovery-pr-created-under-the-wrong-identity) for the #241 failure mode that motivates the wrapper-first rule.
 - `GOOGLE_APPLICATION_CREDENTIALS` — used automatically by gcloud/Firebase scripts
 - `OP_PREFLIGHT_DONE=1` — flag indicating preflight has been run
 
@@ -224,6 +230,27 @@ Before moving past Phase 2.5, confirm all of the following:
 8. After internal review passes, the agent evaluates whether the PR meets the external review threshold (see [Review Policy Configuration](#review-policy-configuration)).
 9. If the threshold is **not** met, the agent merges the PR as `nathanjohnpayne`. Done.
 10. If the threshold **is** met, the agent proceeds to [Phase 4: External Review](#phase-4-external-review). Phase 4 itself routes the PR to Phase 4a (automated, via the Codex GitHub App) or Phase 4b (manual handoff) based on `codex.enabled` in `.github/review-policy.yml` and on whether 4a's automated loop converges. The agent does NOT post a handoff message directly from this step — Phase 4b posts its own handoff message if and when the fallback path is taken.
+
+### Phase 3.5: Propagation PR review lane
+
+A **propagation PR** — one opened by `scripts/sync-to-downstream.sh` to mirror canonical/kit paths from `mergepath` into a downstream consumer — is a special case of the threshold check. Its content was **already reviewed in the upstream `mergepath` PR** that introduced it; the propagation PR only re-applies that already-reviewed content verbatim. It is also large by construction (a `--sync-all` PR mirrors the full canonical surface) and always touches `.github/**`, so both the line-count threshold *and* the `external_review_paths` check would flag every sync PR for a redundant Phase 4 review of non-novel code.
+
+The lane closes that mismatch. `.github/workflows/pr-review-policy.yml`'s External Review Check recognizes a propagation PR and **exempts it from the `needs-external-review` label** — and removes the label if a prior run applied it — when **all** of the following hold:
+
+1. `propagation_prs.enabled: true` in `.github/review-policy.yml`.
+2. The PR branch name starts with `propagation_prs.branch_prefix` (must match `SYNC_BRANCH_PREFIX` in `scripts/sync-to-downstream.sh`).
+3. The PR author is `author_identity` — the propagation actor.
+4. The PR is a **verified byte-for-byte faithful mirror** of `mergepath` at the source commit. This is the load-bearing teeth.
+
+Path-confinement alone is **not** sufficient — `.github/workflows/*` *is* propagation surface, so a check that only asked "is every changed file under a manifest path?" would let a `mergepath-sync/**` PR hand-edit a workflow and skip review (Codex P1 on [#268](https://github.com/nathanjohnpayne/mergepath/issues/268)). Criterion 4 is therefore a real content comparison:
+
+- The `<sha>` in the branch name (`mergepath-sync/[sync-all-]<sha>`) is checked out from **public** `nathanjohnpayne/mergepath` — no token needed.
+- `mergepath@<sha>`'s **own** `scripts/workflow/verify-propagation-pr.sh` byte-compares every file the PR changes against `mergepath@<sha>`'s content, using `mergepath@<sha>`'s manifest as the authoritative path list. Every changed file must be under a manifest path **and** byte-match `mergepath@<sha>` (both-present-equal, or both-absent for a faithful delete-propagation).
+- All trust inputs are sourced away from the PR's own checkout, which the PR could tamper with: the **config** (criteria 1–3) is read from the PR's **base** commit, and the **verifier + manifest + canonical content** all come from the immutable, public `mergepath@<sha>`. The PR controls only its own content — which is exactly what the byte-compare checks.
+
+A lane PR is **not** un-reviewed. It is still subject to the full under-threshold path: required CI green, CodeRabbit advisory review, and an internal reviewer-identity `APPROVED`. The lane removes **only** the cross-agent Phase 4 external review, because re-reviewing a byte-verified mirror of already-reviewed content adds latency without adding signal.
+
+Worked example: in a `--sync-all` wave, the pure-mirror consumer PRs verify clean and take the lane (merge via the under-threshold path); a consumer PR that also carries a hand-edit — even one touching a manifest path, e.g. a one-off convergence commit — fails the byte-compare, keeps `needs-external-review`, and goes through normal Phase 4.
 
 ### Phase 4: External Review
 
@@ -510,9 +537,13 @@ The agent never resolves a fired escalation signal on its own.
 
 Agents must never modify the `needs-external-review`, `needs-human-review`, or `policy-violation` labels on any PR — these are human-action labels. The `scripts/hooks/label-removal-guard.sh` PreToolUse hook enforces this at the mechanism layer; chat authorization does not bypass it. To request a label removal, run `scripts/request-label-removal.sh <PR#> <label>` — this posts a structured ask on the PR and (if `MERGEPATH_NOTIFY_IMESSAGE_TO` is set) pings the human via iMessage. The human clears the label from any device; auto-merge fires immediately.
 
-**Sanctioned automation exception.** The `auto-clear-blocking-labels.yml` workflow (shipped in [#195](https://github.com/nathanjohnpayne/mergepath/issues/195) per parent [#191](https://github.com/nathanjohnpayne/mergepath/issues/191)) is the ONLY automated path permitted to remove `needs-external-review`. It re-runs `scripts/codex-review-check.sh` on `pull_request_target` / `pull_request_review` / `workflow_run` events AND on a 15-minute `schedule` cron sweep (#197 — catches the 👍-after-last-push case where no event-driven trigger fires), and removes the label when the merge gate passes per the full gate logic in [`scripts/codex-review-check.sh`](scripts/codex-review-check.sh) — gate (a) CI green AND gate (b) reviewer-identity APPROVED OR same-agent + Codex 👍 (per [#170](https://github.com/nathanjohnpayne/mergepath/issues/170)) AND gate (c) Codex cleared on current HEAD. The byline on the removal is `github-actions[bot]` (not an agent identity); the workflow's `if:` guards prevent self-fire loops AND skip the event-driven job on schedule events (cron only runs the sweep); checkout pins to the default branch so a malicious PR cannot supply its own gate-script.
+**Sanctioned automation exceptions.** Two — and only two — automated paths may remove `needs-external-review`. Both are GitHub Actions workflows (not interactive agent sessions); both are reconciling a label the policy automation itself is responsible for, which is categorically different from an agent clearing a human-action label.
 
-This exception applies ONLY to that workflow. An interactive agent session (claude / cursor / codex) calling `gh pr edit --remove-label` for any of the three blocking labels remains forbidden — the `scripts/hooks/label-removal-guard.sh` PreToolUse hook enforces this independently. The hook intentionally only fires for `Bash` tool calls from agent sessions; a workflow's `gh` call inside a GitHub Actions runner does not pass through that surface, so the hook does not (and should not) block CI workflows. `needs-human-review` and `policy-violation` remain manual-only by design.
+1. **`auto-clear-blocking-labels.yml`** (shipped in [#195](https://github.com/nathanjohnpayne/mergepath/issues/195) per parent [#191](https://github.com/nathanjohnpayne/mergepath/issues/191)) removes the label once the merge gate clears. It re-runs `scripts/codex-review-check.sh` on `pull_request_target` / `pull_request_review` / `workflow_run` events AND on a 15-minute `schedule` cron sweep (#197 — catches the 👍-after-last-push case where no event-driven trigger fires), and removes the label when the merge gate passes per the full gate logic in [`scripts/codex-review-check.sh`](scripts/codex-review-check.sh) — gate (a) CI green AND gate (b) reviewer-identity APPROVED OR same-agent + Codex 👍 (per [#170](https://github.com/nathanjohnpayne/mergepath/issues/170)) AND gate (c) Codex cleared on current HEAD. The byline on the removal is `github-actions[bot]` (not an agent identity); the workflow's `if:` guards prevent self-fire loops AND skip the event-driven job on schedule events (cron only runs the sweep); checkout pins to the default branch so a malicious PR cannot supply its own gate-script.
+
+2. **`pr-review-policy.yml`'s External Review Check** (the propagation-PR review lane, [#264](https://github.com/nathanjohnpayne/mergepath/issues/264) / [#268](https://github.com/nathanjohnpayne/mergepath/issues/268)) removes the label when a PR is verified to be a faithful propagation mirror — see [§ Phase 3.5](#phase-35-propagation-pr-review-lane). It does not consult the merge gate; it acts on the orthogonal fact that the PR's content was already reviewed upstream, established by `scripts/workflow/verify-propagation-pr.sh`'s byte-comparison against `mergepath@<sha>`. Same `github-actions[bot]` byline; same not-an-agent-override rationale.
+
+These exceptions apply ONLY to those two workflows. An interactive agent session (claude / cursor / codex) calling `gh pr edit --remove-label` for any of the three blocking labels remains forbidden — the `scripts/hooks/label-removal-guard.sh` PreToolUse hook enforces this independently. The hook intentionally only fires for `Bash` tool calls from agent sessions; a workflow's `gh` call inside a GitHub Actions runner does not pass through that surface, so the hook does not (and should not) block CI workflows. `needs-human-review` and `policy-violation` remain manual-only by design.
 
 **Disabling the scheduled sweep.** The 15-minute cron is opt-out via `auto_clear_labels.scheduled_sweep_enabled: false` in `.github/review-policy.yml`. Default is `true`. Set to `false` if your repo has high PR volume and the event-driven path is reliably fast enough that the cron becomes pure noise — but expect occasional stuck `needs-external-review` labels on the 👍-after-last-push case (which the sweep would otherwise catch). The event-driven path remains active regardless of this setting.
 
@@ -696,9 +727,16 @@ GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-request.sh <PR#>
 # Reviewer-identity write (your agent identity is active by default):
 gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
 
-# Author-identity write: temporary switch-around so the byline is
-# nathanjohnpayne, paired with switch-back so active state never lingers
-# wrong for subsequent reviewer-identity writes:
+# Author-identity write: MUST use scripts/gh-as-author.sh, which
+# switches + runs + restores inside ONE bash process via trap EXIT.
+# Splitting the switch and the write across two Bash invocations has
+# been observed to land the PR under the wrong identity (#241). The
+# gh-pr-guard.sh PreToolUse hook now enforces this.
+scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch
+scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
+
+# Only when gh-as-author.sh is unavailable, the equivalent inline form
+# is acceptable — but it MUST stay inside one bash invocation:
 gh auth switch -u nathanjohnpayne && \
   gh pr merge <PR#> --squash --delete-branch && \
   gh auth switch -u nathanpayne-<agent>
@@ -754,10 +792,25 @@ ssh -T git@github-claude        # → Hi nathanpayne-claude!
 
 ### Switching all repos to SSH remotes
 
+The SSH-remote-switch covers every repo on the operator's machine (template
++ consumers + docs). Current set:
+
+<!-- bootstrap-loop-list-start -->
+- mergepath
+- swipewatch
+- nathanpaynedotcom
+- device-platform-reporting
+- device-source-of-truth
+- overridebroadway
+- friends-and-family-billing
+- docs
+<!-- bootstrap-loop-list-end -->
+
 ```bash
-for repo in mergepath swipewatch nathanpaynedotcom \
-            device-platform-reporting device-source-of-truth \
-            overridebroadway friends-and-family-billing docs; do
+# Explicit path to mergepath/REVIEW_POLICY.md — pwd may not be the
+# mergepath repo when the operator runs this (see #252 Codex P1).
+for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' \
+              ~/Documents/GitHub/mergepath/REVIEW_POLICY.md | grep '^- ' | sed 's/^- //'); do
   cd ~/Documents/GitHub/$repo
   CURRENT=$(git remote get-url origin)
   if [[ "$CURRENT" == https* ]]; then
@@ -769,6 +822,99 @@ for repo in mergepath swipewatch nathanpaynedotcom \
   fi
 done
 ```
+
+## Recovery: PR created under the wrong identity
+
+If `gh pr create` lands a PR under the wrong account — typically because the
+`gh auth switch -u nathanjohnpayne` and the `gh pr create` were split across
+two Bash tool calls and the gh keyring's active state drifted between them —
+the PR is unrecoverable in place: any review attempt under the same account
+that authored the PR returns `Can not approve your own pull request`, and the
+`Authoring-Agent:` fingerprint in the body now disagrees with `author.login`,
+breaking downstream audit. See #241 for the bug history and
+`nathanjohnpayne/friends-and-family-billing#262` for the canonical incident.
+
+### Prevention (the primary path)
+
+Always wrap author-identity writes in `scripts/gh-as-author.sh`:
+
+```bash
+scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
+```
+
+The wrapper switches to `nathanjohnpayne`, runs the wrapped command, and
+restores the prior active account via `trap EXIT` — all inside one bash
+process so the switch and the write can't drift apart. For `gh pr create`
+specifically, it also runs a post-create `gh pr view --json author`
+verification and exits non-zero (code 5) if `author.login` does not match
+the expected identity. The `gh-pr-guard.sh` PreToolUse hook independently
+blocks `gh pr create` when the keyring's active account is not the author
+identity.
+
+### Detection
+
+If you suspect the wrong-identity failure (e.g., the PR was just created
+and review attempts return `Can not approve your own pull request`), confirm
+with:
+
+```bash
+gh pr view <PR#> --repo <owner>/<repo> --json author --jq .author.login
+```
+
+Expected: `nathanjohnpayne`. If the output is your agent identity (e.g.
+`nathanpayne-claude`), you hit the #241 footgun.
+
+### Recovery procedure
+
+Close the wrong PR and recreate from the same branch. The commits and the
+branch survive the close — what's lost is the PR's review thread history,
+prior CI results, and any `chatgpt-codex-connector[bot]` / CodeRabbit
+comments. There is no in-place fix: GitHub does not expose an API to change
+`author.login` on an existing PR.
+
+```bash
+# 1. Close the wrong-author PR with a comment explaining the recreate.
+gh pr close <PR#> --repo <owner>/<repo> \
+  --comment "Wrong author identity (see #241). Recreating from the same branch."
+
+# 2. Recreate from a fresh shell so any stale gh-state shell vars are gone,
+#    and route through gh-as-author.sh so the new PR can't repeat the
+#    failure mode.
+scripts/gh-as-author.sh -- gh pr create \
+  --repo <owner>/<repo> \
+  --base main --head <same-branch> \
+  --title "..." \
+  --body "..."
+
+# 3. Verify the new PR landed under the right identity (the wrapper also
+#    does this automatically, but it's worth checking once by hand if you
+#    bypassed the wrapper):
+gh pr view <NEW_PR#> --repo <owner>/<repo> --json author --jq .author.login
+# expected: nathanjohnpayne
+```
+
+The fresh shell in step 2 is belt-and-suspenders: any `GH_TOKEN` /
+`GH_HOST` / `GITHUB_TOKEN` env vars exported earlier in the session that
+might have contributed to the drift are cleared by the new process. The
+wrapper script itself does not depend on those env vars, but a fresh shell
+removes ambiguity about which version of the state any helper is reading.
+
+### What's lost vs. what survives
+
+| Item | After recreate |
+|------|----------------|
+| Commits on the branch | survive (`git push` is unaffected) |
+| Branch ref | survives |
+| PR review threads | LOST (closed-PR threads do not carry over) |
+| CodeRabbit comments | LOST (will re-run on the new PR if enabled) |
+| Codex Connector review | LOST (will re-trigger on the new PR if review-ready) |
+| CI run history | LOST (jobs re-run on the new PR) |
+| PR number | new one assigned |
+| Authoring-Agent fingerprint | regenerated (now matches `author.login`) |
+
+Filing a post-merge issue noting the recreated-PR situation is optional but
+helpful for audit trails — link both the closed PR and the new one so a
+later reader can follow the thread.
 
 ## Adding a New Agent
 
@@ -799,7 +945,7 @@ This policy and the accompanying `review-policy.yml` should be included in every
 5. Ensure all agent environments have credentials configured for the repo.
 6. If the repo is public, enable secret scanning and push protection via GitHub settings (or API).
 7. If the repo is public and using CodeRabbit, set `coderabbit.enabled: true` in `.github/review-policy.yml` and install the CodeRabbit GitHub App on the repo.
-8. The `.coderabbit.yml` file at the repo root ships with the template and works out of the box. Customize `reviews.path_instructions` to add repo-specific review guidance (e.g., flag currency rounding in billing code, verify type compatibility in shared packages).
+8. The `.coderabbit.yml` file at the repo root ships with the template and works out of the box. The template defaults to `reviews.profile: chill` — per CodeRabbit's docs, the 🧹 Nitpick category is "only in Assertive mode," so `chill` keeps substantive findings while suppressing per-thread nit ceremony (see #237 for the 2026-05-13 sweep data that motivated this default). Override per-repo by setting `reviews.profile: assertive` locally if you want the polish pass on that repo specifically. Customize `reviews.path_instructions` to add repo-specific review guidance (e.g., flag currency rounding in billing code, verify type compatibility in shared packages).
 
 ### CodeRabbit Removal
 

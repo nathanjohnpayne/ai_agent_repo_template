@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# check_disagreement_detector — CI wrapper for the disagreement
+# detector test suite (#259).
+#
+# `.github/workflows/agent-review.yml`'s `detect-disagreement` job
+# applies / removes the `needs-human-review` label. Its decision
+# logic was factored into `scripts/disagreement-detector.cjs` so the
+# workflow and this test exercise the same code (the lockstep
+# pattern documented for pr-audit.yml's P0/P1 detection — except
+# here the JS is a real module both sides `require()`, not an
+# inline literal copied twice).
+#
+# This wrapper hard-fails if the detector module, the fixture
+# directory, or the test script are missing, then runs
+# `tests/test_disagreement_detector.sh`.
+#
+# Also asserts the workflow still wires the extracted module in —
+# the long-pole canary if someone re-inlines the logic and the
+# module drifts.
+#
+# Issue: #259. Cross-reference: scripts/codex-review-check.sh
+# gates (b)/(c), #170 + #218.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+DETECTOR="scripts/disagreement-detector.cjs"
+FIXTURES_DIR="scripts/ci/fixtures/disagreement-detector"
+TEST_SCRIPT="tests/test_disagreement_detector.sh"
+WORKFLOW=".github/workflows/agent-review.yml"
+
+for f in "$DETECTOR" "$FIXTURES_DIR" "$TEST_SCRIPT" "$WORKFLOW"; do
+  if [ ! -e "$f" ]; then
+    echo "check_disagreement_detector: missing required path: $f" >&2
+    exit 1
+  fi
+done
+
+if [ ! -x "$TEST_SCRIPT" ]; then
+  echo "check_disagreement_detector: $TEST_SCRIPT is not executable" >&2
+  exit 1
+fi
+
+# Structural assertion: the workflow requires the extracted module.
+# If detect-disagreement is re-inlined, the module can rot silently
+# while this test still passes against the stale file. This canary
+# fails first.
+#
+# Match the path within 2 lines of a `require(` call, not just the
+# bare path anywhere in the file — otherwise the assertion false-
+# passes if the `require(...)` is removed but a comment still
+# mentions the path. The workflow wraps the require across lines:
+#   const { decide } = require(
+#     path.resolve(process.env.GITHUB_WORKSPACE,
+#                  'scripts/disagreement-detector.cjs'));
+# so a -A2 window after `require(` covers it. (CodeRabbit Major, #271.)
+if ! grep -A2 -E 'require\(' "$WORKFLOW" | grep -qF 'scripts/disagreement-detector.cjs'; then
+  echo "check_disagreement_detector: $WORKFLOW no longer require()s scripts/disagreement-detector.cjs — the detect-disagreement job and its test may have drifted" >&2
+  exit 1
+fi
+
+# Structural assertion: the workflow references #259 for traceability.
+if ! grep -qF '#259' "$WORKFLOW"; then
+  echo "check_disagreement_detector: $WORKFLOW must reference #259 in a comment for traceability" >&2
+  exit 1
+fi
+
+# Run the fixture-driven suite.
+bash "$TEST_SCRIPT"
+
+echo "check_disagreement_detector: PASS"

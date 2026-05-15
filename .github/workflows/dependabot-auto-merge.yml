@@ -66,12 +66,23 @@ jobs:
             echo "::error::gh api user returned empty — REVIEWER_ASSIGNMENT_TOKEN may be invalid, expired, or lacks the user scope."
             exit 1
           fi
-          echo "::notice::Approving $PR_URL as $ACTING_AS"
+          echo "::notice::Approving $PR_URL as $ACTING_AS (PR author: $PR_AUTHOR)"
 
-          if [ "$ACTING_AS" = "nathanjohnpayne" ]; then
-            echo "::error::REVIEWER_ASSIGNMENT_TOKEN resolves to nathanjohnpayne (the author identity)."
+          # Self-approval guard. The real condition is "the reviewer
+          # token resolves to the PR's own author" — GitHub blocks
+          # that. The previous check hard-coded `nathanjohnpayne`,
+          # which is wrong here: a Dependabot PR's author is
+          # `dependabot[bot]`, never `nathanjohnpayne`, so the old
+          # check rejected a perfectly valid reviewer token while
+          # never actually testing the self-approval condition.
+          # Compare against the actual PR author. (CodeRabbit Major,
+          # #271.) The available_reviewers validation below is the
+          # broader gate — it independently rejects any ACTING_AS not
+          # in the reviewer-identity allowlist.
+          if [ "$ACTING_AS" = "$PR_AUTHOR" ]; then
+            echo "::error::REVIEWER_ASSIGNMENT_TOKEN resolves to '$ACTING_AS', the PR's own author."
             echo "::error::GitHub blocks self-approval, so the approve call would silently fail and the merge would proceed without an approval recorded."
-            echo "::error::Replace the secret with a reviewer-identity PAT (nathanpayne-claude / -cursor / -codex)."
+            echo "::error::Replace the secret with a distinct reviewer-identity PAT (nathanpayne-claude / -cursor / -codex)."
             exit 1
           fi
 
@@ -143,4 +154,10 @@ jobs:
           fi
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
+          # The actual PR author — `dependabot[bot]` for these events.
+          # Used for the genuine self-approval guard below (a hard-
+          # coded `nathanjohnpayne` compare was wrong: the author of a
+          # Dependabot PR is never `nathanjohnpayne`). (CodeRabbit
+          # Major, #271.)
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}

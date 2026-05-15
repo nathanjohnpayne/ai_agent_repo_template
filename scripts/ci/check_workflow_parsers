@@ -55,6 +55,25 @@ assert_eq() {
   fi
 }
 
+# Classify a phase_4b_default value read from review-policy.yml.
+# Echoes "valid" or "invalid".
+#
+# A MISSING field (empty string) is VALID — the documented semantics
+# (CLAUDE.md, REVIEW_POLICY.md, and the `policy_field` unit fixture
+# below that asserts an absent field returns "") treat an absent
+# phase_4b_default as the `fallback-only` default. This check ships
+# in the propagated `scripts/ci/` kit; a consumer repo whose
+# review-policy.yml predates the field (#185) must NOT hard-fail just
+# for not having opted in. Only a PRESENT-but-unrecognized value is a
+# real failure. (Before this, the propagation wave's 8 consumer PRs
+# all failed `lint` here — see #264.)
+classify_phase_4b() {
+  case "$1" in
+    ""|fallback-only|complex-changes|always) echo "valid" ;;
+    *) echo "invalid" ;;
+  esac
+}
+
 echo "parse_policy_list.sh tests"
 
 # Covers bug 2: the range-based parser silently produced an empty
@@ -131,6 +150,80 @@ src/auth/login.ts'
 assert_eq "end-to-end: parse output piped into matcher" "$want" "$got"
 
 echo
+echo "parse_manifest_paths.sh tests — propagation PR review lane (#264)"
+
+MANIFEST_PARSE="scripts/workflow/parse_manifest_paths.sh"
+if [ ! -f "$MANIFEST_PARSE" ]; then
+  echo "check_workflow_parsers: missing required file: $MANIFEST_PARSE" >&2
+  exit 1
+fi
+
+# Fixture: a minimal manifest with one canonical, one kit, and one
+# templated entry plus the trailing top-level `exclusions:` key. The
+# parser must emit canonical/templated as exact paths and kit as a
+# `<dir>/**` glob, and must stop at the next top-level key.
+manifest_fixture=$(mktemp "${TMPDIR:-/tmp}/manifest-fixture.XXXXXX")
+cat >"$manifest_fixture" <<'YAML'
+version: 1
+consumers:
+  - name: alpha
+    repo: example/alpha
+paths:
+  - path: scripts/op-preflight.sh
+    type: canonical
+    consumers: all
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+  - path: .github/review-policy.yml
+    type: templated
+    consumers: all
+exclusions: []
+YAML
+got=$(bash "$MANIFEST_PARSE" "$manifest_fixture")
+want='scripts/op-preflight.sh
+scripts/ci/**
+.github/review-policy.yml'
+assert_eq "parse_manifest_paths: canonical exact, kit as <dir>/**, templated exact; stops at next top-level key" "$want" "$got"
+
+# Regression: a `- path:` entry with no following `type:` line must
+# emit nothing (a malformed entry is dropped, not silently treated as
+# canonical, and must not leak its path into the next entry).
+manifest_notype=$(mktemp "${TMPDIR:-/tmp}/manifest-notype.XXXXXX")
+cat >"$manifest_notype" <<'YAML'
+paths:
+  - path: scripts/orphan-no-type.sh
+  - path: scripts/has-type.sh
+    type: canonical
+exclusions: []
+YAML
+got=$(bash "$MANIFEST_PARSE" "$manifest_notype")
+assert_eq "parse_manifest_paths: entry missing a type: line emits nothing, doesn't leak into the next" "scripts/has-type.sh" "$got"
+
+# End-to-end: the real .mergepath-sync.yml piped into the matcher —
+# this is exactly the propagation-lane confinement check. A pure-sync
+# diff (every file under a manifest path) is fully matched; a file
+# outside the propagation surface is not.
+if [ -f ".mergepath-sync.yml" ]; then
+  MAN_PATTERNS=()
+  while IFS= read -r line; do
+    [ -n "$line" ] && MAN_PATTERNS+=("$line")
+  done < <(bash "$MANIFEST_PARSE" ".mergepath-sync.yml")
+  got=$(printf '%s\n' \
+      "scripts/hooks/gh-pr-guard.sh" \
+      "scripts/ci/check_codex_scripts" \
+      ".github/workflows/agent-review.yml" \
+      "src/app.ts" \
+    | bash "$MATCH" "${MAN_PATTERNS[@]}" | sort)
+  want='.github/workflows/agent-review.yml
+scripts/ci/check_codex_scripts
+scripts/hooks/gh-pr-guard.sh'
+  assert_eq "parse_manifest_paths: real manifest confinement — sync paths match, src/app.ts does not" "$want" "$got"
+fi
+
+rm -f "$manifest_fixture" "$manifest_notype"
+
+echo
 echo "policy_field (top-level scalar) tests — for phase_4b_default (#185)"
 
 # Inline copy of the same awk policy_field uses inside
@@ -184,20 +277,35 @@ nested_only=$(printf 'codex:\n  phase_4b_default: nested-only\n')
 got=$(echo "$nested_only" | awk -v field="phase_4b_default" "$policy_field_awk")
 assert_eq "policy_field returns empty when only a nested same-named key exists" "" "$got"
 
-# Fixture: real mergepath review-policy.yml has the field set; verify
-# end-to-end against the actual file so a typo in the schema-doc
-# example doesn't pass the unit fixtures while breaking the real read.
+# classify_phase_4b: a MISSING field is valid (= the fallback-only
+# default), the three recognized values are valid, anything else is a
+# real failure. This is the classification the real-file check below
+# uses — fixtured here so the "missing is valid" branch (#264) is
+# covered even though mergepath's own review-policy.yml sets the field.
+assert_eq "classify_phase_4b: missing field is valid (defaults to fallback-only)" "valid" "$(classify_phase_4b "")"
+assert_eq "classify_phase_4b: fallback-only is valid" "valid" "$(classify_phase_4b "fallback-only")"
+assert_eq "classify_phase_4b: complex-changes is valid" "valid" "$(classify_phase_4b "complex-changes")"
+assert_eq "classify_phase_4b: always is valid" "valid" "$(classify_phase_4b "always")"
+assert_eq "classify_phase_4b: a present-but-unrecognized value is invalid" "invalid" "$(classify_phase_4b "strict-mode")"
+
+# Fixture: verify end-to-end against the actual review-policy.yml so a
+# typo in the schema-doc example doesn't pass the unit fixtures while
+# breaking the real read. A missing field is accepted as valid (the
+# documented fallback-only default) per classify_phase_4b — this check
+# ships in the propagated kit and must not hard-fail a consumer repo
+# that simply hasn't opted into phase_4b_default yet (#264).
 got=$(awk -v field="phase_4b_default" "$policy_field_awk" "$ROOT/.github/review-policy.yml")
-case "$got" in
-  fallback-only|complex-changes|always)
-    pass=$((pass + 1))
+if [ "$(classify_phase_4b "$got")" = "valid" ]; then
+  pass=$((pass + 1))
+  if [ -z "$got" ]; then
+    echo "  PASS: real .github/review-policy.yml has no phase_4b_default (valid — defaults to fallback-only)"
+  else
     echo "  PASS: real .github/review-policy.yml has a valid phase_4b_default value ('$got')"
-    ;;
-  *)
-    fail=$((fail + 1))
-    echo "  FAIL: real .github/review-policy.yml phase_4b_default is missing or invalid (got '$got'; expected one of fallback-only / complex-changes / always)"
-    ;;
-esac
+  fi
+else
+  fail=$((fail + 1))
+  echo "  FAIL: real .github/review-policy.yml phase_4b_default is set to an unrecognized value (got '$got'; expected one of fallback-only / complex-changes / always, or absent for the fallback-only default)"
+fi
 
 echo
 if [ "$fail" -gt 0 ]; then

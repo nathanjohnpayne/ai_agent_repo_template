@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# scripts/ci/check_eslint_config_policy
+#
+# CI wrapper that runs the unit tests for the ESLint flat-config
+# policy check (scripts/ci/check_eslint_config_present). Mirrors the
+# scripts/ci/check_gh_as_author pattern: hard-fail (exit 1) when the
+# test file is missing so an accidental delete/rename can't silently
+# disable the policy.
+#
+# This is the "tests" wrapper; the actual policy check that runs
+# against the repo tree is `check_eslint_config_present`. Both are
+# wired into .github/workflows/repo_lint.yml — see issue #250.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+TESTS=(
+  "tests/test_eslint_policy_check.sh"
+)
+
+FAILED=0
+for rel in "${TESTS[@]}"; do
+  full="$REPO_ROOT/$rel"
+  if [ ! -f "$full" ]; then
+    echo "check_eslint_config_policy: ERROR (missing $rel)" >&2
+    FAILED=1
+    continue
+  fi
+  echo "check_eslint_config_policy: running $rel"
+  if ! bash "$full"; then
+    echo "check_eslint_config_policy: FAIL ($rel)" >&2
+    FAILED=1
+  fi
+done
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_eslint_config_policy: FAIL"
+  exit 1
+fi
+
+echo "check_eslint_config_policy: PASS"
+exit 0
