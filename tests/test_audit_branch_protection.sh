@@ -109,7 +109,7 @@ case "$path" in
         emit_status_and_body 200 '{"required_status_checks":{"contexts":["Label Gate","Self-Review Required","lint"]}}'
         exit $?
         ;;
-      no_protection|ruleset_*)
+      no_protection|ruleset_*|ruleset_all_but_main_excluded)
         # No classic protection; 404 triggers ruleset fallback.
         emit_status_and_body 404 '{"message":"Branch not protected","documentation_url":"https://docs.github.com/rest/branches/branch-protection"}'
         exit $?
@@ -147,6 +147,12 @@ case "$path" in
         printf '%s\n' '[{"id":201,"target":"branch"},{"id":202,"target":"branch"}]'
         exit 0
         ;;
+      ruleset_all_but_main_excluded)
+        # ONE ruleset: include ~ALL, exclude refs/heads/main. Must NOT
+        # protect main even though include matches. #285 r2.
+        printf '%s\n' '[{"id":301,"target":"branch"}]'
+        exit 0
+        ;;
       *)
         printf '%s\n' "[]"
         exit 0
@@ -174,6 +180,14 @@ case "$path" in
   */rulesets/202)
     # ~DEFAULT_BRANCH with canonical checks — should match audit of main.
     printf '%s\n' '{"id":202,"target":"branch","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/301)
+    # ~ALL include, refs/heads/main excluded. Canonical checks in the
+    # rule, but the ruleset must be IGNORED for the audit of main.
+    # Without exclude handling, the prior implementation would PASS
+    # — which is the bug #285 r2 closes.
+    printf '%s\n' '{"id":301,"target":"branch","conditions":{"ref_name":{"include":["~ALL"],"exclude":["refs/heads/main"]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"}]}}]}'
     exit 0
     ;;
   *)
@@ -327,6 +341,24 @@ elif ! echo "$out" | grep -q "PASS:"; then
   fail "mixed rulesets: missing PASS line; output: $out"
 else
   pass "mixed rulesets: only matching ruleset's checks counted; PASS"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 9 (#285 r2): a ruleset with include ~ALL + exclude refs/heads/main
+#         must NOT count as protecting main, even though the include
+#         matches. Pre-fix this was a false PASS. (nathanpayne-codex
+#         Phase 4b finding.)
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_all_but_main_excluded 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "ruleset all-but-main-excluded: exit $rc, expected 3 (excluded ruleset must not protect); output: $out"
+elif ! echo "$out" | grep -q "no rulesets target main"; then
+  fail "ruleset all-but-main-excluded: missing 'no rulesets target main' verdict; output: $out"
+else
+  pass "ruleset all-but-main-excluded: exclude correctly disqualifies the ~ALL include"
 fi
 
 # ---------------------------------------------------------------------------

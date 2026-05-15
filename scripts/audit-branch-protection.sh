@@ -204,45 +204,77 @@ if [ "$USE_RULESETS" -eq 1 ]; then
     INCLUDES=$(echo "$DETAIL" | jq -r '.conditions.ref_name.include[]?' 2>/dev/null)
     [ -z "$INCLUDES" ] && continue
 
-    MATCHED=0
     BRANCH_REF="refs/heads/$BRANCH"
-    while IFS= read -r pat; do
-      [ -z "$pat" ] && continue
+    # Reusable matcher: pattern-matches a SINGLE pattern against the
+    # audited branch ref. Echoes "1" on match, "0" on miss. Used by
+    # BOTH the include scan (a match means "this ruleset could apply")
+    # and the exclude scan below (a match means "this ruleset does
+    # NOT apply to this branch"). #285 r2 — nathanpayne-codex Phase
+    # 4b finding: the original implementation only consulted
+    # `.conditions.ref_name.include`, so a ruleset that included
+    # `~ALL` but excluded `main` was incorrectly counted as
+    # protecting main.
+    match_ref_pat() {
+      local pat="$1"
       case "$pat" in
         "~ALL")
-          MATCHED=1
-          break
-          ;;
+          echo 1; return ;;
         "~DEFAULT_BRANCH")
-          # See note above — treat main/master as the assumed default.
-          # For non-default audits, callers should add an explicit
-          # refs/heads/<name> include to the ruleset (or pass
-          # --branch matching the include).
+          # main/master treated as the assumed default; for
+          # non-default-branch audits, callers should use an explicit
+          # refs/heads/<name> form.
           if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
-            MATCHED=1
-            break
+            echo 1; return
           fi
           ;;
         "$BRANCH_REF")
-          MATCHED=1
-          break
-          ;;
+          echo 1; return ;;
         refs/heads/*)
-          # Bash glob match. The pattern may contain literal `*` or `?`
-          # — `[[ str == $pat ]]` does shell-style glob matching with
-          # the pattern unquoted on the RHS.
+          # Bash glob match against the ref.
           # shellcheck disable=SC2053
           if [[ "$BRANCH_REF" == $pat ]]; then
-            MATCHED=1
-            break
+            echo 1; return
           fi
           ;;
       esac
+      echo 0
+    }
+
+    # Pass 1: any include pattern must match.
+    MATCHED=0
+    while IFS= read -r pat; do
+      [ -z "$pat" ] && continue
+      if [ "$(match_ref_pat "$pat")" = "1" ]; then
+        MATCHED=1
+        break
+      fi
     done <<<"$INCLUDES"
 
-    if [ "$MATCHED" -eq 1 ]; then
-      MATCHING_IDS="$MATCHING_IDS $rid"
+    if [ "$MATCHED" -ne 1 ]; then
+      continue
     fi
+
+    # Pass 2: any exclude pattern that matches DISQUALIFIES this
+    # ruleset for the audited branch. A ruleset with
+    # `include: [~ALL]` + `exclude: [refs/heads/main]` applies to
+    # everything except main, so it does NOT protect main even though
+    # the include matched. (#285 r2 — nathanpayne-codex Phase 4b.)
+    EXCLUDES=$(echo "$DETAIL" | jq -r '.conditions.ref_name.exclude[]?' 2>/dev/null)
+    if [ -n "$EXCLUDES" ]; then
+      EXCLUDED=0
+      while IFS= read -r pat; do
+        [ -z "$pat" ] && continue
+        if [ "$(match_ref_pat "$pat")" = "1" ]; then
+          EXCLUDED=1
+          break
+        fi
+      done <<<"$EXCLUDES"
+      if [ "$EXCLUDED" -eq 1 ]; then
+        continue
+      fi
+    fi
+
+    MATCHING_IDS="$MATCHING_IDS $rid"
   done
 
   # Strip leading/trailing whitespace for the empty check below.
