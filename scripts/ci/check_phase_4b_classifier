@@ -225,7 +225,23 @@ set +e
 # Drop --fixture so the script actually goes through the live API path
 # (which is what hits the PR body fetch). Set GH_TOKEN so the script
 # passes its empty-token guard before reaching the body fetch.
-out=$(cd "$SCRATCH_GH" && PATH="$SCRATCH_GH:$PATH" GH_TOKEN=stub-token bash "$ROOT/$CLASSIFIER" 99999 --repo nathanjohnpayne/mergepath 2>&1)
+#
+# The classifier now resolves policy relative to its own script
+# location (`$SCRIPT_DIR/../.github/review-policy.yml`) — so the
+# scratch `.github/review-policy.yml` written above is ignored
+# unless we override via `MERGEPATH_REVIEW_POLICY_PATH`. Without
+# that override, on consumers whose own policy omits
+# `phase_4b_default` (defaulting to `fallback-only`), the
+# classifier short-circuits on `mode != "complex-changes"` and
+# never reaches the body-fetch guard this test is meant to
+# exercise — the test would either FAIL for the wrong reason or
+# falsely report PASS depending on the consumer's policy. The env
+# override pins the test to the scratch policy regardless of the
+# consumer's review-policy.yml. (Codex P2 on the 263caf3
+# propagation wave.)
+out=$(cd "$SCRATCH_GH" && PATH="$SCRATCH_GH:$PATH" GH_TOKEN=stub-token \
+  MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_GH/.github/review-policy.yml" \
+  bash "$ROOT/$CLASSIFIER" 99999 --repo nathanjohnpayne/mergepath 2>&1)
 rc=$?
 set -e
 # Tightened assertion: must specifically be the BODY-fetch error, not
