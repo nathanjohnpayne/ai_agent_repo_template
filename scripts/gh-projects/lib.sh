@@ -47,12 +47,30 @@ link_sub_issue() {
 # Usage: prep_body <src> <parent_num> [c1] [c2] [c3] [c4]
 prep_body() {
   local src="$1" parent="$2" c1="${3:-}" c2="${4:-}" c3="${5:-}" c4="${6:-}"
-  # Preserve the full source path structure under $GHP_TMPDIR. The
-  # earlier `tr '/' '_'` transform was still collision-prone: a
-  # source like `phase-1/c1.md` mapped to `phase-1_c1.md`, which
-  # collides with an actual `phase-1_c1.md` source. Mirroring the
-  # full path eliminates any name-collision ambiguity. (CodeRabbit
-  # Major, #272.)
+  # Preserve the full source path structure under $GHP_TMPDIR — the
+  # earlier `tr '/' '_'` transform was still collision-prone (a source
+  # like `phase-1/c1.md` mapped to `phase-1_c1.md`, which collided
+  # with an actual `phase-1_c1.md` source). Mirroring the full path
+  # eliminates any name-collision ambiguity. (CodeRabbit Major, #272.)
+  #
+  # Reject path-traversal: an absolute `src` or one containing a `..`
+  # segment would let `dst=$GHP_TMPDIR/$src` write OUTSIDE $GHP_TMPDIR
+  # entirely. The old `tr '/' '_'` form was incidentally
+  # traversal-safe; preserving the path means restoring that
+  # explicitly. Same slash-wrapped check as `check_sync_manifest`'s
+  # repo-escape guard. (Codex P2 + CodeRabbit Major on PR #279.)
+  case "$src" in
+    /*)
+      echo "prep_body: refusing absolute src '$src'" >&2
+      return 2
+      ;;
+  esac
+  case "/$src/" in
+    */../*)
+      echo "prep_body: refusing src '$src' (contains '..' segment; would escape \$GHP_TMPDIR)" >&2
+      return 2
+      ;;
+  esac
   local dst="$GHP_TMPDIR/$src"
   mkdir -p "$(dirname "$dst")"
   sed \
