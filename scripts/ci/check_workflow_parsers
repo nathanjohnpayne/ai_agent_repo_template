@@ -290,12 +290,21 @@ assert_eq "classify_phase_4b: a present-but-unrecognized value is invalid" "inva
 
 # Fixture: verify end-to-end against the actual review-policy.yml so a
 # typo in the schema-doc example doesn't pass the unit fixtures while
-# breaking the real read. A missing field is accepted as valid (the
-# documented fallback-only default) per classify_phase_4b — this check
-# ships in the propagated kit and must not hard-fail a consumer repo
-# that simply hasn't opted into phase_4b_default yet (#264).
-got=$(awk -v field="phase_4b_default" "$policy_field_awk" "$ROOT/.github/review-policy.yml")
-if [ "$(classify_phase_4b "$got")" = "valid" ]; then
+# breaking the real read. A missing field is accepted as valid ONLY
+# when the key is truly absent from the real file; mergepath's own
+# policy sets the key, so an empty parser result there is a regression
+# rather than the fallback-only migration case (#300).
+real_policy="$ROOT/.github/review-policy.yml"
+real_has_phase_4b_default=0
+if grep -Eq '^phase_4b_default[[:space:]]*:' "$real_policy"; then
+  real_has_phase_4b_default=1
+fi
+
+got=$(awk -v field="phase_4b_default" "$policy_field_awk" "$real_policy")
+if [ -z "$got" ] && [ "$real_has_phase_4b_default" -eq 1 ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: real .github/review-policy.yml contains phase_4b_default, but policy_field returned empty" >&2
+elif [ "$(classify_phase_4b "$got")" = "valid" ]; then
   pass=$((pass + 1))
   if [ -z "$got" ]; then
     echo "  PASS: real .github/review-policy.yml has no phase_4b_default (valid — defaults to fallback-only)"

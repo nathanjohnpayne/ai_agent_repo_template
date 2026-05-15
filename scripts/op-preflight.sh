@@ -485,10 +485,10 @@ restore_active_account_or_warn() {
       echo "#   Result:   switch returned 0 but active is still '$verify'." >&2
       echo "#             The switch silently no-op'd (corrupt hosts.yml," >&2
       echo "#             mock gh, concurrent switch race). Run" >&2
-      echo "#             'gh auth switch -u $expected' manually to recover." >&2
+      echo "#             gh auth switch -u '$expected' manually to recover." >&2
     fi
   else
-    echo "#   Result:   gh auth switch -u $expected FAILED." >&2
+    echo "#   Result:   gh auth switch -u '$expected' FAILED." >&2
     echo "#             Is $expected in the keyring? Run 'gh auth login'" >&2
     echo "#             once for that identity, then re-run preflight." >&2
   fi
