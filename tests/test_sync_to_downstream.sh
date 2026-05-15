@@ -26,7 +26,7 @@ fi
 
 [[ -x "$SCRIPT" ]] || { echo "missing or non-executable $SCRIPT" >&2; exit 1; }
 
-WORKDIR="$(mktemp -d -t sync-to-downstream-test)"
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/sync-to-downstream-test.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 # ---------------------------------------------------------------------------

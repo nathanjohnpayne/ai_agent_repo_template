@@ -22,7 +22,13 @@ TEMPLATE="$REPO_ROOT/mergepath/playground/index.html"
 # file inside with its extension intact; the dir name carries
 # uniqueness, the filename carries the .html so `open` picks the
 # right handler.
-OUT_DIR="$(mktemp -d -t mergepath-sim)"
+#
+# Use the portable `mktemp -d "$TMPDIR/name.XXXXXX"` form rather
+# than `mktemp -d -t name`: BSD mktemp treats `-t` as a prefix and
+# auto-appends a template, but GNU coreutils requires an explicit
+# `XXXXXX` placeholder and exits non-zero without one. The portable
+# form works on both. See mergepath#286.
+OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mergepath-sim.XXXXXX")"
 OUT="$OUT_DIR/mergepath.html"
 
 for bin in gh jq python3; do
@@ -41,8 +47,8 @@ echo "Fetching last $LIMIT merged PRs via gh..."
 
 # PRs payload is intermediate; same trailing-X constraint, same
 # fix. The trap only cleans up this file — OUT stays so the browser
-# can open it.
-PRS_DIR="$(mktemp -d -t mergepath-prs)"
+# can open it. Portable `mktemp -d "$TMPDIR/name.XXXXXX"` per #286.
+PRS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mergepath-prs.XXXXXX")"
 PRS_FILE="$PRS_DIR/prs.json"
 trap 'rm -rf "$PRS_DIR"' EXIT
 

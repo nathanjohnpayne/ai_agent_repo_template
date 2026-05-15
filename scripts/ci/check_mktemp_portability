@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# check_mktemp_portability
+#
+# Regression guard for mergepath#286. Hard-fails on any tracked shell
+# file that uses the BSD-only `mktemp -t <prefix>` short form. GNU
+# coreutils mktemp requires an explicit `XXXXXX` placeholder in the
+# template and exits non-zero on `mktemp -t name`, so the BSD form
+# silently breaks any Linux CI that reaches it (and any portable
+# tooling that mixes platforms). The portable form is
+# `mktemp -d "${TMPDIR:-/tmp}/<prefix>.XXXXXX"` (and the equivalent
+# without `-d` for a single file).
+#
+# Scope:
+#   - Tracked files only (no node_modules / dist / generated noise).
+#   - Limited to *.sh files and any other tracked shell-shebanged
+#     script under tests/, scripts/, and the repo root. The matcher
+#     is intentionally conservative: it only flags forms where the
+#     argument after `-t` is a bare token (no slash, no quote), which
+#     is exactly the BSD-style "name prefix" form.
+#
+# Exit codes:
+#   0 — no `mktemp -t <prefix>` occurrences found.
+#   1 — at least one occurrence found; paths + line numbers printed.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+cd "$REPO_ROOT"
+
+# git ls-files: tracked files only. -z + NUL-delim handles paths with
+# spaces. We restrict to *.sh first and additionally include any
+# tracked file whose first line is a bash/sh shebang.
+TMPFILE="$(mktemp "${TMPDIR:-/tmp}/check-mktemp-portability.XXXXXX")"
+trap 'rm -f "$TMPFILE"' EXIT
+
+# Collect candidate files.
+while IFS= read -r -d '' f; do
+  case "$f" in
+    *.sh) echo "$f" >> "$TMPFILE" ;;
+    *)
+      # Cheap shebang sniff. Only the first line is read.
+      head -n1 -- "$f" 2>/dev/null | grep -qE '^#!.*(bash|/sh)( |$)' \
+        && echo "$f" >> "$TMPFILE"
+      ;;
+  esac
+done < <(git ls-files -z)
+
+# Self-exclusion: skip this script (its comments necessarily mention
+# the forbidden form for documentation) and the script that owns the
+# regression test for #286's mktemp story.
+SELF_REL="scripts/ci/check_mktemp_portability"
+
+VIOLATIONS=0
+VIOLATION_LIST=""
+
+# The pattern targets `mktemp` followed by zero or more whitespace-
+# separated options (`-d` and friends) and then `-t <prefix>` where
+# the prefix is a bare token: starts with a letter/underscore and
+# contains no slash or quote. This is exactly the BSD short form.
+#
+# Examples this matches (BAD):
+#   mktemp -t myprefix
+#   mktemp -d -t mergepath-sim
+#   mktemp -dt myprefix
+#
+# Examples this DOES NOT match (GOOD):
+#   mktemp -d "${TMPDIR:-/tmp}/mergepath-sim.XXXXXX"
+#   mktemp /tmp/foo.XXXXXX
+#   mktemp --tmpdir name.XXXXXX
+PATTERN='mktemp([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-t[[:space:]]+[A-Za-z_][A-Za-z0-9_.-]*'
+
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
+  [[ "$file" == "$SELF_REL" ]] && continue
+  # Filter out:
+  #   - comment lines (leading-whitespace `#` — both documentation
+  #     comments and shebangs)
+  #   - lines where the `mktemp -t name` reference is INSIDE a quoted
+  #     string fed to grep / awk / sed (these are tests asserting the
+  #     bad form is NOT present in another script; flagging them
+  #     would force the check to know which strings are docs vs.
+  #     real invocations, an unwinnable game).
+  # The second filter is intentionally narrow: it requires the
+  # occurrence to be preceded by a non-quote-immediately-before
+  # context. The regex anchors `mktemp` at a word boundary that
+  # is not immediately preceded by `"` or `'`.
+  matches="$(grep -nE "$PATTERN" -- "$file" \
+    | grep -vE '^[0-9]+:[[:space:]]*#' \
+    | grep -vE "[\"']mktemp[[:space:]]" \
+    || true)"
+  if [[ -n "$matches" ]]; then
+    VIOLATIONS=$((VIOLATIONS + 1))
+    VIOLATION_LIST+="$file"$'\n'"$matches"$'\n\n'
+  fi
+done < "$TMPFILE"
+
+if [[ $VIOLATIONS -gt 0 ]]; then
+  cat >&2 <<EOF
+check_mktemp_portability: FAIL
+
+Found $VIOLATIONS file(s) using the BSD-only \`mktemp -t <prefix>\` form.
+GNU coreutils mktemp requires an explicit \`XXXXXX\` placeholder and
+exits non-zero on the BSD short form, so this break Linux CI and any
+portable tooling that mixes platforms.
+
+Replace with the portable form:
+
+    mktemp -d "\${TMPDIR:-/tmp}/<prefix>.XXXXXX"
+    mktemp    "\${TMPDIR:-/tmp}/<prefix>.XXXXXX"  # for a single file
+
+Offending files (path + line numbers):
+
+EOF
+  printf '%s' "$VIOLATION_LIST" >&2
+  exit 1
+fi
+
+echo "check_mktemp_portability: PASS"
+exit 0
