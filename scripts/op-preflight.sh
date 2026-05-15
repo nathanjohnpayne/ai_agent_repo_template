@@ -511,7 +511,16 @@ emit_from_session_file() (
     if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] || [[ ! -s "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
       exit 2
     fi
-    if ! adc_is_usable "${GOOGLE_APPLICATION_CREDENTIALS}"; then
+    # --check is the "no external probes" contract — never invoke op,
+    # ssh, OR python3. The `adc_is_usable` probe spawns python3 to
+    # validate the OAuth2 refresh token, which fires a network call.
+    # Under --check we trust the cache as-is and emit the ADC path
+    # without validating it; downstream deploy callers will surface
+    # their own auth failure if the cred is actually broken.
+    # (nathanpayne-codex Phase 4b r1 on PR #292 — they verified
+    # `--check --mode deploy` still spawned python3.)
+    if [[ "${OP_PREFLIGHT_CHECK_MODE:-0}" != "1" ]] && \
+       ! adc_is_usable "${GOOGLE_APPLICATION_CREDENTIALS}"; then
       # File exists but refresh token is rejected. Warn and skip the
       # export so downstream deploy callers can fall back to local
       # firebase-login / ADC. OP_PREFLIGHT_DONE stays 1 and PATs are
@@ -610,10 +619,11 @@ if $CHECK; then
   fi
   # The session is fresh. Emit the cached exports the same way the fast
   # path does — but DO NOT warm SSH and DO NOT call any other helpers
-  # that might prompt. emit_from_session_file's ADC-usability probe
-  # (adc_is_usable) only runs when MODE is deploy/all; --check defaults
-  # to review and the deploy fields are simply omitted when absent.
-  if cached_exports=$(emit_from_session_file); then
+  # that might prompt. Setting OP_PREFLIGHT_CHECK_MODE=1 tells
+  # emit_from_session_file to skip the ADC-usability python3 probe
+  # under `--mode deploy`/`--mode all` so the helper stays probe-free
+  # in --check mode. (nathanpayne-codex Phase 4b r1 on PR #292.)
+  if cached_exports=$(OP_PREFLIGHT_CHECK_MODE=1 emit_from_session_file); then
     rc=0
   else
     rc=$?

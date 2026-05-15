@@ -268,6 +268,68 @@ test_default_mode_is_review() {
   pass "test_default_mode_is_review: default --mode is review (no ADC)"
 }
 
+# ---------------------------------------------------------------------------
+# test_check_deploy_no_python3_probe (nathanpayne-codex Phase 4b r1 on
+# PR #292): --check --mode deploy must NOT invoke python3 to validate
+# ADC. Probe by PATH-shimming python3 with an aborting stub and
+# verifying the --check path exits 0 with cached exports rather than
+# aborting via the stub.
+# ---------------------------------------------------------------------------
+test_check_deploy_no_python3_probe() {
+  local cache_dir="$WORKDIR/deploy-no-python3-cache"
+  mkdir -p "$cache_dir" && chmod 700 "$cache_dir"
+  local adc_file="$WORKDIR/deploy-no-python3-adc.json"
+  # Fake but well-formed service_account JSON. adc_is_usable
+  # short-circuits to OK on service_account creds without HTTP, but
+  # if --check honors the contract it shouldn't even reach
+  # adc_is_usable.
+  cat > "$adc_file" <<'JSON'
+{"type":"service_account","project_id":"x","private_key_id":"x","private_key":"x","client_email":"x"}
+JSON
+  local epoch
+  epoch=$(date +%s)
+  cat > "$cache_dir/op-preflight-claude.env" <<EOF
+OP_PREFLIGHT_CREATED_AT_EPOCH=$epoch
+OP_PREFLIGHT_TTL_SECONDS=14400
+OP_PREFLIGHT_AGENT=claude
+OP_PREFLIGHT_MODE=all
+OP_PREFLIGHT_DONE=1
+OP_PREFLIGHT_REVIEWER_PAT=stub-reviewer
+OP_PREFLIGHT_AUTHOR_PAT=stub-author
+GOOGLE_APPLICATION_CREDENTIALS=$adc_file
+OP_PREFLIGHT_ADC_TMPFILE=$adc_file
+EOF
+  chmod 600 "$cache_dir/op-preflight-claude.env"
+
+  # Aborting python3 stub.
+  local py_stub="$WORKDIR/stub-bin-py"
+  mkdir -p "$py_stub"
+  cat > "$py_stub/python3" <<'EOF'
+#!/usr/bin/env bash
+echo "FATAL: --check --mode deploy invoked python3 with args: $*" >&2
+exit 97
+EOF
+  chmod +x "$py_stub/python3"
+
+  local out rc=0
+  out=$(OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+        PATH="$py_stub:$STUB_DIR:$PATH" \
+        "$SCRIPT" --agent claude --mode deploy --check 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "test_check_deploy_no_python3_probe: --check --mode deploy returned rc=$rc; out=$out"
+    return
+  fi
+  if echo "$out" | grep -q "invoked python3"; then
+    fail "test_check_deploy_no_python3_probe: --check --mode deploy invoked python3 (ADC probe leaked)"
+    return
+  fi
+  if ! echo "$out" | grep -q "export GOOGLE_APPLICATION_CREDENTIALS="; then
+    fail "test_check_deploy_no_python3_probe: --check --mode deploy did not emit ADC export; out=$out"
+    return
+  fi
+  pass "test_check_deploy_no_python3_probe: --check --mode deploy emits ADC without python3 probe"
+}
+
 test_check_fresh_cache
 test_check_missing_cache
 test_check_stale_cache
@@ -275,6 +337,7 @@ test_check_mutex
 test_status_alias
 test_quiet_mode
 test_default_mode_is_review
+test_check_deploy_no_python3_probe
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
