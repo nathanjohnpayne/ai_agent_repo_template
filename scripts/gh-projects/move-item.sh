@@ -2,8 +2,14 @@
 # Move a GitHub Project v2 item (by issue number) to a named Status swimlane.
 #
 # Usage:
+#   # Front-load the preflight, then run with the cached PAT.
+#   eval "$(scripts/op-preflight.sh --agent claude --mode review)"
 #   PROJECT=5 OWNER=nathanjohnpayne REPO=nathanjohnpayne/nathanpaynedotcom \
-#     GH_TOKEN="$(op read ...)" ./move-item.sh <issue_number> <status_name>
+#     GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT" ./move-item.sh <issue_number> <status_name>
+#
+# (The earlier example showed `GH_TOKEN="$(op read ...)"`, which is the
+# disallowed inline-secret-read pattern — caught by CodeRabbit on the
+# 024e0da propagation wave, #272.)
 #
 # <status_name> is the human-readable option name: Todo, In Progress, In Review,
 # Human, Done (or whatever options exist on the project's Status field).
