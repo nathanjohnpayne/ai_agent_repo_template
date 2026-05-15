@@ -83,21 +83,30 @@ if [ -z "$COMMAND" ]; then exit 0; fi
 # anything), so it remains safe.
 # `pr edit` is ALWAYS adjacent in a real invocation — `edit` is the
 # subcommand of `pr`, nothing goes between (global flags like
-# `-R` / `--repo` go before `pr`, so `gh -R x pr edit` still has the
-# adjacent ` pr edit`). Requiring the adjacent substring — not the
-# old `*gh*pr*edit*` scatter — stops a `gh pr create` whose body
-# prose merely contains the word "edit" from tripping the
-# tokenize-and-fail-closed path below: that over-match plus the
-# #275 fail-closed change was blocking legitimate `gh pr create`s.
+# `-R` / `--repo` go before `pr`, so `gh -R x pr edit` still has
+# `pr` directly followed by whitespace and then `edit`).
+#
+# Use a bash `[[ =~ ]]` regex (NOT a `case` glob) so we can express
+# "one or more whitespace" between `pr` and `edit`: the regex is
+# parsed dynamically at runtime, whereas extglob `+(...)` syntax
+# would be a parse-time error here (`shopt -s extglob` at runtime
+# is too late for the parser). The regex pattern keeps `pr` and
+# `edit` adjacency-anchored (no `.*` between them), so it:
+#   - excludes a `gh pr create` whose body prose merely contains
+#     the word "edit" (the old `*gh*pr*edit*` scatter matched that,
+#     and combined with #275's fail-closed-on-untokenizable change
+#     it was blocking legitimate `gh pr create`s);
+#   - is NOT bypassable by a tab or multiple spaces between `pr`
+#     and `edit` (a plain `" pr edit"` literal substring was —
+#     CodeRabbit Major on PR #277);
+#   - stays adjacency-anchored.
 # String screening is still imperfect (a body that literally
-# contains the adjacent text " pr edit" residually matches), but
-# this `case` is only a cheap pre-filter — the post-tokenize token
-# walk further down is the precise source of truth. (CodeRabbit /
-# #272.)
-case "$COMMAND" in
-  *gh*" pr edit"*) ;;
-  *) exit 0 ;;
-esac
+# contains `pr` <ws+> `edit` adjacent residually matches), but this
+# check is only a cheap pre-filter — the post-tokenize token walk
+# further down is the precise source of truth.
+if ! [[ "$COMMAND" =~ gh.*pr[[:space:]]+edit ]]; then
+  exit 0
+fi
 
 TMP_TOKENS=$(mktemp)
 trap 'rm -f "$TMP_CMD" "$TMP_TOKENS"' EXIT
