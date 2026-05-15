@@ -200,6 +200,14 @@ jobs:
         # added by #256 P2.
         run: ./scripts/ci/check_coderabbit_config_tests
 
+      - name: check_mktemp_portability
+        # Regression guard for mergepath#286. Hard-fails on any
+        # tracked shell file using the BSD-only `mktemp -t <prefix>`
+        # form, which GNU coreutils mktemp rejects (XXXXXX required).
+        # Closes the re-introduction surface that the closed-review
+        # backlog sweep on #286 caught.
+        run: ./scripts/ci/check_mktemp_portability
+
       - name: check_governance_files
         run: |
           MISSING=0

@@ -12,7 +12,11 @@ SCRIPT="$ROOT/scripts/policy-sim.sh"
 # macOS mktemp only substitutes trailing Xs — `name.XXXXXX.js`
 # would work once and then fail with "File exists". Use a temp
 # directory and place fixed-name files inside.
-TMPDIR_SAFE="$(mktemp -d -t mergepath-test)"
+#
+# Use the portable `mktemp -d "$TMPDIR/name.XXXXXX"` form rather
+# than `mktemp -d -t name`: GNU coreutils requires an explicit
+# `XXXXXX` placeholder. See mergepath#286.
+TMPDIR_SAFE="$(mktemp -d "${TMPDIR:-/tmp}/mergepath-test.XXXXXX")"
 CHECK_FILE="$TMPDIR_SAFE/extracted.js"
 
 cleanup() {

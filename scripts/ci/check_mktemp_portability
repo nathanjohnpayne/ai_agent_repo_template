@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# check_mktemp_portability
+#
+# Regression guard for mergepath#286. Hard-fails on any tracked shell
+# file that uses the BSD-only `mktemp -t <prefix>` short form. GNU
+# coreutils mktemp requires an explicit `XXXXXX` placeholder in the
+# template and exits non-zero on `mktemp -t name`, so the BSD form
+# silently breaks any Linux CI that reaches it (and any portable
+# tooling that mixes platforms). The portable form is
+# `mktemp -d "${TMPDIR:-/tmp}/<prefix>.XXXXXX"` (and the equivalent
+# without `-d` for a single file).
+#
+# Scope:
+#   - Tracked files only (no node_modules / dist / generated noise).
+#   - Limited to *.sh files and any other tracked shell-shebanged
+#     script under tests/, scripts/, and the repo root. The matcher
+#     is intentionally conservative: it only flags forms where the
+#     argument after `-t` is a bare token (no slash, no quote), which
+#     is exactly the BSD-style "name prefix" form.
+#
+# Exit codes:
+#   0 — no `mktemp -t <prefix>` occurrences found.
+#   1 — at least one occurrence found; paths + line numbers printed.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# MERGEPATH_MKTEMP_SCAN_ROOT env override so tests/test_check_mktemp_portability.sh
+# can point the check at fixture trees. When set, file enumeration uses
+# `find` over that root (no git involvement); otherwise the default path
+# uses `git ls-files` over $REPO_ROOT.
+SCAN_ROOT="${MERGEPATH_MKTEMP_SCAN_ROOT:-$REPO_ROOT}"
+cd "$SCAN_ROOT"
+
+TMPFILE="$(mktemp "${TMPDIR:-/tmp}/check-mktemp-portability.XXXXXX")"
+trap 'rm -f "$TMPFILE"' EXIT
+
+# Collect candidate files. Two modes:
+#   - default: git ls-files (tracked-files-only over a real repo)
+#   - test:    find over the scan root (no git index assumed)
+if [[ -n "${MERGEPATH_MKTEMP_SCAN_ROOT:-}" ]]; then
+  while IFS= read -r -d '' f; do
+    rel="${f#./}"
+    case "$rel" in
+      *.sh) echo "$rel" >> "$TMPFILE" ;;
+      *)
+        head -n1 -- "$f" 2>/dev/null | grep -qE '^#!.*(bash|/sh)( |$)' \
+          && echo "$rel" >> "$TMPFILE"
+        ;;
+    esac
+  done < <(find . -type f -print0)
+else
+  while IFS= read -r -d '' f; do
+    case "$f" in
+      *.sh) echo "$f" >> "$TMPFILE" ;;
+      *)
+        head -n1 -- "$f" 2>/dev/null | grep -qE '^#!.*(bash|/sh)( |$)' \
+          && echo "$f" >> "$TMPFILE"
+        ;;
+    esac
+  done < <(git ls-files -z)
+fi
+
+# Self-exclusion: skip files that LEGITIMATELY contain the BSD-only
+# form as part of their own purpose (documentation, regression test
+# fixtures). Without this set, the check false-flags itself and its
+# own paired test for #286 r3 — nathanpayne-codex Phase 4b finding:
+# the new tests/test_check_mktemp_portability.sh writes heredoc
+# fixtures containing `mktemp -dt mergepath-bad` (the BAD pattern
+# the regex is supposed to catch), and the check scans those
+# fixture strings and flags them.
+#
+# This script: its comments document the forbidden form by name.
+# The paired test file: its heredocs contain the forbidden form
+# AS FIXTURES — the regex catching them inside heredocs is exactly
+# the false positive r3 closes.
+SELF_REL="scripts/ci/check_mktemp_portability"
+EXCLUDE_PATHS=(
+  "scripts/ci/check_mktemp_portability"
+  "tests/test_check_mktemp_portability.sh"
+)
+
+VIOLATIONS=0
+VIOLATION_LIST=""
+
+# The pattern targets `mktemp` followed by zero or more whitespace-
+# separated short-option clusters, ending in a cluster that contains
+# `-t` (bare `-t` OR a compact combined form like `-dt`), followed
+# by a prefix-like argument — bare token, quoted string, OR variable
+# expansion.
+#
+# The cluster regex `-[a-zA-Z]*t` matches:
+#   - bare `-t`                  (zero leading letters, then 't')
+#   - compact `-dt`, `-Pt`, etc. (one or more leading letters, then 't')
+# In BSD getopt semantics `-t` consumes the next arg as the prefix,
+# so `t` must be the LAST char of the flag cluster — hence the trailing
+# `t` anchor in the regex.
+#
+# Prefix-argument alternation (#286 r3 — nathanpayne-codex Phase 4b
+# finding: r2 regex required a bare identifier as the prefix-arg, so
+# quoted forms like `mktemp -t "prefix"` and variable forms like
+# `mktemp -t "$prefix"` slipped through. r3 extends the alternation):
+#   - "..."   double-quoted bare-name (no slashes inside — slashes
+#             would indicate the portable template form)
+#   - '...'   single-quoted bare-name
+#   - $VAR    $-prefixed variable expansion (with or without braces)
+#   - bare    identifier (existing coverage)
+#
+# Examples this matches (BAD):
+#   mktemp -t myprefix
+#   mktemp -d -t mergepath-sim
+#   mktemp -dt myprefix
+#   mktemp -Pdt myprefix
+#   mktemp -t "prefix"             (r3: quoted bare-name)
+#   mktemp -t 'prefix'             (r3: single-quoted bare-name)
+#   mktemp -t "$prefix"            (r3: quoted variable expansion)
+#   mktemp -t ${prefix}            (r3: bare variable expansion)
+#
+# Examples this DOES NOT match (GOOD):
+#   mktemp -d "${TMPDIR:-/tmp}/mergepath-sim.XXXXXX"  (slashes in quote)
+#   mktemp "/tmp/foo.XXXXXX"                          (no -t)
+#   mktemp --tmpdir name.XXXXXX                       (no -t flag)
+#   mktemp -d                                         (no -t, no prefix-arg)
+PATTERN='mktemp([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*t[[:space:]]+("[^"/]*"|'"'"'[^'"'"'/]*'"'"'|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|[A-Za-z_][A-Za-z0-9_.-]*)'
+
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
+  # Skip any path on the self-exclusion list (docs + regression
+  # fixtures that legitimately reference the BSD form). Keep the
+  # SELF_REL variable above as the primary self-skip for readability;
+  # EXCLUDE_PATHS extends it to the paired test file.
+  skip_file=0
+  for ex in "${EXCLUDE_PATHS[@]}"; do
+    if [[ "$file" == "$ex" ]]; then skip_file=1; break; fi
+  done
+  [[ "$skip_file" -eq 1 ]] && continue
+  # Filter out:
+  #   - comment lines (leading-whitespace `#` — both documentation
+  #     comments and shebangs)
+  #   - lines where the `mktemp -t name` reference is INSIDE a quoted
+  #     string fed to grep / awk / sed (these are tests asserting the
+  #     bad form is NOT present in another script; flagging them
+  #     would force the check to know which strings are docs vs.
+  #     real invocations, an unwinnable game).
+  # The second filter is intentionally narrow: it requires the
+  # occurrence to be preceded by a non-quote-immediately-before
+  # context. The regex anchors `mktemp` at a word boundary that
+  # is not immediately preceded by `"` or `'`.
+  matches="$(grep -nE "$PATTERN" -- "$file" \
+    | grep -vE '^[0-9]+:[[:space:]]*#' \
+    | grep -vE "[\"']mktemp[[:space:]]" \
+    || true)"
+  if [[ -n "$matches" ]]; then
+    VIOLATIONS=$((VIOLATIONS + 1))
+    VIOLATION_LIST+="$file"$'\n'"$matches"$'\n\n'
+  fi
+done < "$TMPFILE"
+
+if [[ $VIOLATIONS -gt 0 ]]; then
+  cat >&2 <<EOF
+check_mktemp_portability: FAIL
+
+Found $VIOLATIONS file(s) using the BSD-only \`mktemp -t <prefix>\` form.
+GNU coreutils mktemp requires an explicit \`XXXXXX\` placeholder and
+exits non-zero on the BSD short form, so this break Linux CI and any
+portable tooling that mixes platforms.
+
+Replace with the portable form:
+
+    mktemp -d "\${TMPDIR:-/tmp}/<prefix>.XXXXXX"
+    mktemp    "\${TMPDIR:-/tmp}/<prefix>.XXXXXX"  # for a single file
+
+Offending files (path + line numbers):
+
+EOF
+  printf '%s' "$VIOLATION_LIST" >&2
+  exit 1
+fi
+
+# Run the regression test suite if present. Guarded by absence of
+# MERGEPATH_MKTEMP_SCAN_ROOT so the test harness's fixture-mode
+# invocations (which set that env) don't recurse back through the
+# test suite. Same recursion-guard pattern as check_sync_manifest.
+TEST_SUITE="$REPO_ROOT/tests/test_check_mktemp_portability.sh"
+if [[ -z "${MERGEPATH_MKTEMP_SCAN_ROOT:-}" ]] && [[ -x "$TEST_SUITE" ]]; then
+  echo "check_mktemp_portability: running regression test suite"
+  if ! bash "$TEST_SUITE"; then
+    echo "check_mktemp_portability: FAIL (regression test suite failed)"
+    exit 1
+  fi
+fi
+
+echo "check_mktemp_portability: PASS"
+exit 0
