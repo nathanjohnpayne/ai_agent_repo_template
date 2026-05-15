@@ -52,6 +52,18 @@
 
 set -eo pipefail
 
+# --- preflight auto-source (#282) ------------------------------------------
+# If OP_PREFLIGHT_REVIEWER_PAT is unset and a fresh op-preflight cache
+# exists for this agent, source it. The existing PAT_GH_TOKEN logic
+# below already prefers OP_PREFLIGHT_REVIEWER_PAT over GH_TOKEN, so this
+# block needs only to populate the env var. Silent on no-op paths.
+__RESOLVE_THREADS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ] && [ -r "$__RESOLVE_THREADS_DIR/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=lib/preflight-helpers.sh
+  . "$__RESOLVE_THREADS_DIR/lib/preflight-helpers.sh"
+  auto_source_preflight
+fi
+
 usage() {
   cat <<'EOF' >&2
 Usage: scripts/resolve-pr-threads.sh <PR#> [--repo owner/name] [--list]

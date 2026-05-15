@@ -78,22 +78,43 @@ keyring active is your agent identity. No switch needed for commits.
 
 ## Session start (run once)
 
-0. Run credential preflight to front-load all biometric prompts:
-   `eval "$(scripts/op-preflight.sh --agent claude --mode all)"`
-   This caches PATs and deploy credentials in a chmod-600 session file
-   at `$XDG_CACHE_HOME/mergepath/op-preflight-claude.env` (default
-   `$HOME/.cache/mergepath/`). Safe to re-run at the top of every tool
-   call — within the TTL (4h default, override via
-   `OP_PREFLIGHT_TTL_SECONDS`) the script reads the session file and
-   emits the same exports without a new biometric prompt. Read-path
-   API calls and helper scripts use
-   `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` (or `…AUTHOR_PAT`) instead
-   of `op read`. Write paths (`gh pr review` / `create` / `merge` /
-   `edit`) use the active keyring account regardless of `GH_TOKEN`
-   per the Active-account convention above.
+0. Run credential preflight to front-load all biometric prompts. The
+   canonical session-loop snippet (see REVIEW_POLICY.md § Phase 0 for
+   the full doc, and § PAT lookup table for the per-agent item IDs):
+
+   ```bash
+   # Session start (one biometric burst). Default --mode is `review`.
+   eval "$(scripts/op-preflight.sh --agent claude --mode review)"
+
+   # Every subsequent tool call (idempotent, NEVER prompts):
+   eval "$(scripts/op-preflight.sh --agent claude --check)"
+
+   # Read-path API call (uses cached PAT, no biometric):
+   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login
+
+   # Write-path API call (gh keyring active = nathanpayne-<agent>):
+   gh pr review <PR#> --comment --body "..."
+
+   # Author write (temporary switch via the gh-as-author.sh wrapper):
+   scripts/gh-as-author.sh -- gh pr create ...
+   ```
+
+   The cache lives at `$XDG_CACHE_HOME/mergepath/op-preflight-claude.env`
+   (default `$HOME/.cache/mergepath/`), chmod 600. The `--check` mode
+   is a read-only validator: it never invokes `op`, never warms SSH,
+   never reads ADC; on a missing/stale cache it exits non-zero with a
+   pointer back at `--mode review`. Safe to re-run at the top of every
+   tool call. Within the TTL (4h default, override via
+   `OP_PREFLIGHT_TTL_SECONDS`) the script emits the cached exports
+   without a new biometric prompt. Set `OP_PREFLIGHT_QUIET=1` to
+   collapse the cache-hit stderr block to a single line.
+
    Run `scripts/op-preflight.sh --agent claude --purge` at end of
-   session to wipe the cache. If preflight was not run (or failed), fall
-   back to inline `op read` (original pattern).
+   session to wipe the cache. If preflight is unavailable (e.g.
+   first-time bootstrap on a fresh machine), fall back to inline
+   `op read` per REVIEW_POLICY.md § PAT lookup table > Fallback —
+   every call triggers biometric, so use only for setup, never for
+   routine work.
 
 ## Before opening a PR
 

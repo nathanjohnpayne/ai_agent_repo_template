@@ -24,29 +24,51 @@ This repository uses a multi-identity AI agent code review system. The full poli
 
 ### Workflow Summary
 
-0. Run credential preflight at the start of every PR session (and safely
-   at the top of every subsequent tool call — re-running within the TTL
-   returns cached values without a new biometric prompt):
-   `eval "$(scripts/op-preflight.sh --agent {your-agent} --mode all)"`
-   This triggers biometric prompts once and writes a chmod-600 session
-   file at `$XDG_CACHE_HOME/mergepath/op-preflight-<agent>.env` so fresh
-   subshells can reuse the credentials (see REVIEW_POLICY.md § Phase 0).
-   `gh` resolves auth differently for read vs write paths: read paths
-   (`gh api user`, GETs, helper scripts) honor `GH_TOKEN`; write paths
-   (`gh pr review`, `gh pr create`, `gh pr merge`, `gh pr edit`) use
-   the keyring's **active** account. Set the active account once per
-   machine: `gh auth switch -u nathanpayne-{your-agent}`. Then use
-   `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` (or `$OP_PREFLIGHT_AUTHOR_PAT`)
-   only for read-path API calls and helper scripts. For author-identity
-   writes (PR create/merge/label edits), MUST wrap the call in
-   `scripts/gh-as-author.sh -- gh pr create ...` — a single bash process
-   that switches, runs, and switches back via `trap EXIT`. Splitting the
-   sequence across two Bash tool calls lands the PR under the wrong
-   identity (#241). The `gh-pr-guard.sh` PreToolUse hook now blocks
-   `gh pr create` when the keyring's active is not `nathanjohnpayne`.
-   See REVIEW_POLICY.md § Reviewer PAT Quick Start for the full convention
-   and § Recovery: PR created under the wrong identity for what to do
-   if a PR already landed under the wrong account.
+0. Run credential preflight at the start of every PR session. The
+   canonical session-loop snippet (read-path GH_TOKEN, write-path
+   active-keyring, author-write wrapper — full details in REVIEW_POLICY.md
+   § Phase 0 and § PAT lookup table):
+
+   ```bash
+   # Session start (one biometric burst). Default --mode is `review`.
+   eval "$(scripts/op-preflight.sh --agent {your-agent} --mode review)"
+
+   # Every subsequent tool call (idempotent, NEVER prompts):
+   eval "$(scripts/op-preflight.sh --agent {your-agent} --check)"
+
+   # Read-path API call (uses cached PAT, no biometric):
+   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login
+
+   # Write-path API call (gh keyring active = nathanpayne-{your-agent}):
+   gh pr review <PR#> --comment --body "..."
+
+   # Author write (temporary switch via the gh-as-author.sh wrapper):
+   scripts/gh-as-author.sh -- gh pr create ...
+   ```
+
+   `--check` (alias `--status`) is the lightweight re-validator: never
+   invokes `op`, never warms SSH, exits non-zero on missing/stale
+   cache. Set `OP_PREFLIGHT_QUIET=1` to collapse the cache-hit stderr
+   block. The helper scripts (`coderabbit-wait.sh`,
+   `codex-review-request.sh`, `codex-review-check.sh`,
+   `resolve-pr-threads.sh`, `request-label-removal.sh`) auto-source
+   the cache when `GH_TOKEN` is unset (#282), so the explicit
+   `GH_TOKEN=...` prefix is optional once preflight has run.
+
+   Set the gh keyring active account once per machine: `gh auth switch
+   -u nathanpayne-{your-agent}`. Then read-path commands use
+   `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"`; write paths use the
+   keyring active. For author-identity writes (PR create/merge/label
+   edits), MUST wrap the call in `scripts/gh-as-author.sh -- gh pr
+   create ...` — a single bash process that switches, runs, and
+   switches back via `trap EXIT`. Splitting the sequence across two
+   Bash tool calls lands the PR under the wrong identity (#241). The
+   `gh-pr-guard.sh` PreToolUse hook now blocks `gh pr create` when
+   the keyring's active is not `nathanjohnpayne`. See REVIEW_POLICY.md
+   § Reviewer PAT Quick Start for the full convention and § Recovery:
+   PR created under the wrong identity for what to do if a PR already
+   landed under the wrong account.
+
    Run `scripts/op-preflight.sh --agent {your-agent} --purge` (or
    `--purge-all`) at end of session to delete the cached PATs.
 1. Author code as nathanjohnpayne. File a PR.

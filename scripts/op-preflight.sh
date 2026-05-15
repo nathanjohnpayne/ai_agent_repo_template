@@ -16,22 +16,35 @@
 # motivated this design.
 #
 # Usage:
-#   eval "$(scripts/op-preflight.sh --agent claude --mode all)"
+#   # Session start (one biometric burst) — review mode is the default:
+#   eval "$(scripts/op-preflight.sh --agent claude --mode review)"
+#
+#   # Idempotent re-check at the top of every subsequent tool call. NEVER
+#   # prompts for biometric; exits non-zero if no fresh cache exists:
+#   eval "$(scripts/op-preflight.sh --agent claude --check)"
 #
 #   # Force a fresh fetch even if the session file is still warm:
-#   eval "$(scripts/op-preflight.sh --agent claude --mode all --refresh)"
+#   eval "$(scripts/op-preflight.sh --agent claude --refresh)"
+#
+#   # Deploy scripts that genuinely need deploy credentials:
+#   eval "$(scripts/op-preflight.sh --agent claude --mode deploy)"
 #
 #   # Delete the session file + ADC tempfile (end-of-session cleanup):
 #   scripts/op-preflight.sh --agent claude --purge
 #
 # Modes:
-#   review  — reviewer PAT + author PAT + SSH key warming
+#   review  — reviewer PAT + author PAT + SSH key warming (DEFAULT)
 #   deploy  — GCP ADC credential + Cloudflare cache-purge token
-#   all     — everything (default)
+#   all     — everything
 #
 # Flags:
 #   --agent <name>   Agent name: claude, cursor, or codex (required except --purge-all)
-#   --mode <mode>    review, deploy, or all (default: all)
+#   --mode <mode>    review, deploy, or all (default: review). #282
+#   --check          Validate the session file is fresh and emit cached
+#   --status         (alias for --check) exports WITHOUT invoking op.
+#                    Never burns biometric, never warms SSH, never reads
+#                    ADC. Exits non-zero if cache missing/stale. Mutually
+#                    exclusive with --refresh, --purge, --purge-all. #282
 #   --dry-run        Show what would be fetched without prompting
 #   --skip-ssh       Skip SSH key warming (useful in CI or non-interactive)
 #   --refresh        Force biometric fetch even if session file is fresh
@@ -53,6 +66,11 @@
 #                             shorter than 4h. Skipping re-warm within
 #                             this window prevents a biometric prompt on
 #                             every cache-hit invocation. See #163.
+#   OP_PREFLIGHT_QUIET        When set to 1, suppress the verbose
+#                             cached-hit stderr block. A single-line
+#                             "# preflight: cache hit, no biometric
+#                             burned" message replaces it. Refresh
+#                             notices and warnings are unaffected. #282
 #
 # Session file:
 #   Path:        $cache_dir/op-preflight-<agent>.env
@@ -131,13 +149,19 @@ DEFAULT_CF_TOKEN_OP_URI="${CF_TOKEN_OP_URI:-op://Private/4x6wslp3f6pal5t6h3jhhe6
 SSH_AUTHOR_HOST="github.com"
 
 # ── Parse arguments ───────────────────────────────────────────────────
+# Default --mode is `review` (was `all` prior to #282). The vast majority
+# of agent tool calls only need the reviewer/author PATs + SSH warming;
+# loading ADC + Cloudflare on every preflight bloated the biometric
+# burst for no reason. Deploy scripts that genuinely need deploy
+# credentials must pass `--mode deploy` or `--mode all` explicitly.
 AGENT=""
-MODE="all"
+MODE="review"
 DRY_RUN=false
 SKIP_SSH=false
 REFRESH=false
 PURGE=false
 PURGE_ALL=false
+CHECK=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -148,13 +172,25 @@ while [[ $# -gt 0 ]]; do
     --refresh) REFRESH=true; shift ;;
     --purge) PURGE=true; shift ;;
     --purge-all) PURGE_ALL=true; shift ;;
+    --check|--status) CHECK=true; shift ;;
     *)
       echo "Error: unknown argument: $1" >&2
-      echo "Usage: eval \"\$(scripts/op-preflight.sh --agent claude --mode all)\"" >&2
+      echo "Usage: eval \"\$(scripts/op-preflight.sh --agent claude --mode review)\"" >&2
       exit 1
       ;;
   esac
 done
+
+# ── --check / --status mutual exclusion (#282) ────────────────────────
+# --check is the "never invoke op, never warm SSH, never touch ADC"
+# read-only validator. It is mutually exclusive with anything that
+# would mutate state or burn biometric.
+if $CHECK; then
+  if $REFRESH || $PURGE || $PURGE_ALL; then
+    echo "Error: --check / --status is mutually exclusive with --refresh, --purge, --purge-all." >&2
+    exit 1
+  fi
+fi
 
 # ── Validate ──────────────────────────────────────────────────────────
 if $PURGE_ALL; then
@@ -165,9 +201,9 @@ if $PURGE_ALL; then
   exit 0
 fi
 
-if [[ "$MODE" == "review" || "$MODE" == "all" || "$PURGE" == "true" ]] && [[ -z "$AGENT" ]]; then
-  echo "Error: --agent is required for review, all, or --purge mode." >&2
-  echo "Usage: eval \"\$(scripts/op-preflight.sh --agent claude --mode all)\"" >&2
+if [[ "$MODE" == "review" || "$MODE" == "all" || "$PURGE" == "true" || "$CHECK" == "true" ]] && [[ -z "$AGENT" ]]; then
+  echo "Error: --agent is required for review, all, --purge, or --check mode." >&2
+  echo "Usage: eval \"\$(scripts/op-preflight.sh --agent claude --mode review)\"" >&2
   exit 1
 fi
 
@@ -185,6 +221,8 @@ fi
 SESSION_FILE="$CACHE_DIR/op-preflight-$AGENT.env"
 ADC_TMPFILE="$CACHE_DIR/op-preflight-$AGENT-adc.json"
 SSH_WARM_MARKER="$CACHE_DIR/op-preflight-$AGENT.ssh-warmed"
+BIOMETRIC_LOG="$CACHE_DIR/biometric-log"  # #282: append a one-line
+                                          # record on each fresh fetch.
 SSH_WARM_TTL_SECONDS="${OP_PREFLIGHT_SSH_WARM_TTL_SECONDS:-1800}"  # 30 min default; #163
 # Validate the override is a non-negative integer before any arithmetic
 # context (`[[ "$age" -lt "$SSH_WARM_TTL_SECONDS" ]]` later in the
@@ -197,6 +235,27 @@ if [[ ! "$SSH_WARM_TTL_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "# WARNING: OP_PREFLIGHT_SSH_WARM_TTL_SECONDS='$SSH_WARM_TTL_SECONDS' is not a non-negative integer; falling back to default 1800s" >&2
   SSH_WARM_TTL_SECONDS=1800
 fi
+
+# ── Biometric trigger log (#282) ──────────────────────────────────────
+# Append a one-line record every time we trigger a fresh op fetch (i.e.
+# every time `op inject` or `op read` is invoked for cache population).
+# Format: `<ISO8601> agent=<agent> mode=<mode> reason=<reason>` so a
+# session audit can correlate biometric prompts against agent behavior.
+# Always-on (independent of OP_PREFLIGHT_QUIET) — the file is local-only
+# and there's no privacy / log-volume tradeoff to suppress it for.
+log_biometric_trigger() {
+  local reason="${1:-full-fetch}"
+  local now_iso
+  now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%FT%TZ)
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  if [[ ! -f "$BIOMETRIC_LOG" ]]; then
+    touch "$BIOMETRIC_LOG" 2>/dev/null || return 0
+    chmod 600 "$BIOMETRIC_LOG" 2>/dev/null || true
+  fi
+  printf '%s agent=%s mode=%s reason=%s\n' \
+    "$now_iso" "${AGENT:-unknown}" "${MODE:-unknown}" "$reason" \
+    >> "$BIOMETRIC_LOG" 2>/dev/null || true
+}
 
 # ── Purge mode ────────────────────────────────────────────────────────
 if $PURGE; then
@@ -536,6 +595,50 @@ warm_ssh_keys() {
   chmod 600 "$SSH_WARM_MARKER" 2>/dev/null || true
 }
 
+# ── --check / --status mode (#282) ────────────────────────────────────
+# Read-only validator: emit cached exports if the session file is fresh,
+# OR exit non-zero with a diagnostic if it is missing/stale. NEVER
+# invokes op, NEVER warms SSH, NEVER reads ADC. Designed to be re-run
+# at the top of every agent tool call without the biometric prompt risk
+# of `--mode review`.
+if $CHECK; then
+  if ! session_is_fresh; then
+    echo "# preflight: cache missing or stale for agent=$AGENT" >&2
+    echo "#   run: scripts/op-preflight.sh --agent $AGENT --mode review" >&2
+    echo "#   then re-run this command." >&2
+    exit 2
+  fi
+  # The session is fresh. Emit the cached exports the same way the fast
+  # path does — but DO NOT warm SSH and DO NOT call any other helpers
+  # that might prompt. emit_from_session_file's ADC-usability probe
+  # (adc_is_usable) only runs when MODE is deploy/all; --check defaults
+  # to review and the deploy fields are simply omitted when absent.
+  if cached_exports=$(emit_from_session_file); then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [[ "$rc" != "0" ]]; then
+    echo "# preflight: cache present but incomplete for agent=$AGENT (mode=$MODE)" >&2
+    echo "#   run: scripts/op-preflight.sh --agent $AGENT --mode review" >&2
+    exit 2
+  fi
+  echo "$cached_exports"
+  if [[ "${OP_PREFLIGHT_QUIET:-0}" != "1" ]]; then
+    epoch=$(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$SESSION_FILE" | cut -d= -f2- | tr -d "'\"" || true)
+    now=$(date +%s)
+    if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+      age=$(( now - 10#$epoch ))
+    else
+      age=$now
+    fi
+    echo "# preflight: --check ok (age ${age}s / TTL ${TTL_SECONDS}s, no biometric)" >&2
+  else
+    echo "# preflight: cache hit, no biometric burned" >&2
+  fi
+  exit 0
+fi
+
 # ── Refresh forces both PAT cache + SSH-warm marker invalidation ─────
 # (--refresh is the "I want a brand-new biometric burst" knob; honor
 # it for SSH too, otherwise the warm would skip via the marker.)
@@ -581,20 +684,48 @@ if ! $REFRESH && session_is_fresh; then
     if [[ "$MODE" == "review" || "$MODE" == "all" ]] && ! $SKIP_SSH; then
       warm_ssh_keys
     fi
-    echo "" >&2
-    echo "# ── Preflight cached hit (age ${age}s / TTL ${TTL_SECONDS}s) ──" >&2
-    echo "# Session file: $SESSION_FILE" >&2
-    for line in "${SUMMARY[@]}"; do
-      echo "#   $line" >&2
-    done
-    echo "# Run with --refresh to force a new biometric fetch." >&2
-    warn_active_account_mismatch
-    echo "# ──────────────────────────────────────────────────────────" >&2
+    if [[ "${OP_PREFLIGHT_QUIET:-0}" == "1" ]]; then
+      # #282: agents that re-run preflight at the top of every tool
+      # call want a single-line confirmation, not the verbose block.
+      # Refresh notices and warnings remain unaffected; only this
+      # routine cache-hit block collapses.
+      echo "# preflight: cache hit, no biometric burned" >&2
+      warn_active_account_mismatch
+    else
+      echo "" >&2
+      echo "# ── Preflight cached hit (age ${age}s / TTL ${TTL_SECONDS}s) ──" >&2
+      echo "# Session file: $SESSION_FILE" >&2
+      for line in "${SUMMARY[@]}"; do
+        echo "#   $line" >&2
+      done
+      echo "# Run with --refresh to force a new biometric fetch." >&2
+      warn_active_account_mismatch
+      echo "# ──────────────────────────────────────────────────────────" >&2
+    fi
     exit 0
   fi
   # emit_from_session_file returned non-zero (e.g. ADC file vanished).
   # Fall through to full fetch.
   echo "# Session file stale or incomplete — refreshing" >&2
+  # Distinguish a partial-cache miss (stale ADC, cross-mode invalidation)
+  # from a full-fetch when logging the biometric trigger reason. The rc
+  # from emit_from_session_file is in scope thanks to the if-condition
+  # capture above. rc=2 means cross-mode invalidation; anything else is
+  # treated as stale-ADC by default for log clarity.
+  if [[ "${rc:-0}" == "2" ]]; then
+    BIOMETRIC_REASON="cross-mode-invalidation"
+  else
+    BIOMETRIC_REASON="stale-adc"
+  fi
+fi
+
+# Default reason for full-fetch path (no cache hit at all, or --refresh).
+if [[ -z "${BIOMETRIC_REASON:-}" ]]; then
+  if $REFRESH; then
+    BIOMETRIC_REASON="refresh"
+  else
+    BIOMETRIC_REASON="full-fetch"
+  fi
 fi
 
 # ── Preflight checks for full fetch ──────────────────────────────────
@@ -624,6 +755,7 @@ AUTHOR_PAT={{ op://Private/${AUTHOR_PAT_ITEM}/token }}
 TPL
 
   echo "# Preflight: reading PATs (one biometric prompt)..." >&2
+  log_biometric_trigger "$BIOMETRIC_REASON"
   resolved="$(op inject -i "$tpl_file")"
   rm -f "$tpl_file"
 
@@ -655,6 +787,13 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
   touch "$ADC_TMPFILE"
   chmod 600 "$ADC_TMPFILE"
 
+  # For --mode deploy (no review credentials loaded), this is the first
+  # op call of the run — log it. For --mode all, the Phase 1 op inject
+  # above already logged a single line covering the whole biometric
+  # burst, so no second log entry is needed here.
+  if [[ "$MODE" == "deploy" ]]; then
+    log_biometric_trigger "$BIOMETRIC_REASON"
+  fi
   if op read "$DEFAULT_ADC_OP_URI" > "$ADC_TMPFILE" 2>/dev/null && [[ -s "$ADC_TMPFILE" ]]; then
     if adc_is_usable "$ADC_TMPFILE"; then
       EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
