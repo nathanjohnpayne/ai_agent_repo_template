@@ -14,6 +14,16 @@ jobs:
       - name: make_ci_scripts_executable
         run: chmod +x scripts/ci/*
 
+      # Structural guard added in #269: every executable
+      # scripts/ci/check_* must be wired into this workflow as an
+      # explicit `run: ./scripts/ci/check_X` step (or carry a
+      # documented exemption comment). Catches the failure mode where
+      # a check ships on disk but never executes in CI because nobody
+      # remembered to add the matching workflow step. Pure-bash so it
+      # can run before any tooling install (yq, etc.).
+      - name: check_ci_scripts_wired
+        run: ./scripts/ci/check_ci_scripts_wired
+
       - name: check_required_root_files
         run: ./scripts/ci/check_required_root_files
 
@@ -32,6 +42,38 @@ jobs:
       - name: check_duplicate_docs
         run: ./scripts/ci/check_duplicate_docs
 
+      # Bootstrap-wizard test suites (#156). Each check_bootstrap_*
+      # script wraps the matching tests/test_bootstrap_*.sh suite
+      # that exercises the corresponding bootstrap sub-wizard so the
+      # wizards stay reproducible and a regression in any sub-wizard
+      # is caught in CI before it ships to consumer repos. Wired in
+      # #269 after the inventory of unwired scripts/ci/check_*.
+      - name: check_bootstrap_wizard
+        # Sub-A: top-level bootstrap wizard scaffolding + flow.
+        run: ./scripts/ci/check_bootstrap_wizard
+
+      - name: check_bootstrap_template_mirror
+        # Sub-B: template-mirror bootstrap that seeds a downstream
+        # repo with the canonical mergepath template files.
+        run: ./scripts/ci/check_bootstrap_template_mirror
+
+      - name: check_bootstrap_github_infra
+        # Sub-C: GitHub infrastructure bootstrap (labels, branch
+        # protection, required workflows) for a fresh consumer repo.
+        run: ./scripts/ci/check_bootstrap_github_infra
+
+      - name: check_bootstrap_firebase_and_codereview
+        # Sub-D: Firebase + code-review configuration bootstrap.
+        # Validates the wizard correctly disables CodeRabbit for
+        # private consumer repos (free tier is public-only).
+        run: ./scripts/ci/check_bootstrap_firebase_and_codereview
+
+      - name: check_bootstrap_board_and_summary
+        # Sub-E: Project board + bootstrap-summary generation.
+        # Ensures the wizard's end-state artifacts stay in sync with
+        # the canonical templates.
+        run: ./scripts/ci/check_bootstrap_board_and_summary
+
       - name: check_review_policy_exists
         run: |
           MISSING=0
@@ -44,6 +86,15 @@ jobs:
             MISSING=1
           fi
           exit $MISSING
+
+      # WIRED-EXEMPT: check_op_firebase_deploy_integration — opt-in
+      # local-only resolver smoke test for `scripts/firebase/op-firebase-deploy`
+      # (#211). Gated on MERGEPATH_RUN_INTEGRATION=1 in the script's
+      # own header; defaults to SKIPPED + exit 0 so wiring it into
+      # repo_lint.yml would just add a SKIPPED step. The check_ci_scripts_wired
+      # exemption keeps it executable on disk (so operators can run it
+      # locally with the env var) without requiring a no-op CI step.
+      # See #289 r4 / #290 / #269 — nathanpayne-codex Phase 4b finding.
 
       - name: check_codex_scripts
         run: ./scripts/ci/check_codex_scripts
@@ -121,6 +172,13 @@ jobs:
 
       - name: check_sync_manifest
         run: ./scripts/ci/check_sync_manifest
+
+      - name: check_sync_overrides
+        # Exercises tests/test_sync_overrides.sh — verifies the
+        # per-consumer sync override semantics (#200) so a downstream
+        # repo can opt files out of the propagation lane without the
+        # mirror lane silently re-overwriting them.
+        run: ./scripts/ci/check_sync_overrides
 
       - name: check_coderabbit_config
         # Validates the template-level .coderabbit.yml stays on the

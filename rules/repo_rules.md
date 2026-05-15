@@ -70,3 +70,21 @@ All checks must pass before merge.
 - check_eslint_config_policy: runs `tests/test_eslint_policy_check.sh` — unit tests for the policy check itself.
 - check_disagreement_detector: `scripts/disagreement-detector.cjs` + `tests/test_disagreement_detector.sh` + the fixture directory `scripts/ci/fixtures/disagreement-detector/` must exist, and the fixture-driven suite must pass. The detector module holds the decision logic for `.github/workflows/agent-review.yml`'s `detect-disagreement` job — the workflow `require()`s it so the live job and the test share one implementation. The check also asserts the workflow still references the module (re-inlining the logic would let it rot silently). The detector scopes "live disagreement" to the current HEAD, takes the latest non-DISMISSED review per reviewer, and only fires `needs-human-review` when allow-listed reviewers conflict on `pr.head.sha` — closing the #259 false-positive where a stale CHANGES_REQUESTED re-applied the label after a clean APPROVED.
 - check_verify_propagation_pr: `scripts/workflow/verify-propagation-pr.sh` + `tests/test_verify_propagation_pr.sh` must exist and the fixture-driven suite must pass. The verifier is the security-load-bearing teeth of the propagation-PR review lane (#264 / #268, REVIEW_POLICY.md § Phase 3.5): it byte-compares every file a sync PR changes against `mergepath@<sha>`'s content + manifest, so the lane only ever skips Phase 4 external review for a PR that is *provably* a verbatim mirror of already-reviewed content. A path-confinement-only check would be a hole — `.github/workflows/*` is itself propagation surface — so the check is a real content comparison sourced entirely from the immutable public `mergepath@<sha>` the PR's branch name points at.
+- check_ci_scripts_wired: every `scripts/ci/check_*` file (executable
+  or not — see r5 below) must be invoked as an explicit
+  `run: ./scripts/ci/check_X` step in `.github/workflows/repo_lint.yml`,
+  OR carry a documented exemption on a
+  `# WIRED-EXEMPT: check_X — reason` line in the same workflow.
+  Comment-only mentions of a check (e.g. inside a comment block) do
+  NOT count as wiring — only real `run:` lines. Pure-bash so it can
+  run before the yq install. Catches the #269 failure mode where a
+  check ships on disk and passes review under its own tests yet
+  never actually executes in CI because the matching workflow step
+  was never added. The check itself must be wired into repo_lint.yml.
+  Note (#269 r5): the guard counts ALL `check_*` files regardless of
+  executable bit. The earlier r3-r4 spec carved out non-executable
+  files as "WIP skip", but repo_lint.yml runs
+  `chmod +x scripts/ci/*` BEFORE this guard, so on CI every check_*
+  is executable regardless of pre-chmod permission. Aligning the
+  guard with production reality is more honest than enforcing a
+  contract the workflow order silently breaks.

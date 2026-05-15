@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# check_ci_scripts_wired
+#
+# Structural guard for #269: every executable scripts/ci/check_* on
+# disk must be invoked as an explicit `run: ./scripts/ci/check_X`
+# step in .github/workflows/repo_lint.yml. Without this guard a
+# check can ship on disk, pass review under its own tests, and yet
+# never actually run in CI because nobody remembered to add the
+# matching workflow step. That is exactly the failure mode the
+# inventory in #269 surfaced (6 unwired check_* scripts).
+#
+# Rules:
+#   - EVERY scripts/ci/check_* file (executable OR NOT) counts as
+#     "on disk" and must be wired or exempted. The earlier r3-r4
+#     spec carved out non-executable files as "work-in-progress
+#     skip"; nathanpayne-codex Phase 4b r4 caught that the workflow
+#     runs `chmod +x scripts/ci/*` BEFORE this guard, so on CI every
+#     check_* is executable regardless of its pre-chmod permission.
+#     The carve-out only ever matched in local dev; in production
+#     the exclusion was a no-op. Aligning the guard with production
+#     reality is more honest than enforcing a contract the workflow
+#     order silently breaks. (#269 r5.)
+#   - A check is "wired" only if there is a line in repo_lint.yml
+#     matching `run: ./scripts/ci/check_X` (or
+#     `run: ./scripts/ci/check_X<space>`). Comment-only mentions
+#     ("# check_X covers …") do NOT count — that was the trap in #269
+#     where check_verify_propagation_pr was only referenced in a
+#     comment block until #267 wired it for real.
+#   - Duplicate wires (the same script listed in two steps) are
+#     tolerated — inefficient, but not a correctness failure.
+#   - Exemptions: if a check is intentionally not wired (e.g. it is
+#     a helper invoked by another check rather than a top-level
+#     workflow step, OR it's an opt-in local-only check like
+#     check_op_firebase_deploy_integration), add a
+#     `# WIRED-EXEMPT: check_X — reason` line anywhere in
+#     repo_lint.yml. The check honors that exemption.
+#
+# Implementation is pure Bash/awk so this script can run BEFORE any
+# yq install — it is one of the first steps in repo_lint.yml.
+#
+# Enforces the `rules/repo_rules.md` § CI Enforcement entry that
+# every scripts/ci/check_* must be wired or documented-exempt.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+WORKFLOW="$REPO_ROOT/.github/workflows/repo_lint.yml"
+CHECK_DIR="$REPO_ROOT/scripts/ci"
+
+if [[ ! -f "$WORKFLOW" ]]; then
+  echo "FAIL: workflow not found: $WORKFLOW" >&2
+  echo "check_ci_scripts_wired: FAIL" >&2
+  exit 1
+fi
+
+if [[ ! -d "$CHECK_DIR" ]]; then
+  echo "FAIL: check directory not found: $CHECK_DIR" >&2
+  echo "check_ci_scripts_wired: FAIL" >&2
+  exit 1
+fi
+
+# Enumerate ALL check_* files in scripts/ci/, regardless of executable
+# bit. See the r5 comment block above for why the perm filter was
+# dropped — the workflow's `chmod +x scripts/ci/*` step makes the
+# distinction meaningless on CI. The script itself
+# (check_ci_scripts_wired) is included; it must also be wired.
+ON_DISK=()
+while IFS= read -r -d '' file; do
+  base="$(basename "$file")"
+  ON_DISK+=("$base")
+done < <(find "$CHECK_DIR" -maxdepth 1 -type f -name 'check_*' -print0 | LC_ALL=C sort -z)
+
+if [[ ${#ON_DISK[@]} -eq 0 ]]; then
+  echo "FAIL: no check_* files found in $CHECK_DIR" >&2
+  echo "check_ci_scripts_wired: FAIL" >&2
+  exit 1
+fi
+
+# Extract the set of wired check_* names from repo_lint.yml. A line
+# counts as wiring iff its first non-whitespace token is `run:` and
+# the next token is `./scripts/ci/check_<name>` (possibly followed by
+# whitespace/end-of-line). awk handles the comment-strip + run-line
+# detection so a comment that happens to contain
+# "./scripts/ci/check_X" does NOT count.
+WIRED=$(awk '
+  {
+    # Strip trailing comments. A `#` outside quotes terminates the
+    # statement. The workflow does not use # inside string literals
+    # for these steps, so a naive split is sufficient.
+    sub(/[[:space:]]*#.*$/, "")
+    # Match `run: ./scripts/ci/check_<name>` after optional leading
+    # whitespace. The trailing boundary is end-of-line, whitespace,
+    # or a shell separator (;, &, |). This deliberately does NOT
+    # match `run: |` blocks that *contain* the path inside a shell
+    # script — those are inline checks, not wired steps.
+    if (match($0, /^[[:space:]]*run:[[:space:]]*\.\/scripts\/ci\/check_[A-Za-z0-9_]+/)) {
+      line = substr($0, RSTART, RLENGTH)
+      sub(/^[[:space:]]*run:[[:space:]]*\.\/scripts\/ci\//, "", line)
+      print line
+    }
+  }
+' "$WORKFLOW" | LC_ALL=C sort -u)
+
+# Extract documented exemptions. Format:
+#   `# WIRED-EXEMPT: check_X — reason` (em-dash OR `--` OR `:` after the name).
+EXEMPT=$(awk '
+  {
+    if (match($0, /WIRED-EXEMPT:[[:space:]]*check_[A-Za-z0-9_]+/)) {
+      line = substr($0, RSTART, RLENGTH)
+      sub(/^WIRED-EXEMPT:[[:space:]]*/, "", line)
+      print line
+    }
+  }
+' "$WORKFLOW" | LC_ALL=C sort -u)
+
+# Compute on-disk \ (wired ∪ exempt). Anything left is an unwired
+# check that ships on disk but never runs in CI.
+MISSING=()
+for name in "${ON_DISK[@]}"; do
+  if printf '%s\n' "$WIRED" | grep -Fxq "$name"; then
+    continue
+  fi
+  if printf '%s\n' "$EXEMPT" | grep -Fxq "$name"; then
+    continue
+  fi
+  MISSING+=("$name")
+done
+
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+  echo "FAIL: scripts/ci/check_* not wired into .github/workflows/repo_lint.yml:" >&2
+  for name in "${MISSING[@]}"; do
+    echo "  - $name" >&2
+  done
+  echo "" >&2
+  echo "Each check above must be added as an explicit step in repo_lint.yml:" >&2
+  echo "  - name: <name>" >&2
+  echo "    run: ./scripts/ci/<name>" >&2
+  echo "" >&2
+  echo "If the check is intentionally not wired (e.g. invoked by another" >&2
+  echo "check rather than a top-level workflow step, or opt-in via env), add:" >&2
+  echo "  # WIRED-EXEMPT: <name> — <reason>" >&2
+  echo "anywhere in repo_lint.yml." >&2
+  echo "check_ci_scripts_wired: FAIL" >&2
+  exit 1
+fi
+
+echo "check_ci_scripts_wired: PASS (${#ON_DISK[@]} check_* scripts, all wired or exempt)"
+exit 0
