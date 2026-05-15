@@ -81,10 +81,32 @@ if [ -z "$COMMAND" ]; then exit 0; fi
 # unrelated commands. The `gh pr edit` form check is structural (the
 # binary name + subcommand must be literal for the command to do
 # anything), so it remains safe.
-case "$COMMAND" in
-  *gh*pr*edit*|*gh*-R*pr*edit*|*gh*--repo*pr*edit*) ;;
-  *) exit 0 ;;
-esac
+# `pr edit` is ALWAYS adjacent in a real invocation — `edit` is the
+# subcommand of `pr`, nothing goes between (global flags like
+# `-R` / `--repo` go before `pr`, so `gh -R x pr edit` still has
+# `pr` directly followed by whitespace and then `edit`).
+#
+# Use a bash `[[ =~ ]]` regex (NOT a `case` glob) so we can express
+# "one or more whitespace" between `pr` and `edit`: the regex is
+# parsed dynamically at runtime, whereas extglob `+(...)` syntax
+# would be a parse-time error here (`shopt -s extglob` at runtime
+# is too late for the parser). The regex pattern keeps `pr` and
+# `edit` adjacency-anchored (no `.*` between them), so it:
+#   - excludes a `gh pr create` whose body prose merely contains
+#     the word "edit" (the old `*gh*pr*edit*` scatter matched that,
+#     and combined with #275's fail-closed-on-untokenizable change
+#     it was blocking legitimate `gh pr create`s);
+#   - is NOT bypassable by a tab or multiple spaces between `pr`
+#     and `edit` (a plain `" pr edit"` literal substring was —
+#     CodeRabbit Major on PR #277);
+#   - stays adjacency-anchored.
+# String screening is still imperfect (a body that literally
+# contains `pr` <ws+> `edit` adjacent residually matches), but this
+# check is only a cheap pre-filter — the post-tokenize token walk
+# further down is the precise source of truth.
+if ! [[ "$COMMAND" =~ gh.*pr[[:space:]]+edit ]]; then
+  exit 0
+fi
 
 TMP_TOKENS=$(mktemp)
 trap 'rm -f "$TMP_CMD" "$TMP_TOKENS"' EXIT
@@ -96,7 +118,19 @@ try:
 except ValueError:
     sys.exit(1)
 ' > "$TMP_TOKENS" 2>/dev/null; then
-  exit 0
+  # FAIL CLOSED. This is a protection hook — the command already
+  # matched the `gh ... pr edit` prefix screen above, so it IS a
+  # `gh pr edit` invocation; we just can't parse it to check whether
+  # it removes a human-action label. Allowing an unparseable
+  # `gh pr edit` through (the old `exit 0`) was a fail-open hole:
+  # malformed quoting would bypass the guard entirely. Block it and
+  # tell the agent to fix the quoting — same posture as
+  # gh-pr-guard.sh's tokenization failure path. (CodeRabbit Major, #271.)
+  echo "BLOCKED: label-removal-guard could not tokenize the gh command (malformed shell quoting)." >&2
+  echo "  The command matched the 'gh pr edit' screen but cannot be parsed to verify it" >&2
+  echo "  does not remove a human-action label (needs-external-review / needs-human-review /" >&2
+  echo "  policy-violation). Fix the quoting and retry." >&2
+  exit 2
 fi
 
 TOKENS=()

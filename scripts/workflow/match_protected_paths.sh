@@ -30,7 +30,13 @@ fi
 
 patterns=("$@")
 
-while IFS= read -r file; do
+# `|| [ -n "$file" ]` so a non-newline-terminated final stdin line
+# is still processed in this iteration. Without it, `read` returns
+# non-zero on EOF-without-newline and the loop body is skipped — the
+# last changed file is silently dropped from protected-path matching,
+# which can false-pass the guard on EXACTLY the path you're trying
+# to protect. (CodeRabbit Major, #272.)
+while IFS= read -r file || [ -n "$file" ]; do
   [ -z "$file" ] && continue
   for pattern in "${patterns[@]}"; do
     # shellcheck disable=SC2053  # $pattern is intended to be a glob

@@ -620,11 +620,22 @@ emit_status_context_verdict() {
   # from the StatusContext check.
   local potential_issues synthetic
   potential_issues=$(count_potential_issues_for_sha "$HEAD_SHA")
+  # Keep the synthetic review object compatible with the documented
+  # contract at the top of this file: `{ id, created_at, endpoint,
+  # body_excerpt }`. The fast-path has no underlying GitHub review,
+  # so `id` is null and `created_at` is the synthesis time — but a
+  # caller reading `review.id` or `review.created_at` no longer hits
+  # a missing key and breaks. `endpoint` keeps the new
+  # "status_context" value (a documented extension for this path); the
+  # extra `head_sha` / `context_state` / `potential_issue_count`
+  # fields are additive. (CodeRabbit Major, #272.)
   synthetic=$(jq -nc \
     --arg sha "$HEAD_SHA" \
     --arg state "$state" \
     --argjson p "$potential_issues" \
     '{
+      id: null,
+      created_at: (now | todateiso8601),
       endpoint: "status_context",
       head_sha: $sha,
       context_state: $state,

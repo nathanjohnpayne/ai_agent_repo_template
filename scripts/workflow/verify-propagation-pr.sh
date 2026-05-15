@@ -101,23 +101,37 @@ while IFS= read -r f; do
     continue
   fi
 
-  # 2. Byte-equality of the END STATE against mergepath@<sha>.
-  #    Compared via git BLOB HASHES (content-addressed) rather than
-  #    captured content: `$(git show ...)` strips trailing newlines,
-  #    which would false-positive a "differs" on any file with a
-  #    trailing newline. The consumer hash comes from its git object
-  #    store; the mergepath hash is computed from the file on disk
-  #    with `git hash-object` (works whether or not the mergepath
-  #    checkout dir is a worktree). Both sides use git's blob hashing,
-  #    so equal hash ⟺ byte-identical content.
+  # 2. Tree-entry equality of the END STATE against mergepath@<sha>.
+  #    Compare the full git TREE ENTRY (mode + type + oid) rather
+  #    than just the blob hash, so a file-mode change (exec-bit
+  #    flip, regular file ↔ symlink) is caught too — a hand-edited
+  #    `chmod +x` on a canonical script would otherwise pass the
+  #    blob-only check while leaving the consumer's on-disk mode
+  #    different from mergepath. `git ls-tree` returns
+  #    `<mode> <type> <oid>\t<path>`; we drop the path field (always
+  #    $f) and compare the mode+type+oid tuple. Empty output ⇒ path
+  #    not present at that ref. (CodeRabbit Major, #272/#274.)
   consumer_present=1
-  consumer_hash=$(git -C "$CONSUMER_DIR" rev-parse --verify -q "$HEAD_SHA:$f") || consumer_present=0
+  consumer_entry=$(git -C "$CONSUMER_DIR" ls-tree "$HEAD_SHA" -- "$f" 2>/dev/null | awk '{print $1, $2, $3}')
+  [ -z "$consumer_entry" ] && consumer_present=0
   mergepath_present=1
-  mergepath_hash=""
-  if [ -f "$MERGEPATH_DIR/$f" ]; then
-    mergepath_hash=$(git hash-object "$MERGEPATH_DIR/$f")
+  if [ -d "$MERGEPATH_DIR/.git" ] || [ -f "$MERGEPATH_DIR/.git" ]; then
+    # mergepath_dir is a git checkout — `ls-tree HEAD` gives the
+    # authoritative tree entry (mode/type from git's index, not a
+    # filesystem mode that could vary by clone permissions).
+    mergepath_entry=$(git -C "$MERGEPATH_DIR" ls-tree HEAD -- "$f" 2>/dev/null | awk '{print $1, $2, $3}')
+    [ -z "$mergepath_entry" ] && mergepath_present=0
   else
-    mergepath_present=0
+    # Test harness fallback: mergepath_dir is a plain directory.
+    # Synthesize a tree entry from the on-disk file: mode 100755 if
+    # executable else 100644, type blob, oid via hash-object.
+    if [ -f "$MERGEPATH_DIR/$f" ]; then
+      if [ -x "$MERGEPATH_DIR/$f" ]; then mode="100755"; else mode="100644"; fi
+      mp_oid=$(git hash-object "$MERGEPATH_DIR/$f")
+      mergepath_entry="$mode blob $mp_oid"
+    else
+      mergepath_entry=""; mergepath_present=0
+    fi
   fi
 
   if [ "$consumer_present" -eq 0 ] && [ "$mergepath_present" -eq 0 ]; then
@@ -132,9 +146,9 @@ while IFS= read -r f; do
     fail "$f — deleted in the PR but still present at mergepath@<sha> (not a faithful delete-propagation)"
     continue
   fi
-  # Both present — blob hashes must match.
-  if [ "$consumer_hash" != "$mergepath_hash" ]; then
-    fail "$f — content differs from mergepath@<sha> (hand-edited; not a verbatim mirror)"
+  # Both present — tree entries (mode + type + oid) must match.
+  if [ "$consumer_entry" != "$mergepath_entry" ]; then
+    fail "$f — tree entry differs from mergepath@<sha> (mode/type/oid mismatch; hand-edited or mode-flipped, not a verbatim mirror). consumer=[$consumer_entry] mergepath=[$mergepath_entry]"
     continue
   fi
 done <<< "$CHANGED_FILES"

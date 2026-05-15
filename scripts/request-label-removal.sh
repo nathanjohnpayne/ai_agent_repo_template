@@ -94,7 +94,22 @@ fi
 REPO_FLAG=()
 if [ -n "$REPO" ]; then REPO_FLAG=(--repo "$REPO"); fi
 
-PR_URL=$(gh pr view "$PR_NUM" "${REPO_FLAG[@]}" --json url --jq .url 2>/dev/null) || {
+# Token policy (CodeRabbit Major, #271/#272):
+#  - The `gh pr view` READ below is pinned to a PAT
+#    (OP_PREFLIGHT_REVIEWER_PAT, falling back to an ambient GH_TOKEN)
+#    rather than relying on the keyring fallback — matches the
+#    gh_pat / read-path convention used across the other scripts.
+#  - The `gh pr comment` WRITE further down is deliberately NOT
+#    pinned. `gh pr comment` is a write path: gh attributes it to
+#    the keyring's ACTIVE account regardless of GH_TOKEN. That is
+#    the desired byline here — the structured ask should be posted
+#    by the agent identity (the agent is the one asking the human),
+#    NOT the author identity. Pinning a token would not change the
+#    byline anyway; leaving it on the keyring is both correct and
+#    explicit-by-this-comment.
+GH_READ_PAT="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}"
+
+PR_URL=$(GH_TOKEN="$GH_READ_PAT" gh pr view "$PR_NUM" "${REPO_FLAG[@]}" --json url --jq .url 2>/dev/null) || {
   echo "Could not resolve PR #$PR_NUM. Check --repo and gh auth." >&2
   exit 2
 }

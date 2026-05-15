@@ -157,7 +157,14 @@ jobs:
             # synchronize/workflow_run for under-threshold PRs).
             if ! HAS_LABEL=$(gh pr view "$PR" --repo "$REPO" --json labels \
               --jq '[.labels[].name] | contains(["needs-external-review"])'); then
-              echo "::warning::Failed to query labels for PR #$PR; skipping."
+              # Infra error — NOT a warning-only skip. This workflow
+              # exists to clear a merge-blocking label; if it can't even
+              # read the label state, it must NOT report success. A
+              # rate-limit / network / API error here previously let
+              # the job go green while a PR stayed stuck. (CodeRabbit
+              # Major, #271.)
+              echo "::error::Failed to query labels for PR #$PR — cannot evaluate."
+              had_infra_error=1
               echo "::endgroup::"
               continue
             fi
@@ -176,7 +183,13 @@ jobs:
               0)
                 echo "Gate passes — removing needs-external-review label."
                 if ! gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review; then
-                  echo "::warning::Failed to remove needs-external-review on PR #$PR"
+                  # The gate passed but the removal API call failed —
+                  # the label is still stuck. That is an infra error,
+                  # not a warning: the job must not report success
+                  # when it failed to do its one job. (CodeRabbit
+                  # Major, #271.)
+                  echo "::error::Failed to remove needs-external-review on PR #$PR — label still stuck."
+                  had_infra_error=1
                   echo "::endgroup::"
                   continue
                 fi
@@ -324,7 +337,11 @@ jobs:
                   gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
                     || echo "::warning::Failed to post attribution comment for PR #$PR"
                 else
-                  echo "::warning::Failed to remove needs-external-review on PR #$PR"
+                  # Gate passed but the removal failed — infra error,
+                  # not warning-only. The label is still stuck; the
+                  # sweep must not report success. (CodeRabbit Major, #271.)
+                  echo "::error::Failed to remove needs-external-review on PR #$PR — label still stuck."
+                  had_infra_error=1
                 fi
                 ;;
               1) echo "Gate not yet met — leaving label in place." ;;
