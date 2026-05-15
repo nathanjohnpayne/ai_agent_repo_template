@@ -141,7 +141,7 @@ Companion one-shot, non-idempotent driver that adds new children to **existing**
 - A phase scope expands mid-flight
 - A mid-phase discovery needs its own ticket
 
-Same `lib.sh` helpers — no library changes. The driver fetches existing parent numbers (or accepts them as args), prep_body's sibling references, calls `create_child` + `link_sub_issue` for each new child, then adds to the Project. The reference implementation lives in nathanpaynedotcom (`scripts/gh-projects/examples/matchline/additions/add-plan-refinements.sh` on the `matchline/issue-driver` branch — promoted in [nathanpaynedotcom#263](https://github.com/nathanjohnpayne/nathanpaynedotcom/pull/263)).
+Same `lib.sh` helpers — no library changes. The driver fetches existing parent numbers (or accepts them as args), prep_body's sibling references, calls `create_child` + `link_sub_issue` for each new child, then adds to the Project. The reference implementation lives in nathanpaynedotcom on `main`: [`scripts/gh-projects/examples/matchline/additions/add-plan-refinements.sh`](https://github.com/nathanjohnpayne/nathanpaynedotcom/blob/main/scripts/gh-projects/examples/matchline/additions/add-plan-refinements.sh), promoted in [nathanpaynedotcom#263](https://github.com/nathanjohnpayne/nathanpaynedotcom/pull/263).
 
 ### Picking which to write
 
