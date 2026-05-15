@@ -187,6 +187,127 @@ else
   fail "Case 5 unexpected (rc=$rc): $out"
 fi
 
+# --- Case 6: consumer-scope-aware closure (#264 r2) ----------------
+#
+# nathanpayne-codex Phase 4b r1 on PR #294: the original closure
+# check verified that a required path was IN the manifest but did
+# NOT verify that the required path's `consumers:` covered the
+# requirer's `consumers:`. If a kit propagates to `consumers: all`
+# but a `requires:` entry points at a path with `consumers:
+# [matchline]`, the other consumers still miss the dependency at
+# lint time.
+
+# Need at least two consumers to express a non-universal subset.
+MULTI_HEADER='version: 1
+consumers:
+  - name: matchline
+    repo: org/matchline
+    visibility: public
+  - name: swipewatch
+    repo: org/swipewatch
+    visibility: public
+paths:'
+
+MANIFEST_SCOPE_GAP="$MULTI_HEADER
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+    requires:
+      - \"tests/test_foo.sh\"
+  - path: tests/test_foo.sh
+    type: canonical
+    consumers:
+      - matchline
+"
+PATHS_SCOPE_GAP="scripts/ci/
+tests/test_foo.sh"
+set +e
+out=$(run_with_fixture "$MANIFEST_SCOPE_GAP" "$PATHS_SCOPE_GAP"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "does NOT cover the requirer" && \
+   echo "$out" | grep -qE "requirer is consumers: all|matchline"; then
+  pass "Case 6: requires: with narrower consumer scope fails closed (all → matchline gap)"
+else
+  fail "Case 6 unexpected (rc=$rc): $out"
+fi
+
+# Case 6b: explicit-list requirer with strict-subset required.
+# Both are explicit lists; one consumer is missing from required.
+MANIFEST_NAMED_GAP="$MULTI_HEADER
+  - path: scripts/foo.sh
+    type: canonical
+    consumers:
+      - matchline
+      - swipewatch
+    requires:
+      - \"tests/test_foo.sh\"
+  - path: tests/test_foo.sh
+    type: canonical
+    consumers:
+      - matchline
+"
+PATHS_NAMED_GAP="scripts/foo.sh
+tests/test_foo.sh"
+set +e
+out=$(run_with_fixture "$MANIFEST_NAMED_GAP" "$PATHS_NAMED_GAP"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "does NOT cover" && \
+   echo "$out" | grep -q "swipewatch"; then
+  pass "Case 6b: named-consumer-list requires: gap fails closed and names the missing consumer (swipewatch)"
+else
+  fail "Case 6b unexpected (rc=$rc): $out"
+fi
+
+# Case 7: same shape but required's consumers covers requirer's.
+# Should PASS.
+MANIFEST_SCOPE_OK="$MULTI_HEADER
+  - path: scripts/foo.sh
+    type: canonical
+    consumers:
+      - matchline
+    requires:
+      - \"tests/test_foo.sh\"
+  - path: tests/test_foo.sh
+    type: canonical
+    consumers:
+      - matchline
+      - swipewatch
+"
+PATHS_SCOPE_OK="scripts/foo.sh
+tests/test_foo.sh"
+set +e
+out=$(run_with_fixture "$MANIFEST_SCOPE_OK" "$PATHS_SCOPE_OK"); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case 7: requires: covered by superset consumer scope passes"
+else
+  fail "Case 7 unexpected (rc=$rc): $out"
+fi
+
+# Case 8: consumers: all → all (trivial universal coverage).
+MANIFEST_ALL_ALL="$MIN_HEADER
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+    requires:
+      - \"tests/test_foo.sh\"
+  - path: tests/test_foo.sh
+    type: canonical
+    consumers: all
+"
+PATHS_ALL_ALL="scripts/ci/
+tests/test_foo.sh"
+set +e
+out=$(run_with_fixture "$MANIFEST_ALL_ALL" "$PATHS_ALL_ALL"); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case 8: consumers: all → all trivially passes"
+else
+  fail "Case 8 unexpected (rc=$rc): $out"
+fi
+
 # NOTE: a "live manifest" smoke case is intentionally absent. The
 # live invocation of check_sync_manifest in PR CI already smoke-tests
 # the live manifest; invoking it from inside this fixture suite
