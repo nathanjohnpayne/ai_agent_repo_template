@@ -207,12 +207,20 @@ if $DRY_RUN; then
   echo "# ADC tempfile:   $ADC_TMPFILE" >&2
   echo "# TTL seconds:    $TTL_SECONDS" >&2
   if [[ -f "$SESSION_FILE" ]]; then
-    # `|| true` so a missing/corrupt epoch key doesn't take down dry-run
-    # under set -e + pipefail (grep exits 1 on no match). `${embedded:-0}`
-    # below handles the empty result for the arithmetic. (CodeRabbit P2, #272.)
+    # `|| true` so a missing epoch key doesn't take down dry-run under
+    # set -e + pipefail (grep exits 1 on no match). The numeric-only
+    # validation + `10#` decimal coercion below covers the OTHER bad
+    # case CodeRabbit caught on PR #278: a key present with a garbage
+    # value (e.g. `123abc` errors in arithmetic, or `08` is parsed as
+    # invalid octal). On bad input we fall back to age=$now → huge →
+    # cache miss + refresh (the correct fallback). (CodeRabbit, #272.)
     embedded=$(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$SESSION_FILE" | cut -d= -f2- | tr -d "'\"" || true)
     now=$(date +%s)
-    age=$((now - ${embedded:-0}))
+    if [[ "$embedded" =~ ^[0-9]+$ ]]; then
+      age=$(( now - 10#$embedded ))
+    else
+      age=$now
+    fi
     echo "# Session age:    ${age}s (TTL ${TTL_SECONDS}s)" >&2
   else
     echo "# Session age:    n/a (no session file)" >&2
@@ -546,12 +554,19 @@ if ! $REFRESH && session_is_fresh; then
   fi
   if [[ "$rc" == "0" ]]; then
     echo "$cached_exports"
-    # `|| true` so a missing/corrupt epoch key doesn't take down the
-    # cache-hit path under set -e + pipefail; bash arithmetic treats
-    # an empty operand as 0, so a missing key yields age == now (huge,
-    # triggers a cache miss + refresh — the correct fallback).
+    # `|| true` + numeric-only validation + `10#` decimal coercion so
+    # neither a missing key NOR a garbage value (e.g. `123abc` errors
+    # in arithmetic; `08` is parsed as invalid octal) takes down the
+    # cache-hit path under set -e + pipefail. On bad input we fall
+    # back to age = $now → huge → cache miss + refresh (the correct
+    # fallback). (CodeRabbit Minor on PR #278, #272.)
     epoch=$(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$SESSION_FILE" | cut -d= -f2- | tr -d "'\"" || true)
-    age=$(( $(date +%s) - ${epoch:-0} ))
+    now=$(date +%s)
+    if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+      age=$(( now - 10#$epoch ))
+    else
+      age=$now
+    fi
     # Warm SSH keys on the cache-hit path too. The cached PATs are
     # worthless for git push/pull if SSH auth isn't also primed, and
     # the prior implementation skipped this step entirely on cache
