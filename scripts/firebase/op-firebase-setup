@@ -177,16 +177,59 @@ if $PROVISION_SA_KEY; then
     # exit. The trap is scoped to this branch — installing it at the
     # top of the script would surprise callers in the impersonation-
     # only path (they have no tempfile to clean up).
+    #
+    # Trap also revokes the just-minted GCP key if the 1Password
+    # upload fails partway through. Without revoke-on-failure, a
+    # transient `op document create` error (stale auth, vault perms,
+    # network) would leave an active deployer-SA key in IAM that
+    # nothing local references — the tempfile gets wiped by the trap
+    # and the key is orphaned. Repeated failed provisioning runs
+    # would eventually hit GCP's 10-keys-per-SA limit and block all
+    # future minting. (codex P1 r1 on PR #302.)
     umask 077
     KEY_PATH="$(mktemp "${TMPDIR:-/tmp}/firebase-sa-key-XXXXXX.json")"
-    cleanup_key_tempfile() { rm -f "$KEY_PATH"; }
-    trap cleanup_key_tempfile EXIT
+    KEY_ID=""
+    UPLOAD_OK=false
+    cleanup_provision() {
+      local rc=$?
+      if ! $UPLOAD_OK && [ -n "$KEY_ID" ]; then
+        echo "Revoking just-minted key $KEY_ID (1Password upload did not complete)..." >&2
+        # Best-effort revoke. If the revoke itself fails (auth lost,
+        # network drop, IAM policy denial), surface the orphan KEY_ID
+        # for manual cleanup rather than silently swallowing the loss.
+        if ! gcloud iam service-accounts keys delete "$KEY_ID" \
+             --iam-account="$SA_EMAIL" \
+             --project="$PROJECT" \
+             --quiet 2>&1; then
+          echo "WARNING: Failed to revoke key $KEY_ID on $SA_EMAIL." >&2
+          echo "Manually revoke with:" >&2
+          echo "  gcloud iam service-accounts keys delete $KEY_ID \\" >&2
+          echo "    --iam-account=$SA_EMAIL --project=$PROJECT" >&2
+        else
+          echo "Revoked $KEY_ID." >&2
+        fi
+      fi
+      rm -f "$KEY_PATH"
+      return $rc
+    }
+    trap cleanup_provision EXIT
 
     echo "Minting SA key (requires iam.serviceAccountKeyAdmin on $PROJECT)..."
     gcloud iam service-accounts keys create "$KEY_PATH" \
       --iam-account="$SA_EMAIL" \
       --project="$PROJECT" \
       --quiet
+
+    # Capture the minted key's private_key_id so the trap can revoke
+    # it if upload fails. If extraction errors (malformed JSON, etc.),
+    # KEY_ID stays empty and the trap surfaces the orphan for manual
+    # cleanup rather than guessing at a key ID.
+    KEY_ID="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('private_key_id',''))" "$KEY_PATH" 2>/dev/null || true)"
+    if [ -z "$KEY_ID" ]; then
+      echo "WARNING: Could not extract private_key_id from minted SA key file." >&2
+      echo "If the upload below fails, manually list + revoke recent keys with:" >&2
+      echo "  gcloud iam service-accounts keys list --iam-account=$SA_EMAIL --project=$PROJECT" >&2
+    fi
 
     echo "Uploading to op://Firebase/$SA_KEY_OP_TITLE..."
     # `op document create` reads the file from disk. The title is
@@ -196,7 +239,10 @@ if $PROVISION_SA_KEY; then
       --vault Firebase \
       --title "$SA_KEY_OP_TITLE" >/dev/null
 
-    # Explicit wipe (the trap will also fire). Belt-and-braces.
+    UPLOAD_OK=true
+
+    # Explicit wipe (the trap will also fire on EXIT, but doing it
+    # eagerly here narrows the on-disk-key window).
     rm -f "$KEY_PATH"
     trap - EXIT
     echo "SA key uploaded and local tempfile wiped."
