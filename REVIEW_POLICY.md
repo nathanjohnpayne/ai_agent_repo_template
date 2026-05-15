@@ -606,6 +606,8 @@ Each repo using this template must mark these as required on `main` (Settings â†
 
 Audit a repo's branch protection with `scripts/audit-branch-protection.sh` (read-only; exits 3 if any canonical check is not required, with a fix recipe). Re-run after every protection change.
 
+The audit reads `GET /repos/{owner}/{repo}/branches/{branch}/protection` and falls back to the rulesets endpoint when classic protection isn't configured. Both endpoints require the `Administration:read` scope. Reviewer PATs commonly lack this scope â€” the audit will exit 2 with an auth diagnostic in that case rather than emitting a false "PR merges are completely unprotected" verdict (#177, #285). To run a full audit, use an author/admin PAT (e.g. `GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"`).
+
 ### `resolveReviewThread`
 
 The GitHub GraphQL `resolveReviewThread` mutation may be used by agents **only** when both:
