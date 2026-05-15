@@ -81,8 +81,21 @@ if [ -z "$COMMAND" ]; then exit 0; fi
 # unrelated commands. The `gh pr edit` form check is structural (the
 # binary name + subcommand must be literal for the command to do
 # anything), so it remains safe.
+# `pr edit` is ALWAYS adjacent in a real invocation — `edit` is the
+# subcommand of `pr`, nothing goes between (global flags like
+# `-R` / `--repo` go before `pr`, so `gh -R x pr edit` still has the
+# adjacent ` pr edit`). Requiring the adjacent substring — not the
+# old `*gh*pr*edit*` scatter — stops a `gh pr create` whose body
+# prose merely contains the word "edit" from tripping the
+# tokenize-and-fail-closed path below: that over-match plus the
+# #275 fail-closed change was blocking legitimate `gh pr create`s.
+# String screening is still imperfect (a body that literally
+# contains the adjacent text " pr edit" residually matches), but
+# this `case` is only a cheap pre-filter — the post-tokenize token
+# walk further down is the precise source of truth. (CodeRabbit /
+# #272.)
 case "$COMMAND" in
-  *gh*pr*edit*|*gh*-R*pr*edit*|*gh*--repo*pr*edit*) ;;
+  *gh*" pr edit"*) ;;
   *) exit 0 ;;
 esac
 
