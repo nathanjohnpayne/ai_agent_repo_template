@@ -10,9 +10,16 @@
 # inventory in #269 surfaced (6 unwired check_* scripts).
 #
 # Rules:
-#   - Only executable check_* files in scripts/ci/ count as "on disk"
-#     (non-executable files are typically fixtures or work-in-progress
-#     and intentionally not wired yet).
+#   - EVERY scripts/ci/check_* file (executable OR NOT) counts as
+#     "on disk" and must be wired or exempted. The earlier r3-r4
+#     spec carved out non-executable files as "work-in-progress
+#     skip"; nathanpayne-codex Phase 4b r4 caught that the workflow
+#     runs `chmod +x scripts/ci/*` BEFORE this guard, so on CI every
+#     check_* is executable regardless of its pre-chmod permission.
+#     The carve-out only ever matched in local dev; in production
+#     the exclusion was a no-op. Aligning the guard with production
+#     reality is more honest than enforcing a contract the workflow
+#     order silently breaks. (#269 r5.)
 #   - A check is "wired" only if there is a line in repo_lint.yml
 #     matching `run: ./scripts/ci/check_X` (or
 #     `run: ./scripts/ci/check_X<space>`). Comment-only mentions
@@ -23,8 +30,10 @@
 #     tolerated — inefficient, but not a correctness failure.
 #   - Exemptions: if a check is intentionally not wired (e.g. it is
 #     a helper invoked by another check rather than a top-level
-#     workflow step), add a `# WIRED-EXEMPT: check_X — reason` line
-#     anywhere in repo_lint.yml. The check honors that exemption.
+#     workflow step, OR it's an opt-in local-only check like
+#     check_op_firebase_deploy_integration), add a
+#     `# WIRED-EXEMPT: check_X — reason` line anywhere in
+#     repo_lint.yml. The check honors that exemption.
 #
 # Implementation is pure Bash/awk so this script can run BEFORE any
 # yq install — it is one of the first steps in repo_lint.yml.
@@ -50,17 +59,19 @@ if [[ ! -d "$CHECK_DIR" ]]; then
   exit 1
 fi
 
-# Enumerate executable check_* files in scripts/ci/. The script
-# itself (check_ci_scripts_wired) is included — it must also be
-# wired into the workflow as a step.
+# Enumerate ALL check_* files in scripts/ci/, regardless of executable
+# bit. See the r5 comment block above for why the perm filter was
+# dropped — the workflow's `chmod +x scripts/ci/*` step makes the
+# distinction meaningless on CI. The script itself
+# (check_ci_scripts_wired) is included; it must also be wired.
 ON_DISK=()
 while IFS= read -r -d '' file; do
   base="$(basename "$file")"
   ON_DISK+=("$base")
-done < <(find "$CHECK_DIR" -maxdepth 1 -type f -name 'check_*' -perm -u+x -print0 | LC_ALL=C sort -z)
+done < <(find "$CHECK_DIR" -maxdepth 1 -type f -name 'check_*' -print0 | LC_ALL=C sort -z)
 
 if [[ ${#ON_DISK[@]} -eq 0 ]]; then
-  echo "FAIL: no executable check_* files found in $CHECK_DIR" >&2
+  echo "FAIL: no check_* files found in $CHECK_DIR" >&2
   echo "check_ci_scripts_wired: FAIL" >&2
   exit 1
 fi
@@ -116,7 +127,7 @@ for name in "${ON_DISK[@]}"; do
 done
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
-  echo "FAIL: executable scripts/ci/check_* not wired into .github/workflows/repo_lint.yml:" >&2
+  echo "FAIL: scripts/ci/check_* not wired into .github/workflows/repo_lint.yml:" >&2
   for name in "${MISSING[@]}"; do
     echo "  - $name" >&2
   done
@@ -126,12 +137,12 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
   echo "    run: ./scripts/ci/<name>" >&2
   echo "" >&2
   echo "If the check is intentionally not wired (e.g. invoked by another" >&2
-  echo "check rather than a top-level workflow step), add a line:" >&2
+  echo "check rather than a top-level workflow step, or opt-in via env), add:" >&2
   echo "  # WIRED-EXEMPT: <name> — <reason>" >&2
   echo "anywhere in repo_lint.yml." >&2
   echo "check_ci_scripts_wired: FAIL" >&2
   exit 1
 fi
 
-echo "check_ci_scripts_wired: PASS (${#ON_DISK[@]} executable check_* scripts, all wired)"
+echo "check_ci_scripts_wired: PASS (${#ON_DISK[@]} check_* scripts, all wired or exempt)"
 exit 0

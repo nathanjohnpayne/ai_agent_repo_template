@@ -186,9 +186,13 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Case 5: non-executable check file → excluded from the on-disk set.
-# A check_* file that exists but is not executable should not be
-# required to be wired (it's typically a WIP or fixture).
+# Case 5 (#269 r5 — nathanpayne-codex Phase 4b finding): non-executable
+# check files are STILL required to be wired or exempted. The earlier
+# r3-r4 spec carved them out as "WIP skip", but the repo_lint.yml
+# workflow runs `chmod +x scripts/ci/*` BEFORE this guard, so on CI
+# every check_* is executable regardless of pre-chmod perms. Aligning
+# the guard with production reality is more honest than enforcing a
+# contract the workflow order silently breaks.
 # ---------------------------------------------------------------------------
 repo="$(make_scratch_repo case5_nonexec)"
 mk_check "$repo" check_foo
@@ -206,10 +210,53 @@ set +e
 out=$(run_check "$repo" 2>&1)
 rc=$?
 set -e
-if [[ $rc -eq 0 ]]; then
-  pass "non-executable check file: excluded from on-disk set"
+if [[ $rc -ne 0 ]] && echo "$out" | grep -q "check_not_ready_yet"; then
+  pass "non-executable check file: still required to be wired (r5 — workflow chmods regardless of pre-state)"
 else
-  fail "non-executable check file: expected exit 0, got $rc; output: $out"
+  fail "non-executable check file: expected exit 1 with 'check_not_ready_yet' in diagnostic, got rc=$rc; output: $out"
+fi
+
+# Same fixture, now wired → PASS regardless of executable bit.
+mk_workflow "$repo" "name: t
+jobs:
+  lint:
+    steps:
+      - name: check_ci_scripts_wired
+        run: ./scripts/ci/check_ci_scripts_wired
+      - name: check_foo
+        run: ./scripts/ci/check_foo
+      - name: check_not_ready_yet
+        run: ./scripts/ci/check_not_ready_yet
+"
+set +e
+out=$(run_check "$repo" 2>&1)
+rc=$?
+set -e
+if [[ $rc -eq 0 ]]; then
+  pass "non-executable check file: wired → passes regardless of perm bit"
+else
+  fail "non-executable wired-and-on-disk: expected exit 0, got $rc; output: $out"
+fi
+
+# Same fixture, exempted via WIRED-EXEMPT → PASS.
+mk_workflow "$repo" "name: t
+jobs:
+  lint:
+    # WIRED-EXEMPT: check_not_ready_yet — intentionally pending
+    steps:
+      - name: check_ci_scripts_wired
+        run: ./scripts/ci/check_ci_scripts_wired
+      - name: check_foo
+        run: ./scripts/ci/check_foo
+"
+set +e
+out=$(run_check "$repo" 2>&1)
+rc=$?
+set -e
+if [[ $rc -eq 0 ]]; then
+  pass "non-executable check file: WIRED-EXEMPT honored as escape hatch"
+else
+  fail "non-executable + WIRED-EXEMPT: expected exit 0, got $rc; output: $out"
 fi
 
 # ---------------------------------------------------------------------------
