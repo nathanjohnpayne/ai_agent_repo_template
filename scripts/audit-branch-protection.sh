@@ -22,11 +22,19 @@
 # Exit codes:
 #   0 — all canonical checks are required
 #   1 — bad arguments
-#   2 — gh API failure (auth, missing repo, network)
+#   2 — gh API failure (auth scope, network, missing repo) — see diagnostic
 #   3 — one or more canonical checks NOT required (PR-merge gating gap)
 #
-# Requires a token with `Administration:read` scope on the target repo
-# (most reviewer/author PATs already have this).
+# Auth-scope note (#177, #285):
+#   Reading branch protection requires `Administration:read` on the target
+#   repo. Most author/admin PATs already have this; **reviewer PATs often
+#   do NOT** and will get a 403 from
+#   `GET /repos/{owner}/{repo}/branches/{branch}/protection`. The script
+#   distinguishes 403 (auth/scope failure → exit 2 with diagnostic) from
+#   404 (no classic protection → fall back to rulesets) so that running the
+#   audit under a reviewer identity does not produce a false "PR merges are
+#   completely unprotected" verdict. If you hit exit 2 with an auth-scope
+#   diagnostic, re-run with an author/admin token.
 
 set -eo pipefail
 
@@ -63,6 +71,7 @@ canonical mergepath-shipped status checks:
   ${CANONICAL_REQUIRED_CHECKS[*]}
 
 Exit 3 if any canonical check is not required (PR-merge gating gap).
+Exit 2 on gh API auth/scope failures (use an author/admin PAT).
 EOF
       exit 0
       ;;
@@ -86,33 +95,190 @@ echo ""
 # Fetch the branch-protection rules. Two endpoints are relevant:
 #   1. /branches/{branch}/protection — classic protection rules
 #   2. /rulesets — newer rulesets (the modern way)
-# Try (1) first; if 404, fall back to (2).
-PROT=$(gh api "repos/$REPO/branches/$BRANCH/protection" 2>&1) || true
-if echo "$PROT" | grep -q '"message":'; then
-  echo "Note: classic branch protection not configured on $BRANCH — checking rulesets instead."
+# Try (1) first; on a true 404 fall back to (2). On 403 (auth/scope
+# failure) bail with a diagnostic — falling through to rulesets would
+# produce a false "unprotected" verdict because the rulesets endpoint
+# may also be denied or empty under the same auth.
+#
+# Implementation: `gh api -i` includes the HTTP status line, which lets
+# us inspect the status code directly. We split headers from body via a
+# blank-line marker, then extract the HTTP/x.y status code from the
+# first line of the headers.
+PROT_RAW=$(gh api -i "repos/$REPO/branches/$BRANCH/protection" 2>&1) || PROT_API_RC=$?
+PROT_API_RC=${PROT_API_RC:-0}
+
+# Extract HTTP status code from the first line ("HTTP/2 200" / "HTTP/1.1 404 Not Found")
+# Falls back to empty string if there's no recognizable status line (e.g. network error).
+PROT_STATUS=$(printf '%s\n' "$PROT_RAW" | awk 'NR==1 && /^HTTP\// {print $2; exit}')
+
+# Split headers from body on the first blank line. Body is everything
+# AFTER the blank line; if we can't find one (malformed / pre-HTTP error),
+# treat the whole payload as the body so error messages still surface.
+PROT_BODY=$(printf '%s\n' "$PROT_RAW" | awk 'BEGIN{p=0} /^[[:space:]]*$/{if(!p){p=1; next}} p{print}')
+if [ -z "$PROT_BODY" ] && [ -z "$PROT_STATUS" ]; then
+  PROT_BODY="$PROT_RAW"
+fi
+
+USE_RULESETS=0
+case "$PROT_STATUS" in
+  200)
+    # Classic protection present — happy path.
+    ;;
+  404)
+    # No classic protection configured. Fall back to rulesets (modern path).
+    echo "Note: classic branch protection not configured on $BRANCH — checking rulesets instead."
+    USE_RULESETS=1
+    ;;
+  401|403)
+    # Auth/scope failure. This is the #177/#285 trap: a reviewer PAT
+    # typically lacks Administration:read and gets 403 here. Falling
+    # through to rulesets (which may also be denied) would produce a
+    # false "PR merges are completely unprotected" verdict.
+    cat >&2 <<EOF
+ERROR: GitHub API returned HTTP $PROT_STATUS reading branch protection on
+       $REPO@$BRANCH. This usually means the active token lacks the
+       'Administration:read' scope required to read branch protection
+       (reviewer PATs are commonly affected; author/admin PATs typically
+       have it).
+
+       Re-run with an author/admin token:
+         GH_TOKEN="\$OP_PREFLIGHT_AUTHOR_PAT" scripts/audit-branch-protection.sh \\
+           --repo $REPO --branch $BRANCH
+
+       Refusing to fall through to the ruleset fallback because that would
+       produce a false "unprotected" verdict under the same auth failure.
+
+       Raw API response body:
+EOF
+    printf '%s\n' "$PROT_BODY" | sed 's/^/         /' >&2
+    exit 2
+    ;;
+  "")
+    # No status line — gh itself failed (network, gh not installed, etc).
+    echo "Could not call gh api for branch protection on $REPO@$BRANCH (gh rc=$PROT_API_RC):" >&2
+    printf '%s\n' "$PROT_RAW" | sed 's/^/  /' >&2
+    exit 2
+    ;;
+  *)
+    echo "Unexpected HTTP $PROT_STATUS reading branch protection on $REPO@$BRANCH:" >&2
+    printf '%s\n' "$PROT_BODY" | sed 's/^/  /' >&2
+    exit 2
+    ;;
+esac
+
+if [ "$USE_RULESETS" -eq 1 ]; then
   RULESETS=$(gh api "repos/$REPO/rulesets" 2>&1) || {
     echo "Could not fetch rulesets: $RULESETS" >&2; exit 2
   }
-  REQUIRED=$(echo "$RULESETS" | jq -r '
+
+  # Step A: compute the set of rulesets that ACTUALLY target the
+  # audited branch. We need each ruleset's full definition to inspect
+  # its conditions.ref_name.include array, so list IDs first then
+  # fetch each one. Listing returns summaries without conditions.
+  RULESET_IDS=$(echo "$RULESETS" | jq -r '
     .[]
     | select(.target == "branch")
-    | .conditions.ref_name.include[]?
-    | select(. == "~DEFAULT_BRANCH" or . == "refs/heads/'"$BRANCH"'")
-  ' 2>/dev/null | head -1)
-  if [ -z "$REQUIRED" ]; then
+    | .id
+  ' 2>/dev/null)
+
+  MATCHING_IDS=""
+  for rid in $RULESET_IDS; do
+    DETAIL=$(gh api "repos/$REPO/rulesets/$rid" 2>&1) || {
+      echo "Could not fetch ruleset $rid: $DETAIL" >&2; exit 2
+    }
+    # Extract include patterns for this ruleset and decide if any of
+    # them targets the audited branch. Four supported forms:
+    #   ~DEFAULT_BRANCH  — matches if BRANCH is the repo's default
+    #                      (we approximate: trust the include and let
+    #                      a non-default-branch audit pick this up
+    #                      only when the caller passed the actual
+    #                      default; an explicit DEFAULT_BRANCH probe
+    #                      would require an extra API call, so we
+    #                      treat ~DEFAULT_BRANCH as matching when the
+    #                      audited branch is "main" or "master" — the
+    #                      99% case — and recommend explicit
+    #                      refs/heads/<name> for non-default audits)
+    #   ~ALL             — matches every branch
+    #   refs/heads/<x>   — literal match against BRANCH
+    #   refs/heads/<glob>— bash glob match against the BRANCH ref
+    INCLUDES=$(echo "$DETAIL" | jq -r '.conditions.ref_name.include[]?' 2>/dev/null)
+    [ -z "$INCLUDES" ] && continue
+
+    MATCHED=0
+    BRANCH_REF="refs/heads/$BRANCH"
+    while IFS= read -r pat; do
+      [ -z "$pat" ] && continue
+      case "$pat" in
+        "~ALL")
+          MATCHED=1
+          break
+          ;;
+        "~DEFAULT_BRANCH")
+          # See note above — treat main/master as the assumed default.
+          # For non-default audits, callers should add an explicit
+          # refs/heads/<name> include to the ruleset (or pass
+          # --branch matching the include).
+          if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+            MATCHED=1
+            break
+          fi
+          ;;
+        "$BRANCH_REF")
+          MATCHED=1
+          break
+          ;;
+        refs/heads/*)
+          # Bash glob match. The pattern may contain literal `*` or `?`
+          # — `[[ str == $pat ]]` does shell-style glob matching with
+          # the pattern unquoted on the RHS.
+          # shellcheck disable=SC2053
+          if [[ "$BRANCH_REF" == $pat ]]; then
+            MATCHED=1
+            break
+          fi
+          ;;
+      esac
+    done <<<"$INCLUDES"
+
+    if [ "$MATCHED" -eq 1 ]; then
+      MATCHING_IDS="$MATCHING_IDS $rid"
+    fi
+  done
+
+  # Strip leading/trailing whitespace for the empty check below.
+  MATCHING_IDS=$(echo "$MATCHING_IDS" | awk '{$1=$1; print}')
+
+  if [ -z "$MATCHING_IDS" ]; then
     echo "FAIL: no rulesets target $BRANCH on $REPO. PR merges are completely unprotected."
     exit 3
   fi
-  REQUIRED_CHECKS=$(echo "$RULESETS" | jq -r '
-    .[]
-    | select(.target == "branch")
-    | .rules[]?
-    | select(.type == "required_status_checks")
-    | .parameters.required_status_checks[]?
-    | .context
-  ')
+
+  # Step B: extract required status checks ONLY from the rulesets that
+  # target the audited branch. Concatenate each matching ruleset's
+  # required_status_checks parameter. Previously this collected from
+  # ALL branch-target rulesets regardless of include match (#285).
+  REQUIRED_CHECKS=""
+  for rid in $MATCHING_IDS; do
+    DETAIL=$(gh api "repos/$REPO/rulesets/$rid" 2>&1) || {
+      echo "Could not fetch ruleset $rid: $DETAIL" >&2; exit 2
+    }
+    THIS_CHECKS=$(echo "$DETAIL" | jq -r '
+      .rules[]?
+      | select(.type == "required_status_checks")
+      | .parameters.required_status_checks[]?
+      | .context
+    ' 2>/dev/null)
+    if [ -n "$THIS_CHECKS" ]; then
+      if [ -n "$REQUIRED_CHECKS" ]; then
+        REQUIRED_CHECKS="$REQUIRED_CHECKS
+$THIS_CHECKS"
+      else
+        REQUIRED_CHECKS="$THIS_CHECKS"
+      fi
+    fi
+  done
 else
-  REQUIRED_CHECKS=$(echo "$PROT" | jq -r '.required_status_checks.contexts[]? // empty')
+  REQUIRED_CHECKS=$(echo "$PROT_BODY" | jq -r '.required_status_checks.contexts[]? // empty')
 fi
 
 if [ -z "$REQUIRED_CHECKS" ]; then
