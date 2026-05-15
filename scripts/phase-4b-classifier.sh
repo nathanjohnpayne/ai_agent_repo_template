@@ -114,7 +114,23 @@ fi
 # triggers. (CodeRabbit Major, #272.) An env override
 # (`MERGEPATH_REVIEW_POLICY_PATH`) lets tests point at a fixture
 # config without depending on cwd.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#
+# Follow symlinks: `dirname "${BASH_SOURCE[0]}"` alone resolves to
+# the symlink's directory, not the real script location — so if this
+# script is invoked through a `PATH` symlink
+# (e.g. `~/bin/phase-4b-classifier.sh`), CONFIG would be looked up
+# next to the symlink and silently fall through to fallback-only.
+# Portable bash-3.2 canonicalization loop (macOS BSD readlink has no
+# `-f` everywhere). (Codex P2 on PR #278, #272.)
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  link_target="$(readlink "$src")"
+  case "$link_target" in
+    /*) src="$link_target" ;;
+    *)  src="$(cd -P "$(dirname "$src")" && pwd)/$link_target" ;;
+  esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$src")" && pwd)"
 CONFIG="${MERGEPATH_REVIEW_POLICY_PATH:-$SCRIPT_DIR/../.github/review-policy.yml}"
 PHASE_4B_DEFAULT=""
 if [ -f "$CONFIG" ]; then
