@@ -26,25 +26,41 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-cd "$REPO_ROOT"
+# MERGEPATH_MKTEMP_SCAN_ROOT env override so tests/test_check_mktemp_portability.sh
+# can point the check at fixture trees. When set, file enumeration uses
+# `find` over that root (no git involvement); otherwise the default path
+# uses `git ls-files` over $REPO_ROOT.
+SCAN_ROOT="${MERGEPATH_MKTEMP_SCAN_ROOT:-$REPO_ROOT}"
+cd "$SCAN_ROOT"
 
-# git ls-files: tracked files only. -z + NUL-delim handles paths with
-# spaces. We restrict to *.sh first and additionally include any
-# tracked file whose first line is a bash/sh shebang.
 TMPFILE="$(mktemp "${TMPDIR:-/tmp}/check-mktemp-portability.XXXXXX")"
 trap 'rm -f "$TMPFILE"' EXIT
 
-# Collect candidate files.
-while IFS= read -r -d '' f; do
-  case "$f" in
-    *.sh) echo "$f" >> "$TMPFILE" ;;
-    *)
-      # Cheap shebang sniff. Only the first line is read.
-      head -n1 -- "$f" 2>/dev/null | grep -qE '^#!.*(bash|/sh)( |$)' \
-        && echo "$f" >> "$TMPFILE"
-      ;;
-  esac
-done < <(git ls-files -z)
+# Collect candidate files. Two modes:
+#   - default: git ls-files (tracked-files-only over a real repo)
+#   - test:    find over the scan root (no git index assumed)
+if [[ -n "${MERGEPATH_MKTEMP_SCAN_ROOT:-}" ]]; then
+  while IFS= read -r -d '' f; do
+    rel="${f#./}"
+    case "$rel" in
+      *.sh) echo "$rel" >> "$TMPFILE" ;;
+      *)
+        head -n1 -- "$f" 2>/dev/null | grep -qE '^#!.*(bash|/sh)( |$)' \
+          && echo "$rel" >> "$TMPFILE"
+        ;;
+    esac
+  done < <(find . -type f -print0)
+else
+  while IFS= read -r -d '' f; do
+    case "$f" in
+      *.sh) echo "$f" >> "$TMPFILE" ;;
+      *)
+        head -n1 -- "$f" 2>/dev/null | grep -qE '^#!.*(bash|/sh)( |$)' \
+          && echo "$f" >> "$TMPFILE"
+        ;;
+    esac
+  done < <(git ls-files -z)
+fi
 
 # Self-exclusion: skip this script (its comments necessarily mention
 # the forbidden form for documentation) and the script that owns the
@@ -55,20 +71,32 @@ VIOLATIONS=0
 VIOLATION_LIST=""
 
 # The pattern targets `mktemp` followed by zero or more whitespace-
-# separated options (`-d` and friends) and then `-t <prefix>` where
-# the prefix is a bare token: starts with a letter/underscore and
-# contains no slash or quote. This is exactly the BSD short form.
+# separated short-option clusters, ending in a cluster that contains
+# `-t` (either bare `-t` OR a compact combined form like `-dt`),
+# followed by a bare-token prefix arg.
+#
+# The cluster regex `-[a-zA-Z]*t` matches:
+#   - bare `-t`                  (zero leading letters, then 't')
+#   - compact `-dt`, `-Pt`, etc. (one or more leading letters, then 't')
+# In BSD getopt semantics `-t` consumes the next arg as the prefix,
+# so `t` must be the LAST char of the flag cluster — hence the trailing
+# `t` anchor in the regex.
 #
 # Examples this matches (BAD):
 #   mktemp -t myprefix
 #   mktemp -d -t mergepath-sim
-#   mktemp -dt myprefix
+#   mktemp -dt myprefix            (#286 r2 — nathanpayne-codex Phase
+#                                    4b finding: the prior regex required
+#                                    a separate `-t` token, missing the
+#                                    compact combined form.)
+#   mktemp -Pdt myprefix           (any leading flags before the t)
 #
 # Examples this DOES NOT match (GOOD):
 #   mktemp -d "${TMPDIR:-/tmp}/mergepath-sim.XXXXXX"
 #   mktemp /tmp/foo.XXXXXX
 #   mktemp --tmpdir name.XXXXXX
-PATTERN='mktemp([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-t[[:space:]]+[A-Za-z_][A-Za-z0-9_.-]*'
+#   mktemp -d   (no -t, no prefix-as-bare-token)
+PATTERN='mktemp([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*t[[:space:]]+[A-Za-z_][A-Za-z0-9_.-]*'
 
 while IFS= read -r file; do
   [[ -z "$file" ]] && continue
@@ -114,6 +142,19 @@ Offending files (path + line numbers):
 EOF
   printf '%s' "$VIOLATION_LIST" >&2
   exit 1
+fi
+
+# Run the regression test suite if present. Guarded by absence of
+# MERGEPATH_MKTEMP_SCAN_ROOT so the test harness's fixture-mode
+# invocations (which set that env) don't recurse back through the
+# test suite. Same recursion-guard pattern as check_sync_manifest.
+TEST_SUITE="$REPO_ROOT/tests/test_check_mktemp_portability.sh"
+if [[ -z "${MERGEPATH_MKTEMP_SCAN_ROOT:-}" ]] && [[ -x "$TEST_SUITE" ]]; then
+  echo "check_mktemp_portability: running regression test suite"
+  if ! bash "$TEST_SUITE"; then
+    echo "check_mktemp_portability: FAIL (regression test suite failed)"
+    exit 1
+  fi
 fi
 
 echo "check_mktemp_portability: PASS"
