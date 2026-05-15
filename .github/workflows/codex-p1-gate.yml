@@ -75,17 +75,22 @@ jobs:
     # to non-schedule events avoids paying for an empty no-op run.
     if: github.event_name != 'schedule'
     steps:
-      - name: Checkout repo (for scripts/codex-p1-gate.sh)
-        # actions/checkout's default for pull_request events checks
-        # out the PR's HEAD ref, which is what this read-only gate
-        # wants — the gate script evolves alongside the PR diff.
-        # No `with:` block needed; actionlint/CodeRabbit rejects an
-        # empty `with:` (round-2 #257 fix).
-        # Unlike auto-clear-blocking-labels.yml (which writes labels
-        # and pins to main's TRUSTED copy to defend against a
-        # malicious PR editing the gate logic), this workflow is
-        # strictly read-only and can't be weaponized.
+      - name: Checkout repo (default branch — trusted gate script)
+        # Pin to the default branch, NOT the PR HEAD. The gate is a
+        # REQUIRED status check: if it ran scripts/codex-p1-gate.sh
+        # from the PR's own checkout, a PR could edit that script to
+        # `exit 0`, satisfy the required check, and merge past
+        # unresolved Codex P1 threads in the window before the
+        # scheduled sweep re-evaluates. "Read-only" (no label writes)
+        # does NOT mean "can't be weaponized" — satisfying a required
+        # check IS the weaponization. The gate script doesn't need the
+        # PR diff anyway: it takes a PR number + repo and queries the
+        # GitHub API. Same trusted-checkout posture as the scheduled-
+        # sweep job below. (Codex P1, #271.)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
 
       - name: Resolve PR number
         id: pr
@@ -232,15 +237,23 @@ jobs:
             # GitHub's 65535-char limit on check_run.output.summary.
             summary=$(printf '%s\n' "$output" | head -c 60000)
 
-            gh api -X POST "repos/$REPO/check-runs" \
+            # Posting the check_run IS the sweep's whole purpose —
+            # it's what supersedes the stale red required-check after
+            # a UI thread-resolve. If the POST fails, the sweep did
+            # not do its job; that's an infra error, not a warning.
+            # Swallowing it let the sweep finish green while the
+            # stale check stayed red. (CodeRabbit Major, #271.)
+            if ! gh api -X POST "repos/$REPO/check-runs" \
               -f name="$CHECK_NAME" \
               -f head_sha="$head_sha" \
               -f status="completed" \
               -f conclusion="$conclusion" \
               -f "output[title]=Codex P1 gate (scheduled re-evaluation)" \
               -f "output[summary]=$summary" \
-              >/dev/null \
-              || echo "::warning::Failed to post check_run for PR #$PR"
+              >/dev/null; then
+              echo "::error::Failed to post check_run for PR #$PR — stale required check not refreshed."
+              had_infra_error=1
+            fi
             echo "::endgroup::"
           done <<<"$PRS"
           if [ "$had_infra_error" -ne 0 ]; then
