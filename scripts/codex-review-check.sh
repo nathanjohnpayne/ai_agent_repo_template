@@ -85,6 +85,19 @@
 
 set -euo pipefail
 
+# --- preflight auto-source (#282) ------------------------------------------
+# Auto-source the op-preflight cache when GH_TOKEN is unset and a fresh
+# cache exists for this agent. codex-review-check.sh is read-only, so
+# reviewer scope is the right PAT — but the auto-source picks whatever
+# is in the cache, both PATs are available, and we only need one for
+# the API calls below.
+__CODEX_CHECK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "$__CODEX_CHECK_DIR/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=lib/preflight-helpers.sh
+  . "$__CODEX_CHECK_DIR/lib/preflight-helpers.sh"
+  preflight_require_token reviewer || true
+fi
+
 # --- argument parsing -------------------------------------------------------
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
@@ -108,7 +121,10 @@ if [ -z "$REPO" ]; then
 fi
 
 if [ -z "${GH_TOKEN:-}" ]; then
-  echo "ERROR: GH_TOKEN is required. See REVIEW_POLICY.md § PAT lookup table." >&2
+  echo "ERROR: GH_TOKEN is required. Either:" >&2
+  echo "  - Run: eval \"\$(scripts/op-preflight.sh --agent <agent> --mode review)\"" >&2
+  echo "    so this helper auto-sources OP_PREFLIGHT_REVIEWER_PAT, OR" >&2
+  echo "  - Set GH_TOKEN inline per REVIEW_POLICY.md § PAT lookup table." >&2
   exit 3
 fi
 

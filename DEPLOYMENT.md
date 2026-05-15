@@ -432,14 +432,15 @@ for collaborators), not repos they collaborate on.
 **Use classic PATs with `repo` scope for all reviewer identities.** This is stored
 in 1Password with the field name `token` (not `credential` or `password`).
 
-1Password item IDs (all classic PATs with `ghp_` prefix, field `token`, vault `Private`):
+**Canonical PAT lookup table:** see [REVIEW_POLICY.md § PAT lookup
+table](REVIEW_POLICY.md#pat-lookup-table). The single source of truth
+for agent-to-item-ID mappings lives there, alongside the cached
+`$OP_PREFLIGHT_*_PAT` env-var conventions. Routine work should use the
+cached env vars (no biometric per call); the inline `op read` form is
+a setup-only fallback documented in the same section.
 
-| Reviewer Identity | 1Password Item ID | `op read` command |
-|---|---|---|
-| `nathanpayne-claude` | `pvbq24vl2h6gl7yjclxy2hbote` | `op read "op://Private/pvbq24vl2h6gl7yjclxy2hbote/token"` |
-| `nathanpayne-cursor` | `bslrih4spwxgookzfy6zedz5g4` | `op read "op://Private/bslrih4spwxgookzfy6zedz5g4/token"` |
-| `nathanpayne-codex` | `o6ekjxjjl5gq6rmcneomrjahpu` | `op read "op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token"` |
-| `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `op read "op://Private/sm5kopwk6t6p3xmu2igesndzhe/token"` |
+All 1Password items in that table are classic PATs with the `ghp_`
+prefix, stored with field name `token` in the `Private` vault.
 
 Use the item ID (not the item title) to avoid shell issues with parentheses in
 1Password item names like `GitHub PAT (pr-review-claude)`.
@@ -457,10 +458,9 @@ and `CLAUDE.md` § Active-account convention. Short form:
   machine: `gh auth switch -u nathanpayne-<agent>`.
 
 ```bash
-# Read-path identity check — GH_TOKEN works here.
-GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
-  gh api user --jq '.login'
-# expected: nathanpayne-claude
+# Read-path identity check (PRIMARY — uses cached PAT, no biometric).
+GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq '.login'
+# expected: nathanpayne-<agent>
 
 # Write-path: with the agent identity active, GH_TOKEN is irrelevant
 # for the byline. Just run the command.
@@ -472,6 +472,13 @@ gh auth switch -u nathanjohnpayne && \
   gh pr merge <PR#> --squash --delete-branch && \
   gh auth switch -u nathanpayne-<agent>
 ```
+
+> **⚠️ Fallback / setup-only:** the inline `GH_TOKEN="$(op read
+> 'op://Private/<item-id>/token')"` form triggers a biometric prompt
+> on **every** invocation. Use only when `op-preflight.sh` is
+> unavailable. Routine agent work should always use the cached
+> `$OP_PREFLIGHT_REVIEWER_PAT` env var after a one-time
+> `eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"`.
 
 - Use the item ID from the table above for your agent identity. Do not use the 1Password item title.
 - Verify the keyring active account with `gh config get -h github.com user`

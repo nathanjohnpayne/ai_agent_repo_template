@@ -71,18 +71,28 @@ matters for audit-trail consistency.
 
 #### PAT lookup table
 
-| Agent | Reviewer Identity | 1Password Item ID | `op read` path |
-|-------|-------------------|-------------------|----------------|
-| Claude | `nathanpayne-claude` | `pvbq24vl2h6gl7yjclxy2hbote` | `op://Private/pvbq24vl2h6gl7yjclxy2hbote/token` |
-| Cursor | `nathanpayne-cursor` | `bslrih4spwxgookzfy6zedz5g4` | `op://Private/bslrih4spwxgookzfy6zedz5g4/token` |
-| Codex | `nathanpayne-codex` | `o6ekjxjjl5gq6rmcneomrjahpu` | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
-| Human | `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `op://Private/sm5kopwk6t6p3xmu2igesndzhe/token` |
+> This is the **canonical source** for PAT lookups across the
+> mergepath ecosystem. `CLAUDE.md` (project), `AGENTS.md`, and
+> `DEPLOYMENT.md` all reference this section instead of duplicating
+> the table. Machine-level `~/GitHub/CLAUDE.md` mirrors the same
+> rows for cross-repo work.
+
+| Agent | Reviewer Identity | 1Password Item ID | Cached env var (primary) | `op read` path (setup-only fallback) |
+|-------|-------------------|-------------------|--------------------------|--------------------------------------|
+| Claude | `nathanpayne-claude` | `pvbq24vl2h6gl7yjclxy2hbote` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/pvbq24vl2h6gl7yjclxy2hbote/token` |
+| Cursor | `nathanpayne-cursor` | `bslrih4spwxgookzfy6zedz5g4` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/bslrih4spwxgookzfy6zedz5g4/token` |
+| Codex | `nathanpayne-codex` | `o6ekjxjjl5gq6rmcneomrjahpu` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
+| Human | `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `$OP_PREFLIGHT_AUTHOR_PAT` | `op://Private/sm5kopwk6t6p3xmu2igesndzhe/token` |
+
+**Cached-variable usage is the primary pattern.** After a single
+`eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"` at
+session start, all subsequent API calls use the env var directly —
+no biometric burned per call:
 
 ```bash
-# Read-path identity check — GH_TOKEN works here.
-GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
-  gh api user --jq '.login'
-# expected: nathanpayne-claude
+# Read-path identity check (PRIMARY — uses cached PAT, no biometric).
+GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq '.login'
+# expected: nathanpayne-<agent>
 
 # Write-path: with the agent identity active, GH_TOKEN is irrelevant
 # for the byline. Just run the command.
@@ -100,6 +110,21 @@ scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
 gh auth switch -u nathanjohnpayne && \
   gh pr create --title "..." --body "..." && \
   gh auth switch -u nathanpayne-claude
+```
+
+##### Fallback / setup-only: inline `op read`
+
+> **⚠️ This triggers a biometric prompt every call. Use only when
+> `op-preflight.sh` is unavailable** — for example, during the
+> initial bootstrap of a new machine before the cache directory
+> exists, or in a CI runner that has not been wired through
+> preflight. Routine agent work should always use the cached
+> `$OP_PREFLIGHT_*_PAT` env vars above.
+
+```bash
+# Setup-only — every invocation prompts for Touch ID.
+GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
+  gh api user --jq '.login'
 ```
 
 - Use the item ID from the lookup table above for your agent identity. Do not use the 1Password item title.
@@ -150,16 +175,31 @@ text below.
 > Run this once at the start of every PR review or deploy session. It front-loads all 1Password credential reads and SSH key authorization into a single burst of biometric prompts (~15 seconds), so the human can step away for the rest of the session.
 
 ```bash
-eval "$(scripts/op-preflight.sh --agent claude --mode all)"
+# Session start (one biometric burst). `--mode review` is the DEFAULT
+# (changed from `--mode all` in #282) — most agent work only needs the
+# reviewer/author PATs + SSH warming, not deploy credentials.
+eval "$(scripts/op-preflight.sh --agent claude --mode review)"
+
+# Every subsequent tool call (idempotent, NEVER prompts for biometric):
+eval "$(scripts/op-preflight.sh --agent claude --check)"
 ```
+
+The `--check` (alias `--status`) mode is the lightweight idempotent re-
+validation pattern: it loads the cached export statements without
+invoking `op`, without warming SSH, and without reading ADC. On a
+missing or stale cache it exits non-zero with a remediation message
+pointing back at `--mode review`. Combined with `OP_PREFLIGHT_QUIET=1`
+the cache-hit path collapses to a single stderr line, so noisy agent
+sessions don't accumulate a verbose preflight block on every tool call.
+See nathanjohnpayne/mergepath#282.
 
 Replace `claude` with `cursor` or `codex` depending on which agent is running. The `--mode` flag controls what is loaded:
 
 | Mode | What's loaded |
 |------|--------------|
-| `review` | Reviewer PAT + author PAT + SSH keys |
-| `deploy` | GCP ADC credential |
-| `all` | Everything (recommended) |
+| `review` | Reviewer PAT + author PAT + SSH keys (**DEFAULT**) |
+| `deploy` | GCP ADC credential + Cloudflare cache-purge token |
+| `all` | Everything |
 
 After preflight, these environment variables are set:
 - `OP_PREFLIGHT_REVIEWER_PAT` — use with `GH_TOKEN=` for reviewer-identity **read-path** API calls and helper scripts (`coderabbit-wait.sh`, `codex-review-request.sh`, `codex-review-check.sh`). Write paths (`gh pr review` / `create` / `merge` / `edit`) use the active keyring account regardless of `GH_TOKEN` — see [Reviewer PAT Quick Start](#reviewer-pat-quick-start).
