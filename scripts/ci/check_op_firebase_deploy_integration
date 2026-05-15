@@ -27,6 +27,9 @@
 # Cases covered (resolver precedence per the script source's comment
 # block at `resolve_source_cred_file`):
 #
+#   0. genuinely user-supplied GOOGLE_APPLICATION_CREDENTIALS (NOT
+#      preflight-injected) → rank 1 wins
+#        log: "source credential: explicit GOOGLE_APPLICATION_CREDENTIALS ..."
 #   1. project SA key present → rank 2 wins
 #        log: "source credential: project Firebase-vault SA key ..."
 #   2. project SA absent + preflight ADC present → rank 3 wins
@@ -36,6 +39,16 @@
 #        log: "source credential: shared 1Password ADC ..."
 #   4. all op sources absent + local ADC file present → rank 5 wins
 #        log: "source credential: local ADC file ..."
+#
+# Not covered (deliberate): the usability-fallback walk (rank-N
+# unusable → fall through to N+1). The script short-circuits
+# `source_cred_is_usable` to "usable" for `type == "service_account"`
+# credentials (see scripts/firebase/op-firebase-deploy line ~244), so
+# triggering the fallback path requires an `authorized_user`-shaped
+# JSON whose refresh-token call to oauth2.googleapis.com fails. That
+# introduces a real outbound-network dependency that's not safe to
+# rely on under hermetic CI; the behavior is exercised by #211's
+# live consumer-repo verification instead.
 #
 # Each case asserts:
 #   (a) the source-credential log line on stderr matches the expected
@@ -215,6 +228,186 @@ STUB
   fi
 }
 
+# Variant of run_case that sources case-env.sh before invoking the script.
+# Lets us pass GOOGLE_APPLICATION_CREDENTIALS / OP_PREFLIGHT_ADC_TMPFILE
+# through env -i without clobbering them.
+run_case_with_env() {
+  local case_name="$1"
+  local expected_log_substring="$2"
+  local project="$3"
+  local provision="$4"
+  local case_dir="$SCRATCH_ROOT/$case_name"
+  local bin_dir="$case_dir/bin"
+  local tmp_dir="$case_dir/tmp"
+  local home_dir="$case_dir/home"
+
+  mkdir -p "$bin_dir" "$tmp_dir" "$home_dir/.config/gcloud"
+
+  cat >"$case_dir/.firebaserc" <<JSON
+{ "projects": { "default": "$project" } }
+JSON
+
+  cat >"$bin_dir/firebase" <<'STUB'
+#!/usr/bin/env bash
+echo "[stub-firebase] called with: $*" >&2
+exit 0
+STUB
+  chmod +x "$bin_dir/firebase"
+
+  cat >"$bin_dir/gcloud" <<'STUB'
+#!/usr/bin/env bash
+echo "[stub-gcloud] called with: $*" >&2
+exit 0
+STUB
+  chmod +x "$bin_dir/gcloud"
+
+  "$provision" "$case_dir" "$bin_dir" "$tmp_dir" "$home_dir" "$project"
+
+  local stderr_log="$case_dir/stderr.log"
+  local stdout_log="$case_dir/stdout.log"
+  local rc=0
+
+  # Wrap the invocation: source case-env.sh (if it exists), then exec
+  # the script. We still use env -i to enforce a hermetic baseline.
+  cat >"$case_dir/runner.sh" <<RUNNER
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$case_dir"
+if [ -f "$case_dir/case-env.sh" ]; then
+  # shellcheck disable=SC1090
+  source "$case_dir/case-env.sh"
+fi
+exec "$DEPLOY_SCRIPT"
+RUNNER
+  chmod +x "$case_dir/runner.sh"
+
+  (
+    env -i \
+      PATH="$bin_dir:$PYTHON3_DIR:/usr/bin:/bin:/usr/sbin:/sbin" \
+      HOME="$home_dir" \
+      TMPDIR="$tmp_dir" \
+      "$case_dir/runner.sh" \
+      >"$stdout_log" 2>"$stderr_log"
+  ) || rc=$?
+
+  local check_passed=true
+
+  if [ "$rc" -ne 0 ]; then
+    echo "  FAIL: $case_name — script exited rc=$rc (expected 0)"
+    echo "    stderr:"
+    sed 's/^/      /' "$stderr_log" >&2 || true
+    check_passed=false
+  fi
+
+  if ! grep -qF "$expected_log_substring" "$stderr_log"; then
+    echo "  FAIL: $case_name — stderr missing expected source-cred log"
+    echo "    expected substring: $expected_log_substring"
+    echo "    actual stderr:"
+    sed 's/^/      /' "$stderr_log" >&2 || true
+    check_passed=false
+  fi
+
+  # Tempfile cleanup: the script-written tempfiles (gcp-impersonated-*,
+  # firebase-sa-*, gcp-adc-*) must be gone. Note that for cases that
+  # pre-provision their own credentials (preflight ADC, explicit GAC),
+  # those harness-written files are allowed to survive — only files
+  # matching the script's mktemp patterns are checked.
+  local lingering
+  lingering="$(find "$tmp_dir" -type f 2>/dev/null | grep -E 'gcp-(adc|impersonated)-|firebase-sa-' || true)"
+  if [ -n "$lingering" ]; then
+    echo "  FAIL: $case_name — tempfiles leaked under $tmp_dir:"
+    echo "$lingering" | sed 's/^/      /' >&2
+    check_passed=false
+  fi
+
+  if $check_passed; then
+    echo "  PASS: $case_name — log='$expected_log_substring', tempfiles cleaned"
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# ----------------------------------------------------------------------
+# Case 0 — genuinely user-supplied GOOGLE_APPLICATION_CREDENTIALS
+#          (NOT preflight-injected) → rank 1 wins
+# ----------------------------------------------------------------------
+# Distinguishes a human-set env var from preflight's tempfile by setting
+# GOOGLE_APPLICATION_CREDENTIALS WITHOUT also setting OP_PREFLIGHT_ADC_TMPFILE.
+# The resolver's `is_preflight_injected` check requires both to be set
+# AND equal; with only GAC set, rank 1 wins and the script reports the
+# explicit override. Even if a project SA key is reachable via `op`,
+# rank 1 short-circuits the resolver before rank 2 runs (this case
+# verifies that ordering by leaving `op` reachable — if rank 2 ever
+# slipped above rank 1, the assertion would fail on the log line).
+# ----------------------------------------------------------------------
+provision_explicit_gac() {
+  local case_dir="$1" bin_dir="$2" tmp_dir="$3" home_dir="$4" project="$5"
+
+  # Provision an explicit credential file in a non-preflight location.
+  # The path lives under $tmp_dir so the cleanup-leak assertion still
+  # works — but the file itself is owned by the test harness and
+  # allowed to survive (we filter the leak grep to the script's mktemp
+  # patterns, not our pre-provisioned files).
+  local explicit_path="$tmp_dir/explicit-gac.json"
+  write_fake_sa_key "$explicit_path" \
+    "explicit-override@${project}.iam.gserviceaccount.com"
+
+  # Provision a project SA key that WOULD win at rank 2 if rank 1
+  # didn't fire. The assertion that the log line says "explicit
+  # GOOGLE_APPLICATION_CREDENTIALS" (not "project Firebase-vault SA
+  # key") is what proves rank 1 outranks rank 2.
+  local sa_payload_dir="$case_dir/op-payloads"
+  mkdir -p "$sa_payload_dir"
+  write_fake_sa_key "$sa_payload_dir/project-sa.json" \
+    "firebase-deployer@${project}.iam.gserviceaccount.com"
+
+  cat >"$bin_dir/op" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+  document)
+    shift
+    if [ "\$1" = "get" ]; then
+      shift
+      out_path=""
+      while [ \$# -gt 0 ]; do
+        if [ "\$1" = "--out-file" ]; then
+          shift; out_path="\$1"
+        fi
+        shift || true
+      done
+      if [ -n "\$out_path" ]; then
+        cp "$sa_payload_dir/project-sa.json" "\$out_path"
+        exit 0
+      fi
+      exit 1
+    fi
+    exit 1
+    ;;
+  read)
+    exit 1
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+STUB
+  chmod +x "$bin_dir/op"
+
+  # GAC set; OP_PREFLIGHT_ADC_TMPFILE deliberately UNSET → not
+  # preflight-injected → rank 1 fires.
+  cat >"$case_dir/case-env.sh" <<ENV
+export GOOGLE_APPLICATION_CREDENTIALS="$explicit_path"
+unset OP_PREFLIGHT_ADC_TMPFILE
+ENV
+}
+
+run_case_with_env \
+  "case0_explicit_gac_override" \
+  "source credential: explicit GOOGLE_APPLICATION_CREDENTIALS" \
+  "merge-path-test" \
+  provision_explicit_gac
+
 # ----------------------------------------------------------------------
 # Case 1 — project SA key present (rank 2 wins)
 # ----------------------------------------------------------------------
@@ -302,106 +495,6 @@ STUB
 export GOOGLE_APPLICATION_CREDENTIALS="$preflight_path"
 export OP_PREFLIGHT_ADC_TMPFILE="$preflight_path"
 ENV
-}
-
-# Variant of run_case that sources case-env.sh before invoking the script.
-# Lets us pass GOOGLE_APPLICATION_CREDENTIALS / OP_PREFLIGHT_ADC_TMPFILE
-# through env -i without clobbering them.
-run_case_with_env() {
-  local case_name="$1"
-  local expected_log_substring="$2"
-  local project="$3"
-  local provision="$4"
-  local case_dir="$SCRATCH_ROOT/$case_name"
-  local bin_dir="$case_dir/bin"
-  local tmp_dir="$case_dir/tmp"
-  local home_dir="$case_dir/home"
-
-  mkdir -p "$bin_dir" "$tmp_dir" "$home_dir/.config/gcloud"
-
-  cat >"$case_dir/.firebaserc" <<JSON
-{ "projects": { "default": "$project" } }
-JSON
-
-  cat >"$bin_dir/firebase" <<'STUB'
-#!/usr/bin/env bash
-echo "[stub-firebase] called with: $*" >&2
-exit 0
-STUB
-  chmod +x "$bin_dir/firebase"
-
-  cat >"$bin_dir/gcloud" <<'STUB'
-#!/usr/bin/env bash
-echo "[stub-gcloud] called with: $*" >&2
-exit 0
-STUB
-  chmod +x "$bin_dir/gcloud"
-
-  "$provision" "$case_dir" "$bin_dir" "$tmp_dir" "$home_dir" "$project"
-
-  local stderr_log="$case_dir/stderr.log"
-  local stdout_log="$case_dir/stdout.log"
-  local rc=0
-
-  # Wrap the invocation: source case-env.sh (if it exists), then exec
-  # the script. We still use env -i to enforce a hermetic baseline.
-  cat >"$case_dir/runner.sh" <<RUNNER
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$case_dir"
-if [ -f "$case_dir/case-env.sh" ]; then
-  # shellcheck disable=SC1090
-  source "$case_dir/case-env.sh"
-fi
-exec "$DEPLOY_SCRIPT"
-RUNNER
-  chmod +x "$case_dir/runner.sh"
-
-  (
-    env -i \
-      PATH="$bin_dir:$PYTHON3_DIR:/usr/bin:/bin:/usr/sbin:/sbin" \
-      HOME="$home_dir" \
-      TMPDIR="$tmp_dir" \
-      "$case_dir/runner.sh" \
-      >"$stdout_log" 2>"$stderr_log"
-  ) || rc=$?
-
-  local check_passed=true
-
-  if [ "$rc" -ne 0 ]; then
-    echo "  FAIL: $case_name — script exited rc=$rc (expected 0)"
-    echo "    stderr:"
-    sed 's/^/      /' "$stderr_log" >&2 || true
-    check_passed=false
-  fi
-
-  if ! grep -qF "$expected_log_substring" "$stderr_log"; then
-    echo "  FAIL: $case_name — stderr missing expected source-cred log"
-    echo "    expected substring: $expected_log_substring"
-    echo "    actual stderr:"
-    sed 's/^/      /' "$stderr_log" >&2 || true
-    check_passed=false
-  fi
-
-  # Tempfile cleanup: the script-written tempfiles (gcp-impersonated-*,
-  # firebase-sa-*, gcp-adc-*) must be gone. Note that for the preflight
-  # case, the preflight-adc.json file is provisioned BY THE TEST (not
-  # the script) and is allowed to survive — only files matching the
-  # script's mktemp patterns are checked.
-  local lingering
-  lingering="$(find "$tmp_dir" -type f 2>/dev/null | grep -E 'gcp-(adc|impersonated)-|firebase-sa-' || true)"
-  if [ -n "$lingering" ]; then
-    echo "  FAIL: $case_name — tempfiles leaked under $tmp_dir:"
-    echo "$lingering" | sed 's/^/      /' >&2
-    check_passed=false
-  fi
-
-  if $check_passed; then
-    echo "  PASS: $case_name — log='$expected_log_substring', tempfiles cleaned"
-    PASS=$((PASS + 1))
-  else
-    FAIL=$((FAIL + 1))
-  fi
 }
 
 run_case_with_env \

@@ -252,14 +252,14 @@ This creates `firebase.json` and `.firebaserc`. Commit both.
 ### 4. Set up the deployer service account
 
 ```bash
-op-firebase-setup {project-id}
+op-firebase-setup {project-id} --provision-sa-key
 ```
 
-See [First-Time Setup](#first-time-setup) for details. This creates the `firebase-deployer` service account, grants the necessary deploy roles, and configures impersonation as a fallback path.
+See [First-Time Setup](#first-time-setup) for details. This creates the `firebase-deployer` service account, grants the necessary deploy roles, configures impersonation as a fallback path, and (with `--provision-sa-key`) mints the deployer SA key and uploads it to `op://Firebase/{project-id} — Firebase Deployer SA Key`. The flag is opt-in; without it, the script does impersonation-only setup and leaves SA-key provisioning as a documented manual step.
 
 ### 5. Provision the Firebase-vault SA key (preferred default)
 
-After `op-firebase-setup` runs, follow [§ Secrets Management → Provisioning the Firebase-vault SA key](#provisioning-the-firebase-vault-sa-key) to materialize the SA key into the 1Password Firebase vault. This is the **preferred default** credential for routine deploys (interactive + CI) per #154 — it avoids the recurring `firebase login --reauth` friction (#137) caused by RAPT/refresh-token expiry on the shared 1Password ADC.
+If you ran step 4 with `--provision-sa-key`, the SA key is already in 1Password and you can skip to step 6. Otherwise, follow [§ Secrets Management → Provisioning the Firebase-vault SA key](#provisioning-the-firebase-vault-sa-key) to materialize the SA key — the doc-block procedure is functionally identical to what `--provision-sa-key` runs inside the setup script. The SA key is the **preferred default** credential for routine deploys (interactive + CI) per #154 — it avoids the recurring `firebase login --reauth` friction (#137) caused by RAPT/refresh-token expiry on the shared 1Password ADC.
 
 Impersonation remains as a fallback path; it kicks in when the project SA key isn't provisioned yet.
 
@@ -701,7 +701,20 @@ Each project's SA key is stored in the 1Password **Firebase** vault with the nam
 
 ### Provisioning the Firebase-vault SA key
 
-Run once per Firebase project, after `op-firebase-setup` has created the `firebase-deployer` service account:
+Run once per Firebase project. The preferred path is the `--provision-sa-key` flag on the setup script — it mints the key, uploads it, and wipes the local tempfile in a single attended invocation:
+
+```bash
+op-firebase-setup {project-id} --provision-sa-key
+
+# Verify: a routine deploy should now log
+# "[op-firebase-deploy] source credential: project Firebase-vault SA key (...)"
+# and run without prompting for firebase login --reauth.
+op-firebase-deploy --only hosting   # or whatever target
+```
+
+The flag is opt-in (preserves the prior impersonation-only setup behavior for callers who want it), refuses to overwrite an existing 1Password item with the canonical title (rotate via the [§ Rotating a Firebase deploy SA key](#rotating-a-firebase-deploy-sa-key) procedure instead), and short-circuits early with a clear error if the 1Password CLI is not on PATH.
+
+If you cannot use the flag (older `op-firebase-setup` on PATH, debugging the steps individually, or operating against a setup that already ran without provisioning), the manual procedure below is functionally identical to what the flag runs internally:
 
 ```bash
 PROJECT_ID="{project-id}"
@@ -885,3 +898,10 @@ and the `GOOGLE_APPLICATION_CREDENTIALS` export resumes normally.
 **2026-05-15: Deploy credential precedence updated.** Project Firebase-vault SA keys
 are now the default for `op-firebase-deploy`. See #154 / #211 for implementation
 history; live consumer verification on matchline pending (#211 close-out).
+
+**2026-05-15: `op-firebase-setup --provision-sa-key` flag added.** The setup script
+now optionally mints the deployer SA key and uploads it to
+`op://Firebase/{project-id} — Firebase Deployer SA Key` as part of the same
+attended invocation, folding the previously-manual DEPLOYMENT.md procedure into
+the script. Opt-in to preserve the prior impersonation-only behavior contract.
+See #154 close-out.
