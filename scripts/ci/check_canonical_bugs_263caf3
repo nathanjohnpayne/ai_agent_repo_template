@@ -87,7 +87,7 @@ GH_STUB
 chmod +x "$SCRATCH/gh"
 
 set +e
-out=$(PATH="$SCRATCH:$PATH" \
+out=$(PATH="$SCRATCH:$PATH" REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK=1 \
   MERGEPATH_NOTIFY_IMESSAGE_TO="" \
   "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review 2>&1)
 rc=$?
@@ -105,7 +105,7 @@ fi
 # Same, but WITH --repo — sanity-check that the explicit-repo path
 # is also still wired up.
 set +e
-out=$(PATH="$SCRATCH:$PATH" \
+out=$(PATH="$SCRATCH:$PATH" REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK=1 \
   MERGEPATH_NOTIFY_IMESSAGE_TO="" \
   "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review --repo nathanjohnpayne/mergepath 2>&1)
 rc=$?
@@ -146,6 +146,7 @@ chmod +x "$SCRATCH/gh"
 # no-repo path
 SCRATCH_BODY_OUT="$SCRATCH/body-norepo.txt" \
   PATH="$SCRATCH:$PATH" \
+  REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK=1 \
   MERGEPATH_NOTIFY_IMESSAGE_TO="" \
   "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review >/dev/null 2>&1 || true
 
@@ -163,6 +164,7 @@ fi
 # with-repo path
 SCRATCH_BODY_OUT="$SCRATCH/body-repo.txt" \
   PATH="$SCRATCH:$PATH" \
+  REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK=1 \
   MERGEPATH_NOTIFY_IMESSAGE_TO="" \
   "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review --repo nathanjohnpayne/mergepath >/dev/null 2>&1 || true
 

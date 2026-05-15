@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# scripts/identity-check.sh — Pre-action identity assertion helper (#284).
+#
+# Asserts that the current execution context has the EXPECTED gh identity
+# at the moment of call. Used as a fail-closed pre-write guard from
+# helper scripts (coderabbit-wait.sh, codex-review-request.sh,
+# resolve-pr-threads.sh, request-label-removal.sh) and the gh-as-*
+# wrappers, so a silent active-account drift never lands a PR write
+# under the wrong byline.
+#
+# Why this exists:
+#
+#   `gh` resolves the byline for write paths from the keyring's ACTIVE
+#   account (read with `gh config get -h github.com user`), not from
+#   GH_TOKEN. A `gh auth switch -u <X>` that silently no-ops (X not in
+#   the keyring; corrupt hosts.yml; race with a parallel switch in
+#   another process) leaves the keyring on the prior identity but
+#   returns rc=0 — the wrapped write then lands under the wrong
+#   account. See #241 / #283 for two concrete in-session incidents.
+#
+#   This helper is the assertion knife: one call before any write
+#   verifies that the caller's expected identity matches reality.
+#   Callers wire it in at the top of each WRITE path.
+#
+# Modes (mutually exclusive; exactly one is required):
+#
+#   --expect-author
+#     Keyring's active account must be the author identity
+#     (nathanjohnpayne by default; override via
+#     IDENTITY_CHECK_EXPECTED_AUTHOR).
+#
+#   --expect-reviewer
+#     Keyring's active account must be nathanpayne-<MERGEPATH_AGENT>.
+#     MERGEPATH_AGENT is read from the environment; missing/empty
+#     falls back to `claude` with a stderr warning.
+#
+#   --expect-external <agent>
+#     Keyring's active account must be nathanpayne-<agent>. Used in
+#     Phase 4b CLI sessions where the cross-agent reviewer (e.g.
+#     `codex` from a `claude` parent session) needs to assert its own
+#     identity before posting the external review.
+#
+#   --expect-token-identity <login>
+#     Runs `gh api user --jq .login` with the CURRENT $GH_TOKEN and
+#     asserts the response matches <login>. This is for PAT-authored
+#     writes — specifically `gh api graphql` mutations like
+#     resolveReviewThread, where attribution follows the token, NOT
+#     the keyring. See REVIEW_POLICY.md § Operation-to-Identity Matrix.
+#
+# Exit codes:
+#   0  match (proceed)
+#   1  bad invocation (no mode, conflicting modes, missing argument)
+#   2  mismatch — actual identity printed with remediation hint
+#   3  could not read identity (gh not installed, hosts.yml corrupt,
+#      gh api user failed, etc.) — fail closed
+#
+# All diagnostics go to stderr; no stdout output. The script is silent
+# on success so it can be dropped at the top of any helper without
+# noise.
+#
+# IDENTITY: keyring vs PAT
+#
+#   `--expect-author` / `--expect-reviewer` / `--expect-external` all
+#   read the KEYRING's active account via `gh config get -h github.com
+#   user`. This is the GH_TOKEN-immune signal — `gh auth status` is
+#   poisonable when GH_TOKEN is set (it reports the GH_TOKEN entry as
+#   Active even though writes still attribute to the keyring), so we
+#   never use it.
+#
+#   `--expect-token-identity` is the inverse: it asserts the IDENTITY
+#   ATTACHED TO $GH_TOKEN, not the keyring. PAT-attributed writes
+#   (specifically `gh api graphql` mutations) follow GH_TOKEN, not the
+#   keyring. The matrix subsection in REVIEW_POLICY.md walks through
+#   which operations belong to which auth layer.
+#
+# Bash 3.2 portable (macOS default).
+
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: identity-check.sh <mode>
+
+Modes (exactly one required):
+  --expect-author                   keyring active == author identity (nathanjohnpayne)
+  --expect-reviewer                 keyring active == nathanpayne-$MERGEPATH_AGENT
+  --expect-external <agent>         keyring active == nathanpayne-<agent>
+  --expect-token-identity <login>   gh api user .login (under $GH_TOKEN) == <login>
+
+Exit codes: 0 match | 1 bad args | 2 mismatch | 3 read failure (fail-closed).
+USAGE
+}
+
+# --- parse args -------------------------------------------------------
+
+MODE=""
+ARG=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --expect-author)
+      [ -n "$MODE" ] && { echo "identity-check: conflicting modes ($MODE and $1)" >&2; usage; exit 1; }
+      MODE="author"
+      shift
+      ;;
+    --expect-reviewer)
+      [ -n "$MODE" ] && { echo "identity-check: conflicting modes ($MODE and $1)" >&2; usage; exit 1; }
+      MODE="reviewer"
+      shift
+      ;;
+    --expect-external)
+      [ -n "$MODE" ] && { echo "identity-check: conflicting modes ($MODE and $1)" >&2; usage; exit 1; }
+      MODE="external"
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "identity-check: --expect-external requires an agent name" >&2
+        usage
+        exit 1
+      fi
+      ARG="$2"
+      shift 2
+      ;;
+    --expect-token-identity)
+      [ -n "$MODE" ] && { echo "identity-check: conflicting modes ($MODE and $1)" >&2; usage; exit 1; }
+      MODE="token"
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "identity-check: --expect-token-identity requires a login" >&2
+        usage
+        exit 1
+      fi
+      ARG="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "identity-check: unknown arg: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [ -z "$MODE" ]; then
+  echo "identity-check: no mode specified" >&2
+  usage
+  exit 1
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "identity-check: gh CLI not on PATH; cannot verify identity." >&2
+  echo "identity-check:   Install gh and run 'gh auth login' for the required identity." >&2
+  exit 3
+fi
+
+# --- compute expected identity ----------------------------------------
+
+EXPECTED=""
+case "$MODE" in
+  author)
+    EXPECTED="${IDENTITY_CHECK_EXPECTED_AUTHOR:-nathanjohnpayne}"
+    ;;
+  reviewer)
+    AGENT="${MERGEPATH_AGENT:-}"
+    if [ -z "$AGENT" ]; then
+      echo "identity-check: WARNING MERGEPATH_AGENT is unset; falling back to 'claude'." >&2
+      echo "identity-check:   Set MERGEPATH_AGENT=<claude|cursor|codex> to silence this warning." >&2
+      AGENT="claude"
+    fi
+    EXPECTED="nathanpayne-$AGENT"
+    ;;
+  external)
+    EXPECTED="nathanpayne-$ARG"
+    ;;
+  token)
+    EXPECTED="$ARG"
+    ;;
+esac
+
+# --- read actual identity ---------------------------------------------
+
+ACTUAL=""
+SIGNAL=""
+if [ "$MODE" = "token" ]; then
+  # PAT-authored write. The token in $GH_TOKEN authenticates the API
+  # call AND determines the byline for graphql mutations like
+  # resolveReviewThread. We deliberately use `gh api user` here
+  # (not `gh config get`) because we want the token's identity, not
+  # the keyring's.
+  if [ -z "${GH_TOKEN:-}" ]; then
+    echo "identity-check: GH_TOKEN is empty/unset; cannot verify token identity." >&2
+    echo "identity-check:   Set GH_TOKEN to the PAT that will sign the API call (e.g. \$OP_PREFLIGHT_REVIEWER_PAT)." >&2
+    exit 3
+  fi
+  SIGNAL="gh api user --jq .login (with GH_TOKEN)"
+  if ! ACTUAL=$(gh api user --jq .login 2>/dev/null); then
+    echo "identity-check: '$SIGNAL' failed; cannot verify token identity." >&2
+    echo "identity-check:   The PAT in GH_TOKEN may be expired, revoked, or lack 'read:user' scope." >&2
+    exit 3
+  fi
+else
+  # Keyring-attributed write. Read the keyring's active account via
+  # `gh config get -h github.com user`, NOT `gh auth status` — the
+  # latter is GH_TOKEN-poisonable (it reports the GH_TOKEN entry as
+  # Active even though writes still attribute to the keyring).
+  SIGNAL="gh config get -h github.com user"
+  ACTUAL=$($SIGNAL 2>/dev/null || true)
+  if [ -z "$ACTUAL" ]; then
+    echo "identity-check: '$SIGNAL' returned empty; cannot verify keyring identity." >&2
+    echo "identity-check:   Either gh is not authenticated or the keyring config is corrupt." >&2
+    echo "identity-check:   Run 'gh auth login' for the $EXPECTED identity, then retry." >&2
+    exit 3
+  fi
+fi
+
+# --- compare ----------------------------------------------------------
+
+if [ "$ACTUAL" = "$EXPECTED" ]; then
+  exit 0
+fi
+
+# Mismatch. Print a remediation hint that names the expected identity
+# AND the path that exists for the calling write context (keyring switch
+# vs PAT swap).
+case "$MODE" in
+  author|reviewer|external)
+    echo "identity-check: BLOCKED active keyring identity is '$ACTUAL', expected '$EXPECTED'." >&2
+    echo "identity-check:   Signal: $SIGNAL" >&2
+    echo "identity-check:   Remediation: gh auth switch -u $EXPECTED" >&2
+    echo "identity-check:   See REVIEW_POLICY.md § Operation-to-Identity Matrix for the auth split." >&2
+    ;;
+  token)
+    echo "identity-check: BLOCKED GH_TOKEN resolves to identity '$ACTUAL', expected '$EXPECTED'." >&2
+    echo "identity-check:   Signal: $SIGNAL" >&2
+    echo "identity-check:   Remediation: export GH_TOKEN to the PAT for '$EXPECTED' (e.g. \$OP_PREFLIGHT_REVIEWER_PAT)." >&2
+    echo "identity-check:   See REVIEW_POLICY.md § Operation-to-Identity Matrix (graphql write — PAT-attributed)." >&2
+    ;;
+esac
+exit 2

@@ -68,6 +68,12 @@ case "$1 $2" in
   "auth switch")
     rc="${GH_SWITCH_RC:-0}"
     if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+    # #284 silent-no-op flavor: when GH_SWITCH_SILENT_NOOP=1, return 0
+    # without updating the ACTIVE_STATE_FILE. Simulates the observed
+    # adversarial failure mode the post-switch verification catches.
+    if [ "${GH_SWITCH_SILENT_NOOP:-0}" = "1" ]; then
+      exit 0
+    fi
     shift; shift
     while [ "$#" -gt 0 ]; do
       if [ "$1" = "-u" ]; then
@@ -201,6 +207,35 @@ elif ! grep -qE $'^gh\tauth\tswitch\t-u\tcustom-reviewer$' "$WORKDIR/calls.log";
   cat "$WORKDIR/calls.log" >&2
 else
   pass "custom identity: GH_AS_REVIEWER_IDENTITY override switched to custom-reviewer"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 5 (#284): post-switch verification failure. The stub returns 0
+# from `gh auth switch` WITHOUT updating the active-state file —
+# simulating a silent-no-op switch (corrupt hosts.yml / mocked gh /
+# concurrent-switch race). The wrapper must fail closed before
+# running the wrapped command. Exit code 2 with a clear diagnostic.
+# ---------------------------------------------------------------------------
+GH_INITIAL_ACTIVE="nathanjohnpayne" \
+reset_state
+
+set +e
+stderr_capture=$(
+  GH_INITIAL_ACTIVE="nathanjohnpayne" \
+  GH_SWITCH_SILENT_NOOP=1 \
+    run_wrapper -- gh pr review 1 --comment --body "x" 2>&1 1>/dev/null
+)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "post-switch verify (silent no-op): wrapper exited $rc, expected 2"
+elif ! echo "$stderr_capture" | grep -qi "POST-SWITCH VERIFICATION FAILED"; then
+  fail "post-switch verify (silent no-op): missing 'POST-SWITCH VERIFICATION FAILED' diagnostic; stderr: $stderr_capture"
+elif grep -qE $'^gh\tpr\treview\t' "$WORKDIR/calls.log"; then
+  fail "post-switch verify (silent no-op): wrapped gh pr review SHOULD NOT have run"
+  cat "$WORKDIR/calls.log" >&2
+else
+  pass "post-switch verify (silent no-op): exit 2 BEFORE wrapped command runs"
 fi
 
 # ---------------------------------------------------------------------------

@@ -45,6 +45,11 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 # --json labels,mergeStateStatus` in the merge branch; this stub
 # handles both. The merge-branch call emits the `MERGE_STATE|LABELS`
 # single-line format the unified hook parses.
+#
+# For the #284 self-approve sub-guard, the stub also handles `pr view
+# --json body,additions,deletions,files` — driven by STUB_PR_BODY,
+# STUB_PR_ADDITIONS, STUB_PR_DELETIONS env vars. The stub returns the
+# fields the hook's --jq filter expects.
 STUB_DIR="$WORKDIR/stub-bin"
 mkdir -p "$STUB_DIR"
 cat >"$STUB_DIR/gh" <<'STUB'
@@ -57,19 +62,43 @@ case "$1 $2" in
     exit 0
     ;;
   "pr view")
-    # The unified hook fetches labels + mergeStateStatus together with
-    # `--jq '.mergeStateStatus, .labels[].name'` — mergeStateStatus on
-    # line 1, then one label name per line. Default state to CLEAN so a
-    # test that only cares about labels doesn't have to set it.
-    # STUB_LABELS is SEMICOLON-separated here for test-authoring
-    # convenience (NOT comma — a single label name may legally contain
-    # a comma, and a test must be able to pass exactly that); emit one
-    # label per line to match real `gh` output.
-    echo "${STUB_MERGE_STATE:-CLEAN}"
-    if [ -n "${STUB_LABELS:-}" ]; then
-      echo "$STUB_LABELS" | tr ';' '\n'
-    fi
-    exit 0
+    # Dispatch based on the --json flag value so both the merge guard's
+    # labels+mergeStateStatus fetch AND the self-approve guard's
+    # body+additions+deletions fetch can coexist in one stub.
+    json_fields=""
+    for ((i=1; i<=$#; i++)); do
+      if [ "${!i}" = "--json" ]; then
+        next=$((i+1))
+        json_fields="${!next}"
+        break
+      fi
+    done
+    case "$json_fields" in
+      *body*)
+        # Self-approve sub-guard fetch: emits a single JSON-ish blob.
+        # The hook's --jq filter projects it into {body, additions,
+        # deletions, files} but our stub returns the same shape the
+        # hook then greps. Just emit raw fields the hook looks for.
+        body_safe="${STUB_PR_BODY:-}"
+        additions="${STUB_PR_ADDITIONS:-0}"
+        deletions="${STUB_PR_DELETIONS:-0}"
+        # The hook parses additions/deletions via regex on the
+        # "additions": NUM pattern, and reads PR_AUTHORING_AGENT from
+        # a body grep. Emit both in a single buffer.
+        printf '%s\n' "$body_safe"
+        printf '"additions": %s\n' "$additions"
+        printf '"deletions": %s\n' "$deletions"
+        exit 0
+        ;;
+      *)
+        # Default: merge-guard labels+mergeStateStatus fetch.
+        echo "${STUB_MERGE_STATE:-CLEAN}"
+        if [ -n "${STUB_LABELS:-}" ]; then
+          echo "$STUB_LABELS" | tr ';' '\n'
+        fi
+        exit 0
+        ;;
+    esac
     ;;
   *)
     exit 0
@@ -94,6 +123,28 @@ run_hook() {
   STUB_ACTIVE_USER="$stub_user" \
   STUB_MERGE_STATE="$merge_state" \
   STUB_LABELS="$labels" \
+  BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK="$skip_id" \
+    bash "$HOOK" <<<"$payload"
+}
+
+# Run the hook with explicit self-approve-guard fixtures. Used for the
+# #284 byline + self-approve tests on `gh pr review`. Passes extra env
+# vars the stub above reads when satisfying the body+additions+deletions
+# `gh pr view` call.
+run_hook_review() {
+  local cmd="$1"
+  local stub_user="${2:-nathanjohnpayne}"
+  local skip_id="${3:-0}"
+  local pr_body="${4:-}"
+  local additions="${5:-0}"
+  local deletions="${6:-0}"
+  local payload
+  payload=$(jq -n --arg c "$cmd" '{tool_input: {command: $c}}')
+  PATH="$STUB_DIR:$PATH" \
+  STUB_ACTIVE_USER="$stub_user" \
+  STUB_PR_BODY="$pr_body" \
+  STUB_PR_ADDITIONS="$additions" \
+  STUB_PR_DELETIONS="$deletions" \
   BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK="$skip_id" \
     bash "$HOOK" <<<"$payload"
 }
@@ -363,6 +414,212 @@ if [ "$rc" -eq 0 ]; then
   pass "label 'team,needs-external-review' does NOT false-match the needs-external-review gate"
 else
   fail "comma-in-label false-match: exit $rc, expected 0 (the label is not literally 'needs-external-review'); output: $out"
+fi
+
+# ===========================================================================
+# #284 — byline-sensitive command coverage (gh pr comment / gh pr review /
+# gh issue comment / self-approve sub-guard)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Test 17: gh pr comment with AUTHOR identity active → blocked (the
+# byline guard rejects nathanjohnpayne for reviewer-byline commands).
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh pr comment 123 --body "ping"' "nathanjohnpayne" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "pr comment + author identity: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "gh pr comment"; then
+  fail "pr comment + author identity: diagnostic missing 'gh pr comment'; output: $out"
+elif ! echo "$out" | grep -qi "REVIEWER identity"; then
+  fail "pr comment + author identity: missing reviewer hint; output: $out"
+else
+  pass "pr comment + author identity: blocked with reviewer-byline diagnostic"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 18: gh pr comment with REVIEWER identity active → allowed.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh pr comment 123 --body "ping"' "nathanpayne-claude" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "pr comment + reviewer identity: allowed"
+else
+  fail "pr comment + reviewer identity: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 19: gh pr review --comment with AUTHOR identity → blocked.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh pr review 123 --comment --body "review"' "nathanjohnpayne" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "pr review --comment + author identity: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "gh pr review"; then
+  fail "pr review + author identity: diagnostic missing 'gh pr review'; output: $out"
+else
+  pass "pr review --comment + author identity: blocked"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 20: gh pr review --comment with REVIEWER identity → allowed.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh pr review 123 --comment --body "review"' "nathanpayne-claude" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "pr review --comment + reviewer identity: allowed"
+else
+  fail "pr review --comment + reviewer identity: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 21: gh issue comment with AUTHOR identity → blocked.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh issue comment 7 --body "thanks"' "nathanjohnpayne" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "issue comment + author identity: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "gh issue comment"; then
+  fail "issue comment + author identity: diagnostic missing 'gh issue comment'; output: $out"
+else
+  pass "issue comment + author identity: blocked"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 22: gh issue comment with REVIEWER identity → allowed.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh issue comment 7 --body "thanks"' "nathanpayne-claude" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "issue comment + reviewer identity: allowed"
+else
+  fail "issue comment + reviewer identity: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 23: gh issue close (non-comment issue subcommand) → allowed.
+# Regression: the issue parent recognizer must NOT swallow `close`,
+# `view`, etc.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh issue close 7' "nathanjohnpayne" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "issue close: allowed (only 'issue comment' is guarded)"
+else
+  fail "issue close: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 24: gh pr review --approve self-approve on over-threshold PR
+# (Authoring-Agent: claude + active=nathanpayne-claude + size > threshold)
+# → blocked. Uses a synthetic body that names claude as the authoring
+# agent and 5000 additions to ensure over-threshold regardless of the
+# config-file lookup.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook_review 'gh pr review 123 --approve --body "lgtm"' "nathanpayne-claude" "0" \
+  "Authoring-Agent: claude" "5000" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "self-approve over-threshold: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "self-approve detected"; then
+  fail "self-approve over-threshold: missing 'self-approve detected' diagnostic; output: $out"
+elif ! echo "$out" | grep -qi "No-self-approve scoping"; then
+  fail "self-approve over-threshold: missing policy pointer; output: $out"
+else
+  pass "self-approve over-threshold: blocked"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 25: gh pr review --approve where active identity does NOT match
+# the PR's Authoring-Agent (cross-agent approve = the intended path
+# for above-threshold). Should be allowed.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook_review 'gh pr review 123 --approve --body "lgtm"' "nathanpayne-codex" "0" \
+  "Authoring-Agent: claude" "5000" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "cross-agent approve (codex approves claude's PR): allowed"
+else
+  fail "cross-agent approve: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 26: gh pr review --approve from author identity (nathanjohnpayne)
+# is blocked by the byline guard BEFORE the self-approve sub-guard
+# even runs. Sanity check that the layered guards stack correctly.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook_review 'gh pr review 123 --approve --body "lgtm"' "nathanjohnpayne" "0" \
+  "Authoring-Agent: claude" "5000" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "approve from author identity: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "REVIEWER identity"; then
+  fail "approve from author identity: byline guard should fire first; output: $out"
+else
+  pass "approve from author identity: byline guard fires before self-approve"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 27: gh pr review --approve, agent-author + agent-reviewer + same
+# agent, but PR is UNDER threshold (small change). Should be allowed:
+# under-threshold PRs are exactly the case where reviewer-identity
+# --approve is the intended path.
+# ---------------------------------------------------------------------------
+# Create a fake review-policy.yml so the threshold parse succeeds.
+# We want the heuristic to compute total < threshold.
+ORIG_DIR="$(pwd)"
+mkdir -p "$WORKDIR/repo-with-policy/.github"
+cat >"$WORKDIR/repo-with-policy/.github/review-policy.yml" <<'YML'
+external_review_threshold: 500
+YML
+cd "$WORKDIR/repo-with-policy"
+set +e
+out=$(run_hook_review 'gh pr review 123 --approve --body "small change"' "nathanpayne-claude" "0" \
+  "Authoring-Agent: claude" "10" "5" 2>&1)
+rc=$?
+set -e
+cd "$ORIG_DIR"
+if [ "$rc" -eq 0 ]; then
+  pass "self-approve UNDER-threshold (10+5 lines vs 500 threshold): allowed"
+else
+  fail "self-approve under-threshold: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 28: BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK=1 bypasses BOTH
+# the byline guard and the self-approve sub-guard. Verifies the escape
+# hatch still applies to the new checks (downstream test harnesses rely
+# on it for the existing create/merge guards; the new guards should
+# honor the same knob).
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh pr comment 123 --body "ping"' "nathanjohnpayne" "1" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "byline guard: BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK=1 bypasses pr comment block"
+else
+  fail "byline guard bypass: exit $rc, expected 0; output: $out"
 fi
 
 # ---------------------------------------------------------------------------

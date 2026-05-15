@@ -416,16 +416,27 @@ log_stale_adc_guidance() {
 # incomplete codex session file look valid and causing gh to run as
 # the wrong identity. See round-5 Codex finding on the propagation
 # PRs for the multi-agent repro.
-# Active-account check (warn-only). gh's write paths use the keyring's
-# active account regardless of GH_TOKEN. Each agent's machine should
-# have its agent identity (nathanpayne-<agent>) as the active gh
-# account so reviewer-identity writes (gh pr review --comment) attribute
-# correctly without a switch. Author-identity writes (gh pr create /
-# merge / edit) still need a temporary `gh auth switch -u nathanjohnpayne`
-# around them. See nathanjohnpayne/mergepath#164 for the empirical
-# diagnosis (matchline PRs #181, #182 — wrong-byline reviews when active
-# was nathanjohnpayne instead of the agent identity).
-warn_active_account_mismatch() {
+# Active-account drift auto-restore (#284, replaces the previous warn-
+# only behavior). gh's write paths use the keyring's active account
+# regardless of GH_TOKEN. Each agent's machine should have its agent
+# identity (nathanpayne-<agent>) as the active gh account so
+# reviewer-identity writes (gh pr review --comment) attribute correctly
+# without a switch. Author-identity writes (gh pr create / merge / edit)
+# still need a temporary `gh auth switch -u nathanjohnpayne` around them.
+# See nathanjohnpayne/mergepath#164 for the empirical diagnosis
+# (matchline PRs #181, #182 — wrong-byline reviews when active was
+# nathanjohnpayne instead of the agent identity).
+#
+# The prior behavior was a stderr warning: "your keyring drifted, here's
+# the fix command, you go run it." In practice agents kept missing the
+# warning and kept landing misattributed writes (#283 in-session
+# incidents documented this concretely). The new behavior is
+# auto-restore: if the keyring drifted, we run the switch ourselves
+# and log a clear stderr line so the operator can see what happened.
+# Idempotent — when the keyring is already correct, the function is a
+# no-op. Fail-soft — a switch failure logs and returns 0 (we don't
+# want preflight itself to abort because of an auth-switch race).
+restore_active_account_or_warn() {
   # Skip silently when no agent is selected (e.g. deploy-only runs that
   # don't need a reviewer identity). The check only makes sense when
   # we know which agent identity SHOULD be active. Codex P2 on PR #171.
@@ -452,12 +463,49 @@ warn_active_account_mismatch() {
   # Wrap in `|| true` so a `gh config` failure (corrupt hosts.yml,
   # no gh login) cannot abort the parent under `set -eo pipefail`.
   actual=$(gh config get -h github.com user 2>/dev/null || true)
-  if [[ -n "$actual" ]] && [[ "$actual" != "$expected" ]]; then
-    echo "# WARNING: gh active account is '$actual' (expected '$expected')." >&2
-    echo "#   Reviewer-identity writes (gh pr review) will mis-attribute." >&2
-    echo "#   Fix once: gh auth switch -u $expected" >&2
-    echo "#   See CLAUDE.md § Active-account convention for the full pattern." >&2
+  if [[ -z "$actual" ]] || [[ "$actual" == "$expected" ]]; then
+    return 0
   fi
+
+  echo "# ──────────────────────────────────────────────────────" >&2
+  echo "# Preflight: keyring drift detected — auto-restoring." >&2
+  echo "#   Was:      $actual" >&2
+  echo "#   Restoring: $expected" >&2
+  echo "#   Reason:   gh write paths (pr review/comment/etc.) attribute" >&2
+  echo "#             to the keyring's active account. Letting the drift" >&2
+  echo "#             persist would land the next reviewer write under the" >&2
+  echo "#             wrong byline. See REVIEW_POLICY.md § Operation-to-" >&2
+  echo "#             Identity Matrix and #284." >&2
+  if gh auth switch -u "$expected" >/dev/null 2>&1; then
+    local verify
+    verify=$(gh config get -h github.com user 2>/dev/null || true)
+    if [[ "$verify" == "$expected" ]]; then
+      echo "#   Result:   restored to $expected." >&2
+    else
+      echo "#   Result:   switch returned 0 but active is still '$verify'." >&2
+      echo "#             The switch silently no-op'd (corrupt hosts.yml," >&2
+      echo "#             mock gh, concurrent switch race). Run" >&2
+      echo "#             'gh auth switch -u $expected' manually to recover." >&2
+    fi
+  else
+    echo "#   Result:   gh auth switch -u $expected FAILED." >&2
+    echo "#             Is $expected in the keyring? Run 'gh auth login'" >&2
+    echo "#             once for that identity, then re-run preflight." >&2
+  fi
+  echo "# ──────────────────────────────────────────────────────" >&2
+  # Fail-soft: never abort preflight on a switch failure. The next
+  # write that lands under the wrong byline will fail its own
+  # identity-check at the write site (the helper scripts each gate
+  # on identity-check.sh before posting).
+  return 0
+}
+
+# Backwards-compat shim: the prior `warn_active_account_mismatch`
+# name is still referenced in some downstream consumers' wrappers.
+# Map it to the new auto-restore function so propagation lands
+# cleanly. Remove this alias once all consumers have re-propagated.
+warn_active_account_mismatch() {
+  restore_active_account_or_warn "$@"
 }
 
 emit_from_session_file() (
