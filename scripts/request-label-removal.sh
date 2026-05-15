@@ -44,6 +44,28 @@ set -eo pipefail
 
 ALLOWED_LABELS=(needs-external-review needs-human-review policy-violation)
 
+# Escape a string for embedding inside an AppleScript double-quoted
+# literal. See the inline call site below for the full rationale on
+# escape ordering; the function is hoisted up here so unit tests can
+# `source` this script (with MERGEPATH_REQUEST_LABEL_REMOVAL_LIB=1) and
+# call it directly without firing the main flow.
+applescript_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}        # \  -> \\          (must be FIRST)
+  s=${s//\"/\\\"}        # "  -> \"
+  s=${s//$'\n'/\\n}      # LF -> \n
+  s=${s//$'\r'/\\r}      # CR -> \r
+  s=${s//$'\t'/\\t}      # TAB -> \t
+  printf '%s' "$s"
+}
+
+# Library mode: when sourced by a test harness with this env var set,
+# expose helper functions only and skip the main flow (which would
+# error on the missing positional PR#).
+if [ "${MERGEPATH_REQUEST_LABEL_REMOVAL_LIB:-0}" = "1" ]; then
+  return 0 2>/dev/null || true
+fi
+
 usage() {
   cat <<'EOF' >&2
 Usage: scripts/request-label-removal.sh <PR#> <label> [--reason <text>] [--repo owner/name]
@@ -186,9 +208,12 @@ fi
 echo "Posted label-removal request on $PR_URL"
 
 if [ -n "${MERGEPATH_NOTIFY_IMESSAGE_TO:-}" ]; then
+  # `applescript_escape` is defined at the top of this file. The
+  # string transits both shell and AppleScript, so the escape order
+  # is load-bearing — see the helper definition for full rationale.
   IMSG_BODY="Mergepath: PR #$PR_NUM blocked on '$LABEL' label. Clear when ready: $PR_URL"
-  IMSG_BODY_ESC=${IMSG_BODY//\"/\\\"}
-  TARGET_ESC=${MERGEPATH_NOTIFY_IMESSAGE_TO//\"/\\\"}
+  IMSG_BODY_ESC=$(applescript_escape "$IMSG_BODY")
+  TARGET_ESC=$(applescript_escape "$MERGEPATH_NOTIFY_IMESSAGE_TO")
   if osascript -e "tell application \"Messages\" to send \"$IMSG_BODY_ESC\" to buddy \"$TARGET_ESC\" of (service 1 whose service type is iMessage)" >/dev/null 2>&1; then
     echo "Notified $MERGEPATH_NOTIFY_IMESSAGE_TO via iMessage"
   else

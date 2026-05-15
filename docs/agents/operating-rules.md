@@ -121,22 +121,34 @@ as a design risk and require either:
 
 Worktrees created for a task must be removed immediately after the corresponding
 branch is merged or deleted from the remote. Never leave a worktree checked out
-for a branch that is `[gone]` on the remote.
+for a branch that is `[gone]` on the remote. Stale worktrees confuse
+branch/HEAD reasoning, leave dead generated artifacts around, and increase
+the chance an agent validates or runs commands from a dead branch.
 
-**After merging a PR whose branch had a worktree:**
+**After a merge or branch delete**, run `scripts/worktree-cleanup.sh` (dry-run)
+to audit stale worktrees and `scripts/worktree-cleanup.sh --apply` to remove
+safe candidates. The helper identifies three classes of stale state:
+
+- worktrees whose branch upstream is `[gone]` (the branch was deleted upstream);
+- detached `mergepath-pr-*` worktrees whose corresponding PR is closed/merged
+  (cross-checked via `gh pr view`);
+- orphaned directories under `.claude/worktrees/` that have no matching
+  entry in `git worktree list --porcelain`.
 
 ```bash
-git worktree remove --force .claude/worktrees/<name>
-git worktree prune
+scripts/worktree-cleanup.sh                       # dry-run audit (default)
+scripts/worktree-cleanup.sh --apply               # remove safe candidates
+scripts/worktree-cleanup.sh --apply --force-locked
+                                                  # also remove LOCKED entries
+                                                  # (may belong to active sessions)
+scripts/worktree-cleanup.sh --apply --orphan-clean
+                                                  # also rm -rf orphan dirs
 ```
 
-**To find stale worktrees:**
+Locked worktrees and orphan dirs are listed in dry-run but require explicit
+`--force-locked` / `--orphan-clean` opt-in under `--apply`, because locked
+worktrees may correspond to in-progress agent sessions and orphan dirs may
+hold partial work the user wants to keep.
 
-```bash
-git worktree list   # all worktrees and their branches
-git branch -vv      # [gone] next to branches whose remote was deleted
-```
-
-If a worktree directory exists but `git worktree list` no longer shows it
-(orphaned after `--force` removal), run `git worktree prune` to clean up
-the git metadata, then `rm -rf` the leftover directory.
+This helper is intentionally local-only — worktree state is machine-local
+and should not gate repository CI (see #288).
