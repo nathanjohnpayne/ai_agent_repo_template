@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+# check_op_firebase_deploy_integration
+#
+# Shimmed integration smoke test for `scripts/firebase/op-firebase-deploy`'s
+# source-credential resolver. Implements mergepath#211 sub-D.
+#
+# OPT-IN / LOCAL ONLY. This check is NOT wired into
+# `.github/workflows/repo_lint.yml` and not part of the required-CI set.
+# It is opt-in because:
+#
+#   - The script under test (`op-firebase-deploy`) shells out to `op`,
+#     `firebase`, and (when no credentials chain matches) `gcloud`.
+#     The integration test PATH-shims all three to scratch stubs, but
+#     the wiring is brittle to environment leakage (TMPDIR, HOME, op
+#     session) and is easier to debug interactively than in CI.
+#   - The genuine end-to-end verification of #154 / #211 is a LIVE
+#     deploy on a real consumer repo (matchline) — that is human-only
+#     and out of scope for any automated check.
+#
+# To run locally:
+#
+#   MERGEPATH_RUN_INTEGRATION=1 bash scripts/ci/check_op_firebase_deploy_integration
+#
+# Without the env var, this script prints a SKIPPED line and exits 0,
+# so dropping it into a script-collection runner is safe.
+#
+# Cases covered (resolver precedence per the script source's comment
+# block at `resolve_source_cred_file`):
+#
+#   1. project SA key present → rank 2 wins
+#        log: "source credential: project Firebase-vault SA key ..."
+#   2. project SA absent + preflight ADC present → rank 3 wins
+#        log: "source credential: preflight-injected ADC ..."
+#   3. project SA absent + preflight absent + shared op ADC reachable
+#      → rank 4 wins
+#        log: "source credential: shared 1Password ADC ..."
+#   4. all op sources absent + local ADC file present → rank 5 wins
+#        log: "source credential: local ADC file ..."
+#
+# Each case asserts:
+#   (a) the source-credential log line on stderr matches the expected
+#       rank label
+#   (b) every tempfile the script wrote under our scratch TMPDIR is
+#       cleaned up after the process exits (no leaked SA key / ADC
+#       material on disk)
+#
+# NOTE on resolver coverage: The brief for #211 named a fourth case
+# "firebase-login-state" as the last-resort fallback. The script as
+# implemented does NOT have a firebase-login-state rank — its rank 4 is
+# the shared 1Password ADC (read directly via `op read`) and rank 5 is
+# the local ADC file. This check matches the resolver as implemented
+# (per the brief's "match what's actually implemented" instruction).
+# DEPLOYMENT.md § Deploy credential precedence (canonical) documents
+# the actual five ranks.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+if [ "${MERGEPATH_RUN_INTEGRATION:-0}" != "1" ]; then
+  echo "check_op_firebase_deploy_integration: SKIPPED — set MERGEPATH_RUN_INTEGRATION=1 to run"
+  exit 0
+fi
+
+DEPLOY_SCRIPT="$REPO_ROOT/scripts/firebase/op-firebase-deploy"
+if [ ! -x "$DEPLOY_SCRIPT" ]; then
+  echo "check_op_firebase_deploy_integration: FAIL — $DEPLOY_SCRIPT not found or not executable" >&2
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "check_op_firebase_deploy_integration: SKIP — python3 not on PATH" >&2
+  exit 0
+fi
+
+# ----------------------------------------------------------------------
+# Test harness
+# ----------------------------------------------------------------------
+SCRATCH_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/op-firebase-deploy-it-XXXXXX")"
+trap 'rm -rf "$SCRATCH_ROOT"' EXIT
+
+PASS=0
+FAIL=0
+
+# Builds a fake service_account JSON credential. `source_cred_is_usable`
+# short-circuits to "usable" for service_account-typed creds without any
+# HTTP call (see scripts/firebase/op-firebase-deploy line ~244), which
+# makes them safe to use as fixtures.
+write_fake_sa_key() {
+  local out_path="$1"
+  local sa_email="$2"
+  cat >"$out_path" <<JSON
+{
+  "type": "service_account",
+  "project_id": "fake-project",
+  "private_key_id": "fake-key-id",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n",
+  "client_email": "$sa_email",
+  "client_id": "0",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token"
+}
+JSON
+}
+
+run_case() {
+  local case_name="$1"
+  local expected_log_substring="$2"
+  local case_dir="$SCRATCH_ROOT/$case_name"
+  local bin_dir="$case_dir/bin"
+  local tmp_dir="$case_dir/tmp"
+  local home_dir="$case_dir/home"
+  local project="$3"
+  local provision="$4"  # provision callback name
+
+  mkdir -p "$bin_dir" "$tmp_dir" "$home_dir/.config/gcloud"
+
+  # Set up .firebaserc in the case dir so the script auto-detects PROJECT.
+  cat >"$case_dir/.firebaserc" <<JSON
+{ "projects": { "default": "$project" } }
+JSON
+
+  # Shim `firebase`: stop the deploy. Print the args so debugging is
+  # tractable but exit 0 so the overall script returns 0 on the happy
+  # path. (We assert the source-cred log was emitted BEFORE the
+  # firebase invocation, so this is just to let the script reach EXIT.)
+  cat >"$bin_dir/firebase" <<'STUB'
+#!/usr/bin/env bash
+echo "[stub-firebase] called with: $*" >&2
+exit 0
+STUB
+  chmod +x "$bin_dir/firebase"
+
+  # Shim `gcloud`: never actually called by op-firebase-deploy itself,
+  # but keep a stub on PATH in case future versions of the script add a
+  # gcloud call ahead of the deploy.
+  cat >"$bin_dir/gcloud" <<'STUB'
+#!/usr/bin/env bash
+echo "[stub-gcloud] called with: $*" >&2
+exit 0
+STUB
+  chmod +x "$bin_dir/gcloud"
+
+  # Provision-callback writes a case-specific `op` shim + any required
+  # on-disk credentials (preflight tempfile, local ADC, etc.) into the
+  # case dir before we invoke the script.
+  "$provision" "$case_dir" "$bin_dir" "$tmp_dir" "$home_dir" "$project"
+
+  local stderr_log="$case_dir/stderr.log"
+  local stdout_log="$case_dir/stdout.log"
+  local rc=0
+
+  # Snapshot tempdir before the run so we can diff after.
+  local pre_files
+  pre_files="$(find "$tmp_dir" -type f 2>/dev/null | sort)"
+
+  # Invoke the script. PATH is locked to the shim dir plus a minimal
+  # set of system paths so python3, mktemp, find etc. resolve. Cases
+  # that need to pass GOOGLE_APPLICATION_CREDENTIALS etc. through env -i
+  # use run_case_with_env instead.
+  (
+    cd "$case_dir"
+    env -i \
+      PATH="$bin_dir:/usr/bin:/bin:/usr/sbin:/sbin" \
+      HOME="$home_dir" \
+      TMPDIR="$tmp_dir" \
+      "$DEPLOY_SCRIPT" \
+      >"$stdout_log" 2>"$stderr_log"
+  ) || rc=$?
+
+  local check_passed=true
+
+  if [ "$rc" -ne 0 ]; then
+    echo "  FAIL: $case_name — script exited rc=$rc (expected 0)"
+    echo "    stderr:"
+    sed 's/^/      /' "$stderr_log" >&2 || true
+    check_passed=false
+  fi
+
+  if ! grep -qF "$expected_log_substring" "$stderr_log"; then
+    echo "  FAIL: $case_name — stderr missing expected source-cred log"
+    echo "    expected substring: $expected_log_substring"
+    echo "    actual stderr:"
+    sed 's/^/      /' "$stderr_log" >&2 || true
+    check_passed=false
+  fi
+
+  # Tempfile cleanup verification: every file we expected the script
+  # to create under $tmp_dir must be gone after exit.
+  local lingering
+  lingering="$(find "$tmp_dir" -type f 2>/dev/null | grep -E 'gcp-(adc|impersonated)-|firebase-sa-' || true)"
+  if [ -n "$lingering" ]; then
+    echo "  FAIL: $case_name — tempfiles leaked under $tmp_dir:"
+    echo "$lingering" | sed 's/^/      /' >&2
+    check_passed=false
+  fi
+
+  if $check_passed; then
+    echo "  PASS: $case_name — log='$expected_log_substring', tempfiles cleaned"
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# ----------------------------------------------------------------------
+# Case 1 — project SA key present (rank 2 wins)
+# ----------------------------------------------------------------------
+provision_project_sa() {
+  local case_dir="$1" bin_dir="$2" tmp_dir="$3" home_dir="$4" project="$5"
+
+  # The shim `op` responds to `op document get` with a fake SA key and
+  # ignores `op read`.
+  local sa_payload_dir="$case_dir/op-payloads"
+  mkdir -p "$sa_payload_dir"
+  write_fake_sa_key "$sa_payload_dir/project-sa.json" \
+    "firebase-deployer@${project}.iam.gserviceaccount.com"
+
+  cat >"$bin_dir/op" <<STUB
+#!/usr/bin/env bash
+# op shim for case 1: respond to 'op document get … --out-file PATH'
+case "\$1" in
+  document)
+    shift
+    if [ "\$1" = "get" ]; then
+      shift
+      out_path=""
+      while [ \$# -gt 0 ]; do
+        if [ "\$1" = "--out-file" ]; then
+          shift; out_path="\$1"
+        fi
+        shift || true
+      done
+      if [ -n "\$out_path" ]; then
+        cp "$sa_payload_dir/project-sa.json" "\$out_path"
+        exit 0
+      fi
+      exit 1
+    fi
+    exit 1
+    ;;
+  read)
+    # No shared ADC source for this case.
+    exit 1
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+STUB
+  chmod +x "$bin_dir/op"
+}
+
+run_case \
+  "case1_project_sa_key_present" \
+  "source credential: project Firebase-vault SA key" \
+  "merge-path-test" \
+  provision_project_sa
+
+# ----------------------------------------------------------------------
+# Case 2 — project SA absent, preflight ADC present (rank 3 wins)
+# ----------------------------------------------------------------------
+provision_preflight_adc() {
+  local case_dir="$1" bin_dir="$2" tmp_dir="$3" home_dir="$4" project="$5"
+
+  # No project SA: op document get fails.
+  cat >"$bin_dir/op" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  document)  exit 1 ;;  # no project SA key available
+  read)      exit 1 ;;  # no shared ADC available either
+  *)         exit 1 ;;
+esac
+STUB
+  chmod +x "$bin_dir/op"
+
+  # Preflight ADC: pre-write a service_account JSON to a tempfile and
+  # export GOOGLE_APPLICATION_CREDENTIALS + OP_PREFLIGHT_ADC_TMPFILE
+  # pointing at it. The script's `is_preflight_injected` check requires
+  # both to be set to the SAME path.
+  local preflight_path="$tmp_dir/preflight-adc.json"
+  write_fake_sa_key "$preflight_path" \
+    "preflight-shared@${project}.iam.gserviceaccount.com"
+
+  # Pass env via a side-channel: env -i in run_case_with_env strips our
+  # env, so we bake GOOGLE_APPLICATION_CREDENTIALS / OP_PREFLIGHT_ADC_TMPFILE
+  # into a per-case env file that runner.sh sources right before exec'ing
+  # the deploy script.
+  cat >"$case_dir/case-env.sh" <<ENV
+export GOOGLE_APPLICATION_CREDENTIALS="$preflight_path"
+export OP_PREFLIGHT_ADC_TMPFILE="$preflight_path"
+ENV
+}
+
+# Variant of run_case that sources case-env.sh before invoking the script.
+# Lets us pass GOOGLE_APPLICATION_CREDENTIALS / OP_PREFLIGHT_ADC_TMPFILE
+# through env -i without clobbering them.
+run_case_with_env() {
+  local case_name="$1"
+  local expected_log_substring="$2"
+  local project="$3"
+  local provision="$4"
+  local case_dir="$SCRATCH_ROOT/$case_name"
+  local bin_dir="$case_dir/bin"
+  local tmp_dir="$case_dir/tmp"
+  local home_dir="$case_dir/home"
+
+  mkdir -p "$bin_dir" "$tmp_dir" "$home_dir/.config/gcloud"
+
+  cat >"$case_dir/.firebaserc" <<JSON
+{ "projects": { "default": "$project" } }
+JSON
+
+  cat >"$bin_dir/firebase" <<'STUB'
+#!/usr/bin/env bash
+echo "[stub-firebase] called with: $*" >&2
+exit 0
+STUB
+  chmod +x "$bin_dir/firebase"
+
+  cat >"$bin_dir/gcloud" <<'STUB'
+#!/usr/bin/env bash
+echo "[stub-gcloud] called with: $*" >&2
+exit 0
+STUB
+  chmod +x "$bin_dir/gcloud"
+
+  "$provision" "$case_dir" "$bin_dir" "$tmp_dir" "$home_dir" "$project"
+
+  local stderr_log="$case_dir/stderr.log"
+  local stdout_log="$case_dir/stdout.log"
+  local rc=0
+
+  # Wrap the invocation: source case-env.sh (if it exists), then exec
+  # the script. We still use env -i to enforce a hermetic baseline.
+  cat >"$case_dir/runner.sh" <<RUNNER
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$case_dir"
+if [ -f "$case_dir/case-env.sh" ]; then
+  # shellcheck disable=SC1090
+  source "$case_dir/case-env.sh"
+fi
+exec "$DEPLOY_SCRIPT"
+RUNNER
+  chmod +x "$case_dir/runner.sh"
+
+  (
+    env -i \
+      PATH="$bin_dir:/usr/bin:/bin:/usr/sbin:/sbin" \
+      HOME="$home_dir" \
+      TMPDIR="$tmp_dir" \
+      "$case_dir/runner.sh" \
+      >"$stdout_log" 2>"$stderr_log"
+  ) || rc=$?
+
+  local check_passed=true
+
+  if [ "$rc" -ne 0 ]; then
+    echo "  FAIL: $case_name — script exited rc=$rc (expected 0)"
+    echo "    stderr:"
+    sed 's/^/      /' "$stderr_log" >&2 || true
+    check_passed=false
+  fi
+
+  if ! grep -qF "$expected_log_substring" "$stderr_log"; then
+    echo "  FAIL: $case_name — stderr missing expected source-cred log"
+    echo "    expected substring: $expected_log_substring"
+    echo "    actual stderr:"
+    sed 's/^/      /' "$stderr_log" >&2 || true
+    check_passed=false
+  fi
+
+  # Tempfile cleanup: the script-written tempfiles (gcp-impersonated-*,
+  # firebase-sa-*, gcp-adc-*) must be gone. Note that for the preflight
+  # case, the preflight-adc.json file is provisioned BY THE TEST (not
+  # the script) and is allowed to survive — only files matching the
+  # script's mktemp patterns are checked.
+  local lingering
+  lingering="$(find "$tmp_dir" -type f 2>/dev/null | grep -E 'gcp-(adc|impersonated)-|firebase-sa-' || true)"
+  if [ -n "$lingering" ]; then
+    echo "  FAIL: $case_name — tempfiles leaked under $tmp_dir:"
+    echo "$lingering" | sed 's/^/      /' >&2
+    check_passed=false
+  fi
+
+  if $check_passed; then
+    echo "  PASS: $case_name — log='$expected_log_substring', tempfiles cleaned"
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+run_case_with_env \
+  "case2_preflight_adc_present" \
+  "source credential: preflight-injected ADC" \
+  "merge-path-test" \
+  provision_preflight_adc
+
+# ----------------------------------------------------------------------
+# Case 3 — project SA absent, preflight absent, shared 1Password ADC
+# reachable (rank 4 wins)
+# ----------------------------------------------------------------------
+provision_shared_op_adc() {
+  local case_dir="$1" bin_dir="$2" tmp_dir="$3" home_dir="$4" project="$5"
+
+  local sa_payload_dir="$case_dir/op-payloads"
+  mkdir -p "$sa_payload_dir"
+  write_fake_sa_key "$sa_payload_dir/shared-adc.json" \
+    "shared-adc@${project}.iam.gserviceaccount.com"
+
+  # `op document get` fails (no project SA); `op read` succeeds and
+  # prints the shared ADC JSON on stdout.
+  cat >"$bin_dir/op" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+  document)
+    exit 1
+    ;;
+  read)
+    shift
+    # Caller is materialize_op_source_cred, which redirects stdout to
+    # its mktemp tempfile. Just emit the JSON.
+    cat "$sa_payload_dir/shared-adc.json"
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+STUB
+  chmod +x "$bin_dir/op"
+}
+
+run_case \
+  "case3_shared_op_adc_present" \
+  "source credential: shared 1Password ADC" \
+  "merge-path-test" \
+  provision_shared_op_adc
+
+# ----------------------------------------------------------------------
+# Case 4 — all op sources absent, local ADC file present (rank 5 wins)
+# ----------------------------------------------------------------------
+provision_local_adc() {
+  local case_dir="$1" bin_dir="$2" tmp_dir="$3" home_dir="$4" project="$5"
+
+  # `op` always fails — no project SA, no shared ADC.
+  cat >"$bin_dir/op" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+  chmod +x "$bin_dir/op"
+
+  # Local ADC file at $HOME/.config/gcloud/application_default_credentials.json
+  local adc_path="$home_dir/.config/gcloud/application_default_credentials.json"
+  write_fake_sa_key "$adc_path" \
+    "local-adc@${project}.iam.gserviceaccount.com"
+}
+
+run_case \
+  "case4_local_adc_present" \
+  "source credential: local ADC file" \
+  "merge-path-test" \
+  provision_local_adc
+
+# ----------------------------------------------------------------------
+echo
+if [ "$FAIL" -gt 0 ]; then
+  echo "check_op_firebase_deploy_integration: $FAIL FAIL / $PASS PASS" >&2
+  exit 1
+fi
+echo "check_op_firebase_deploy_integration: PASS ($PASS cases)"
+exit 0
