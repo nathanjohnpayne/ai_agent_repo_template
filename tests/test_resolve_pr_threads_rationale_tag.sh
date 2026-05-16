@@ -24,6 +24,8 @@
 #   3. nitpick-noted        Nitpick severity, no stronger signal
 #   4. deferred-to-followup default fallback
 #   5. --rationale override emits deferred-to-followup with custom text
+#   6. --no-tag-reply suppresses tag emission while still resolving
+#   7. rebuttal-recorded    ≥30-char agent-authored reply on thread
 
 set -euo pipefail
 
@@ -433,12 +435,70 @@ rc=$?
 set -e
 
 # Negative assertion: no tag-reply field anywhere.
-if ! grep -q 'FIELD: body=\[mergepath-resolve:' "$GH_ARGV_LOG"; then
+# Positive assertion: rc == 0 AND the resolveReviewThread mutation
+# DID run — confirming "--no-tag-reply" suppresses tag emission
+# while leaving the resolve path intact (CodeRabbit Major on #308).
+if [ "$rc" -eq 0 ] \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve:' "$GH_ARGV_LOG" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
-  echo "  PASS: --no-tag-reply suppressed tag emission (no [mergepath-resolve:] body in argv)"
+  echo "  PASS: --no-tag-reply suppressed tag emission and still resolved thread"
 else
   fail=$((fail + 1))
-  echo "  FAIL: --no-tag-reply did NOT suppress tag emission (rc=$rc)" >&2
+  echo "  FAIL: --no-tag-reply behavior incorrect (rc=$rc, missing suppression or resolve)" >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 7: rebuttal-recorded — ≥30-char agent-authored reply on the
+#         thread bumps the class above nitpick / deferred-to-followup
+#         when no addressed-elsewhere/canonical signal applies.
+#         (CodeRabbit Major on #308 — the ladder's rebuttal step had
+#         no fixture coverage before.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 7: rebuttal-recorded class (≥30-char agent reply on thread)"
+
+# Path NOT in manifest, no commits, but allComments has an
+# agent-authored reply ≥30 chars. The reply MUST be authored by an
+# agent identity (nathanpayne-claude / -codex / -cursor) — the
+# bot-author of the original comment is skipped (index 0).
+THREADS_T7='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_7","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/notes.md","body":"Some non-canonical finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Some non-canonical finding","databaseId":7001},
+     {"author":{"login":"nathanpayne-claude"},"body":"Disagree — this is intentional for the propagation path; see #200 for context.","databaseId":7002}
+   ]}
+  }
+]}}}}}'
+FILES_T7='[]'
+COMMITS_T7='[]'
+
+GH_ARGV_LOG="$SCRATCH/t7.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T7" "$FILES_T7" "$COMMITS_T7"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: tag body contains [mergepath-resolve: rebuttal-recorded]"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: rebuttal-recorded tag not emitted (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
 
