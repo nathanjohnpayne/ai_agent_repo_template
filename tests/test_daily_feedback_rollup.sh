@@ -236,6 +236,121 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# parse_triaged_ids_from_body — mergepath#304 dedupe signal matrix
+# ---------------------------------------------------------------------
+#
+# Each test asserts the helper extracts exactly the expected set of
+# triaged mp-ids from a sample rollup body. Order doesn't matter
+# (helper de-dupes via awk), so we sort-compare.
+
+assert_triaged_ids() {
+  local body="$1" expected_sorted="$2" label="$3"
+  local got
+  got=$(parse_triaged_ids_from_body "$body" | sort | tr '\n' ' ' | sed 's/ $//')
+  local expected
+  expected=$(printf '%s' "$expected_sorted" | tr '\n' ' ' | sed 's/ $//')
+  if [ "$got" = "$expected" ]; then
+    pass "parse_triaged_ids_from_body: $label"
+  else
+    fail "parse_triaged_ids_from_body: $label → expected=[$expected] got=[$got]"
+  fi
+}
+
+# 1) Plain `[x]` checkbox triages
+body1='- [x] fix landed for this item <!-- mp-id:aaaa11112222 -->
+- [ ] still open <!-- mp-id:bbbb11112222 -->'
+assert_triaged_ids "$body1" "aaaa11112222" "[x] checkbox marks triaged; [ ] does not"
+
+# 2) Capital `[X]` also counts
+body2='- [X] handled by upstream <!-- mp-id:cccc11112222 -->'
+assert_triaged_ids "$body2" "cccc11112222" "[X] uppercase checkbox marks triaged"
+
+# 3) `[~]` marks N/A
+body3='- [~] not relevant to this codepath <!-- mp-id:dddd11112222 -->
+- [ ] still open <!-- mp-id:eeee11112222 -->'
+assert_triaged_ids "$body3" "dddd11112222" "[~] checkbox marks triaged"
+
+# 4) `[-]` also marks N/A (alias)
+body4='- [-] obsolete <!-- mp-id:ffff11112222 -->'
+assert_triaged_ids "$body4" "ffff11112222" "[-] checkbox marks triaged"
+
+# 5) Strikethrough wraps a `[ ]` bullet
+body5='~~- [ ] superseded item ~~ <!-- mp-id:1111aaaabbbb -->
+- [ ] not striked <!-- mp-id:2222aaaabbbb -->'
+assert_triaged_ids "$body5" "1111aaaabbbb" "~~strikethrough~~ marks triaged even with empty [ ]"
+
+# 6) `#N` follow-up reference on same line as the item
+body6='- [ ] punted to #456 for later <!-- mp-id:3333aaaabbbb -->
+- [ ] no link here <!-- mp-id:4444aaaabbbb -->'
+assert_triaged_ids "$body6" "3333aaaabbbb" "follow-up #N reference marks triaged"
+
+# 7) `#N` follow-up at end of line (different spacing/punctuation)
+body7='- [ ] addressed in (#789) <!-- mp-id:5555aaaabbbb -->'
+assert_triaged_ids "$body7" "5555aaaabbbb" "follow-up #N inside parens marks triaged"
+
+# 8) URL anchor like `pull/999#discussion_r1` must NOT count as `#N`
+body8='- [ ] [scripts/x.sh:10](https://github.com/owner/repo/pull/999#discussion_r1) — `coderabbitai[bot]` Nitpick: "polish" <!-- mp-id:6666aaaabbbb -->'
+assert_triaged_ids "$body8" "" "URL anchor #discussion_rN does NOT mark triaged"
+
+# 9) Empty + lines-without-marker emit nothing
+body9='Just some intro text.
+- [x] no mp-id marker on this line
+- [ ] open item, no marker either
+## ## ## heading'
+assert_triaged_ids "$body9" "" "lines without mp-id marker produce nothing"
+
+# 10) Multiple triaged signals on one line — single ID emitted (dedupe)
+body10='- [x] also has #123 <!-- mp-id:7777aaaabbbb -->'
+assert_triaged_ids "$body10" "7777aaaabbbb" "multiple signals on one line → single mp-id"
+
+# 11) Same mp-id appearing on two lines (both triaged) → de-duped output
+body11='- [x] first <!-- mp-id:8888aaaabbbb -->
+- [x] dup <!-- mp-id:8888aaaabbbb -->'
+assert_triaged_ids "$body11" "8888aaaabbbb" "duplicate mp-ids → de-duped output"
+
+# 12) Realistic rollup-body fragment with mixed states
+body12='## owner/repo#42 (merged 2026-05-14T12:00Z, fix: foo)
+- [x] [scripts/a.sh:10](https://github.com/owner/repo/pull/42#discussion_r1) — `coderabbitai[bot]` Major: "issue A" <!-- mp-id:aaaa00000001 -->
+- [ ] [scripts/b.sh:20](https://github.com/owner/repo/pull/42#discussion_r2) — `coderabbitai[bot]` Nitpick: "issue B" <!-- mp-id:aaaa00000002 -->
+- [~] [scripts/c.sh:30](https://github.com/owner/repo/pull/42#discussion_r3) — `chatgpt-codex-connector[bot]` P2: "issue C" <!-- mp-id:aaaa00000003 -->
+~~- [ ] [scripts/d.sh:40](https://github.com/owner/repo/pull/42#discussion_r4) — `coderabbitai[bot]` Minor: "issue D" ~~ <!-- mp-id:aaaa00000004 -->
+- [ ] [scripts/e.sh:50](https://github.com/owner/repo/pull/42#discussion_r5) — `coderabbitai[bot]` Major: "issue E, filed #999" <!-- mp-id:aaaa00000005 -->'
+# Expected triaged: 1 ([x]), 3 ([~]), 4 (~~~), 5 (#999) — NOT 2 (open, no signal)
+assert_triaged_ids "$body12" "aaaa00000001 aaaa00000003 aaaa00000004 aaaa00000005" "realistic mixed-state rollup fragment"
+
+# ---------------------------------------------------------------------
+# parse_all_ids_from_body — closed-host fallback
+# ---------------------------------------------------------------------
+
+assert_all_ids() {
+  local body="$1" expected_sorted="$2" label="$3"
+  local got
+  got=$(parse_all_ids_from_body "$body" | sort | tr '\n' ' ' | sed 's/ $//')
+  local expected
+  expected=$(printf '%s' "$expected_sorted" | tr '\n' ' ' | sed 's/ $//')
+  if [ "$got" = "$expected" ]; then
+    pass "parse_all_ids_from_body: $label"
+  else
+    fail "parse_all_ids_from_body: $label → expected=[$expected] got=[$got]"
+  fi
+}
+
+# 13) parse_all_ids ignores triage state — emits every mp-id
+body_all1='- [ ] open <!-- mp-id:cccccc111111 -->
+- [x] done <!-- mp-id:cccccc222222 -->
+- [~] na  <!-- mp-id:cccccc333333 -->'
+assert_all_ids "$body_all1" "cccccc111111 cccccc222222 cccccc333333" \
+  "closed-host: every mp-id surfaces regardless of state"
+
+# 14) parse_all_ids dedupes
+body_all2='- [ ] one <!-- mp-id:ddd444aaaaaa -->
+- [x] same id <!-- mp-id:ddd444aaaaaa -->'
+assert_all_ids "$body_all2" "ddd444aaaaaa" "closed-host: duplicate mp-ids de-duped"
+
+# 15) parse_all_ids on a body with no markers → empty
+assert_all_ids "no markers here at all" "" "closed-host: no markers → empty"
+
+# ---------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------
 
