@@ -500,7 +500,36 @@ if $DRY_RUN; then
   if [ -s "$POLISH_NDJSON" ]; then
     cat "$POLISH_NDJSON"
   fi
+  # Dry-run still surfaces per-PR failures via exit code so the
+  # operator inspecting `--dry-run` output sees the same "this run
+  # is incomplete" signal a non-dry run would emit.
+  if [ "$FAILED_PR_COUNT" -gt 0 ]; then
+    echo "daily-feedback-rollup: WARN — $FAILED_PR_COUNT PR(s) failed to fetch threads in this dry run (PRs: $FAILED_PR_LIST)." >&2
+    exit 2
+  fi
   exit 0
+fi
+
+# ---------------------------------------------------------------------
+# Atomicity gate — abort BEFORE posting if any per-PR fetch failed.
+# ---------------------------------------------------------------------
+#
+# Posting partial rollups and then exiting 2 is worse than not posting
+# at all: with v1 dedupe-against-prior-rollups deferred, the operator's
+# retry on the same --since/--until window would create a duplicate
+# (or overlapping) rollup issue, doubling triage cost. Total atomicity
+# — either all-or-nothing — keeps the rollup-output contract intact.
+#
+# The operator's recovery path: retry the same `workflow_dispatch
+# --since X --until X` invocation once the API recovers. The classifier
+# is stateless and idempotent w.r.t. inputs, so the retry produces
+# the complete window's data exactly once.
+#
+# (codex Phase 4b r2 on PR #303.)
+if [ "$FAILED_PR_COUNT" -gt 0 ]; then
+  echo "daily-feedback-rollup: ERROR — $FAILED_PR_COUNT PR(s) failed to fetch threads (PRs: $FAILED_PR_LIST)." >&2
+  echo "daily-feedback-rollup: Aborting WITHOUT posting any rollup issues. Re-run with the same --since/--until once the API recovers to produce a complete rollup." >&2
+  exit 2
 fi
 
 # ---------------------------------------------------------------------
@@ -687,14 +716,8 @@ post_or_append "$SUBSTANTIVE_NDJSON" "substantive" "$SUBSTANTIVE_LABEL" \
 post_or_append "$POLISH_NDJSON" "polish" "$POLISH_LABEL" \
   "$POLISH_THROTTLE" "${POLISH_LABEL} ${DATE_STAMP}"
 
-# Exit non-zero if any per-PR GraphQL fetch failed (CodeRabbit Major
-# r4 on PR #303). The rollup may still have posted SOME data — the
-# log line above tells the operator which PRs are missing so they
-# can re-run via `workflow_dispatch --since X --until X` to pick up
-# the missed threads.
-if [ "$FAILED_PR_COUNT" -gt 0 ]; then
-  echo "daily-feedback-rollup: ERROR — $FAILED_PR_COUNT PR(s) failed to fetch threads (PRs: $FAILED_PR_LIST). The rollup published includes what we did fetch; re-run with the same --since/--until once the API recovers to backfill the missing data." >&2
-  exit 2
-fi
-
+# Note: the FAILED_PR_COUNT check happens BEFORE post_or_append in
+# the atomicity gate above (codex Phase 4b r2 on PR #303). By the
+# time we reach this point, the run has either successfully posted
+# both tracks' rollups or short-circuited via dry-run.
 echo "daily-feedback-rollup: done" >&2
