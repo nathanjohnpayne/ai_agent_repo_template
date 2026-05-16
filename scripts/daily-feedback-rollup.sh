@@ -152,15 +152,11 @@ fi
 pr_count=$(printf '%s' "$prs_json" | jq 'length')
 echo "daily-feedback-rollup: $pr_count PRs in window" >&2
 
-# Counters for the methodology footer. Deliberately no COUNT_FIX in
-# v1 — the per-file fix-commit heuristic from the spec
-# (commit-by-an-agent-author touching the same file between
-# comment.createdAt and thread.resolvedAt) requires another GraphQL
-# round-trip per commit to get the file list. v2 adds it. Until
-# then, threads addressed by commit only (no reply) classify as
-# deferred-untagged — a known false-positive class that the v2
-# agent-side `[mergepath-resolve: addressed-elsewhere]` tagging
-# closes more directly than commit-introspection ever would.
+# Counters for the methodology footer. COUNT_FIX uses the weaker
+# per-PR heuristic (any agent-author commit on the PR after the
+# comment's createdAt) rather than the spec's per-file variant —
+# see the Heuristic 2 block below for the trade-off rationale.
+COUNT_FIX=0
 COUNT_REPLY=0
 COUNT_STALE=0
 COUNT_TAGGED_SKIP=0
@@ -313,7 +309,39 @@ while [ "$i" -lt "$pr_count" ]; do
           ;;
       esac
     else
-      # Heuristic 2: substantive reply from an agent author (≥30 chars,
+      # Heuristic 2: addressed-via-fix — any agent-author commit on
+      # the PR with authoredDate > comment.createdAt. The spec's
+      # per-file variant (commit must touch the comment's anchored
+      # file) is more precise but requires a REST round-trip per
+      # commit to fetch file lists; the GitHub GraphQL `Commit` type
+      # doesn't expose changed files. The weaker per-PR heuristic
+      # catches the codex P1 case ("resolved by follow-up commit, no
+      # reply") but is conservative-toward-skip: an agent commit on
+      # a DIFFERENT file in the same PR still marks this thread as
+      # fix-addressed. The v2 agent-side
+      # `[mergepath-resolve: addressed-elsewhere]` tagging closes
+      # the gap more precisely than commit-introspection ever would.
+      # (codex P1 r1 on PR #303.)
+      addressed_via_fix=false
+      commit_count=$(printf '%s' "$threads_json" | jq '.data.repository.pullRequest.commits.nodes | length')
+      m=0
+      while [ "$m" -lt "$commit_count" ]; do
+        c_date=$(printf '%s' "$threads_json" | jq -r ".data.repository.pullRequest.commits.nodes[$m].commit.authoredDate // \"\"")
+        c_login=$(printf '%s' "$threads_json" | jq -r ".data.repository.pullRequest.commits.nodes[$m].commit.author.user.login // \"\"")
+        # String comparison works for ISO 8601 timestamps.
+        if [ -n "$c_login" ] && [ -n "$c_date" ] && [ -n "$original_created" ] \
+           && [ "$c_date" \> "$original_created" ] && is_agent_author "$c_login"; then
+          addressed_via_fix=true
+          break
+        fi
+        m=$((m + 1))
+      done
+      if $addressed_via_fix; then
+        COUNT_FIX=$((COUNT_FIX + 1))
+        continue
+      fi
+
+      # Heuristic 3: substantive reply from an agent author (≥30 chars,
       # NOT just the tag marker). If present, treat as addressed-via-
       # reply and skip.
       addressed_via_reply=false
@@ -336,7 +364,7 @@ while [ "$i" -lt "$pr_count" ]; do
         continue
       fi
 
-      # Heuristic 3: thread is stale-head — its originalCommit isn't
+      # Heuristic 4: thread is stale-head — its originalCommit isn't
       # in the PR's current commit history (got rebased away or force-
       # pushed off). The naive `orig_commit != head_oid` check was
       # over-broad: many bot comments anchor to intermediate commits
@@ -422,7 +450,7 @@ SUBSTANTIVE_COUNT=$(wc -l < "$SUBSTANTIVE_NDJSON" | tr -d ' ')
 POLISH_COUNT=$(wc -l < "$POLISH_NDJSON" | tr -d ' ')
 
 echo "daily-feedback-rollup: classified substantive=$SUBSTANTIVE_COUNT polish=$POLISH_COUNT" \
-     "(skipped reply=$COUNT_REPLY stale=$COUNT_STALE tagged-skip=$COUNT_TAGGED_SKIP)" >&2
+     "(skipped fix=$COUNT_FIX reply=$COUNT_REPLY stale=$COUNT_STALE tagged-skip=$COUNT_TAGGED_SKIP)" >&2
 
 # ---------------------------------------------------------------------
 # Dry-run short-circuit
@@ -484,6 +512,7 @@ INTRO
 - Window: ${SINCE} — ${UNTIL}
 - PRs scanned: ${pr_count}
 - Threads classified:
+  - addressed-via-fix (heuristic, per-PR): ${COUNT_FIX}
   - addressed-via-reply (heuristic): ${COUNT_REPLY}
   - stale-head (heuristic): ${COUNT_STALE}
   - tagged-skip: ${COUNT_TAGGED_SKIP}

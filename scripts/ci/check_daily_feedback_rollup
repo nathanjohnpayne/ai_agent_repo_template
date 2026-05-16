@@ -80,7 +80,8 @@ cat >"$FIXTURES/threads.json" <<'JSON'
         "headRefOid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx",
         "commits": {
           "nodes": [
-            { "commit": { "oid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx", "authoredDate": "2026-05-15T10:00:00Z", "author": { "user": { "login": "nathanjohnpayne" } } } }
+            { "commit": { "oid": "commit_early_xxxxxxxxxxxxxxxxxxx", "authoredDate": "2026-05-15T07:00:00Z", "author": { "user": { "login": "nathanjohnpayne" } } } },
+            { "commit": { "oid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx", "authoredDate": "2026-05-15T07:30:00Z", "author": { "user": { "login": "nathanjohnpayne" } } } }
           ]
         },
         "reviewThreads": {
@@ -176,9 +177,29 @@ cat >"$FIXTURES/threads.json" <<'JSON'
                     "databaseId": 6,
                     "author": { "login": "chatgpt-codex-connector[bot]" },
                     "body": "**![P1 Badge]** Stale finding — original commit was force-pushed away.",
-                    "createdAt": "2026-05-15T07:00:00Z",
+                    "createdAt": "2026-05-15T08:30:00Z",
                     "originalCommit": { "oid": "DEADBEEF_not_in_commits_list" },
                     "url": "https://github.com/owner/repo/pull/999#discussion_r6"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRT_thread_e",
+              "isResolved": true,
+              "isOutdated": false,
+              "path": "scripts/e.sh",
+              "line": 50,
+              "originalLine": 50,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 7,
+                    "author": { "login": "chatgpt-codex-connector[bot]" },
+                    "body": "**![P1 Badge]** Race condition addressed by a later fix-commit, no reply or tag.",
+                    "createdAt": "2026-05-15T05:00:00Z",
+                    "originalCommit": { "oid": "commit_early_xxxxxxxxxxxxxxxxxxx" },
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r7"
                   }
                 ]
               }
@@ -264,7 +285,7 @@ fi
 # Assertions on the NDJSON output.
 LINES=$(wc -l < "$OUT_FILE" | tr -d ' ')
 if [ "$LINES" -ne 2 ]; then
-  echo "FAIL: expected 2 NDJSON lines (A substantive + C polish; B reply-skipped, D stale-skipped), got $LINES" >&2
+  echo "FAIL: expected 2 NDJSON lines (A substantive + C polish; B reply-skipped, D stale-skipped, E fix-skipped), got $LINES" >&2
   cat "$OUT_FILE" >&2
   echo "  stderr:" >&2
   sed 's/^/    /' "$ERR_FILE" >&2
@@ -303,6 +324,17 @@ if grep -q '"thread_id":"PRT_thread_d"' "$OUT_FILE"; then
   exit 1
 fi
 
+# Thread E — must be FILTERED (addressed-via-fix: agent-author
+# commits at 07:00 + 07:30 are both AFTER the comment's createdAt of
+# 05:00). Validates the per-PR fix-commit heuristic that closes the
+# codex P1 r1 finding on this PR. The other threads' createdAts
+# (08:00+) are AFTER both commits, so the fix-gate doesn't fire for
+# them — keeping the substantive/polish routing assertions intact.
+if grep -q '"thread_id":"PRT_thread_e"' "$OUT_FILE"; then
+  echo "FAIL: thread E (addressed-via-fix: agent commit after comment) should be filtered out" >&2
+  exit 1
+fi
+
 # Thread C — polish (P3, tagged nitpick-noted)
 if ! grep -q '"thread_id":"PRT_thread_c"' "$OUT_FILE"; then
   echo "FAIL: thread C (tagged nitpick-noted P3) missing from output" >&2
@@ -326,5 +358,5 @@ if ! grep -oE '"item_id":"[a-f0-9]{12}"' "$OUT_FILE" | head -1 >/dev/null; then
   exit 1
 fi
 
-echo "check_daily_feedback_rollup: PASS (unit tests + 4-case --dry-run smoke)"
+echo "check_daily_feedback_rollup: PASS (unit tests + 5-case --dry-run smoke)"
 exit 0
