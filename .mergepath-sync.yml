@@ -169,6 +169,19 @@ paths:
   - path: scripts/codex-p1-gate.sh
     type: canonical
     consumers: all
+  - path: scripts/daily-feedback-rollup.sh
+    # Cron workhorse invoked by .github/workflows/daily-feedback-rollup.yml.
+    # Sources scripts/lib/daily-feedback-rollup-helpers.sh. The
+    # workflow's `requires:` list declares both as hard-deps so the
+    # #264 closure invariant catches a future drift. See #299/#306.
+    type: canonical
+    consumers: all
+  - path: scripts/lib/daily-feedback-rollup-helpers.sh
+    # Pure-function helpers sourced by both daily-feedback-rollup.sh
+    # AND tests/test_daily_feedback_rollup.sh. Stays in lockstep with
+    # the workhorse + tests. See #299/#306.
+    type: canonical
+    consumers: all
   - path: scripts/disagreement-detector.cjs
     # Runtime dependency of .github/workflows/agent-review.yml's
     # detect-disagreement job — the job require()s this module.
@@ -280,6 +293,18 @@ paths:
   - path: tests/test_resolve_pr_threads_rationale_tag.sh
     type: canonical
     consumers: all
+  # Pairs with scripts/daily-feedback-rollup.sh +
+  # scripts/ci/check_daily_feedback_rollup (which sources this test
+  # via paired-suite layer-1 before its own layer-2 shimmed smoke).
+  # Exercises the mergepath#299 v1 classifier helpers (severity
+  # routing, item ID stability, tag extraction, dedupe-against-prior-
+  # rollups parsing). Without this test propagated, every consumer's
+  # check_daily_feedback_rollup fails on the layer-1 step — same
+  # #264/#266 coupling class as the codex-p1-gate / disagreement-
+  # detector / verify-propagation-pr pairings above. See #299/#306.
+  - path: tests/test_daily_feedback_rollup.sh
+    type: canonical
+    consumers: all
 
   # Canonical workflows — review policy + automation surfaces that
   # should be lockstep across all consumers.
@@ -322,6 +347,29 @@ paths:
     # `command not found` for every PR in the consumer.
     requires:
       - "scripts/codex-p1-gate.sh"
+  - path: .github/workflows/daily-feedback-rollup.yml
+    type: canonical
+    consumers: all
+    # The cron job invokes scripts/daily-feedback-rollup.sh, which
+    # sources scripts/lib/daily-feedback-rollup-helpers.sh. Both
+    # must travel with the workflow, otherwise the cron firing on
+    # every consumer would fail-closed on missing-file (same
+    # coupling class as the codex-p1-gate.yml + codex-p1-gate.sh
+    # pair above). The check + test are propagated as part of the
+    # scripts/ci/ + tests/ kits but listed individually here so the
+    # #264 requires: closure invariant catches a future split of
+    # either kit. See #299 (v1 design) + #306 (propagation work).
+    #
+    # The workflow auths via secrets.REVIEWER_ASSIGNMENT_TOKEN.
+    # Every consumer must have that secret set before the cron
+    # fires productively (the script exits 1 with a clear-but-noisy
+    # error if not). Audited 2026-05-16: all 8 consumers have the
+    # secret present.
+    requires:
+      - "scripts/daily-feedback-rollup.sh"
+      - "scripts/lib/daily-feedback-rollup-helpers.sh"
+      - "scripts/ci/check_daily_feedback_rollup"
+      - "tests/test_daily_feedback_rollup.sh"
 
   # NOTE: `.mergepath-sync.yml` is deliberately NOT propagated.
   # #268 briefly made it a canonical path on the theory the lane
