@@ -220,7 +220,7 @@ out=$(
 rc=$?
 set -e
 
-if grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: tag body contains [mergepath-resolve: addressed-elsewhere]"
 else
@@ -263,7 +263,7 @@ out=$(
 rc=$?
 set -e
 
-if grep -q 'FIELD: body=\[mergepath-resolve: canonical-coverage\]' "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: canonical-coverage\]' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: tag body contains [mergepath-resolve: canonical-coverage]"
 else
@@ -307,7 +307,7 @@ out=$(
 rc=$?
 set -e
 
-if grep -q 'FIELD: body=\[mergepath-resolve: nitpick-noted\]' "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: nitpick-noted\]' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: tag body contains [mergepath-resolve: nitpick-noted]"
 else
@@ -351,7 +351,7 @@ out=$(
 rc=$?
 set -e
 
-if grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: tag body contains [mergepath-resolve: deferred-to-followup]"
 else
@@ -401,7 +401,7 @@ set -e
 # Both the class and the custom rationale must appear in the SAME
 # tag-reply field. The stub log writes one `FIELD:` line per -F arg
 # (the body is one such line: `FIELD: body=[mergepath-resolve: deferred-to-followup] P2 noted; ...`).
-if grep -qF "FIELD: body=[mergepath-resolve: deferred-to-followup] $CUSTOM_RATIONALE" "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && grep -qF "FIELD: body=[mergepath-resolve: deferred-to-followup] $CUSTOM_RATIONALE" "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: override emitted deferred-to-followup tag with custom rationale text"
 else
@@ -492,7 +492,7 @@ out=$(
 rc=$?
 set -e
 
-if grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: tag body contains [mergepath-resolve: rebuttal-recorded]"
 else
