@@ -119,7 +119,7 @@ write_fake_sa_key() {
   "type": "service_account",
   "project_id": "fake-project",
   "private_key_id": "fake-key-id",
-  "private_key": "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n",
+  "private_key": "REDACTED_TEST_FIXTURE_NOT_A_REAL_KEY",
   "client_email": "$sa_email",
   "client_id": "0",
   "auth_uri": "https://accounts.google.com/o/oauth2/auth",
