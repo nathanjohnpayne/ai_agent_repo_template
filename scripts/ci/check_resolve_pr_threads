@@ -445,6 +445,31 @@ else
   echo "      env capture:" >&2; sed 's/^/        /' "$GH_ARGV_LOG" >&2
 fi
 
+# ── Test 8: delegate to tests/test_resolve_pr_threads_rationale_tag.sh
+# Exercises the mergepath#305 tag-emission flow (derive_tag_class +
+# post_tag_reply + --rationale override + --no-tag-reply). The test
+# is fixture-based and lives in tests/ so it follows the same
+# co-location pattern as test_codex_p1_gate / test_disagreement_detector
+# (the check wrapper delegates to a dedicated test file rather than
+# inlining the cases).
+echo
+echo "resolve-pr-threads.sh rationale-tag emission (mergepath#305)"
+
+TAG_TEST="$ROOT/tests/test_resolve_pr_threads_rationale_tag.sh"
+if [ ! -f "$TAG_TEST" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: missing $TAG_TEST" >&2
+elif bash "$TAG_TEST" >/dev/null 2>&1; then
+  pass=$((pass + 1))
+  echo "  PASS: tests/test_resolve_pr_threads_rationale_tag.sh"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: tests/test_resolve_pr_threads_rationale_tag.sh exited non-zero" >&2
+  # Re-run with output captured so the CI log shows what broke.
+  echo "    re-running with output:" >&2
+  bash "$TAG_TEST" 2>&1 | sed 's/^/      /' >&2 || true
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "check_resolve_pr_threads: PASS ($pass tests)"

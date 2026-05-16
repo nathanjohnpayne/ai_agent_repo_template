@@ -1,0 +1,447 @@
+#!/usr/bin/env bash
+# tests/test_resolve_pr_threads_rationale_tag.sh
+#
+# Tests the mergepath#305 `[mergepath-resolve: <class>] <rationale>`
+# tag-emission flow in scripts/resolve-pr-threads.sh
+# --auto-resolve-bots.
+#
+# Strategy: stub `gh` via PATH-prepend so the script's mutation calls
+# (addPullRequestReviewThreadReply for the tag, resolveReviewThread
+# for the resolve) are captured into a side log file we can inspect.
+# Each case shapes the GraphQL response so derive_tag_class lands on
+# the expected class, then asserts the captured argv contains the
+# matching `[mergepath-resolve: <class>]` tag body.
+#
+# Tag format MUST match exactly what the v1 rollup classifier's
+# regex in scripts/lib/daily-feedback-rollup-helpers.sh expects:
+#   \[mergepath-resolve:[[:space:]]*[a-z-]+[[:space:]]*\]
+#
+# Cases (matching the spec's class taxonomy):
+#   1. addressed-elsewhere  fix-commit by agent author after createdAt
+#                           touching the comment's anchored file
+#   2. canonical-coverage   path matches a canonical entry in
+#                           .mergepath-sync.yml
+#   3. nitpick-noted        Nitpick severity, no stronger signal
+#   4. deferred-to-followup default fallback
+#   5. --rationale override emits deferred-to-followup with custom text
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="$ROOT/scripts/resolve-pr-threads.sh"
+[ -f "$SCRIPT" ] || { echo "missing $SCRIPT" >&2; exit 1; }
+
+pass=0
+fail=0
+
+SCRATCH=$(mktemp -d)
+trap 'rm -rf "$SCRATCH"' EXIT
+
+# Build a fixture .mergepath-sync.yml the script will read for the
+# canonical-coverage classification. We point the script at this
+# fixture by faking REPO_ROOT_FOR_MANIFEST via a symlink-style
+# wrapper. The simplest path: copy the real script into the
+# fixture tree and run it from there, so its
+# `$(dirname BASH_SOURCE)/..` resolution picks up our manifest.
+FIXTURE_ROOT="$SCRATCH/repo"
+mkdir -p "$FIXTURE_ROOT/scripts/lib" "$FIXTURE_ROOT/scripts/ci" "$FIXTURE_ROOT/tests"
+cp "$SCRIPT" "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh"
+# The script auto-sources scripts/lib/preflight-helpers.sh if present;
+# ship a no-op stub so the source line doesn't fail in the fixture.
+cat > "$FIXTURE_ROOT/scripts/lib/preflight-helpers.sh" <<'STUB'
+auto_source_preflight() { :; }
+STUB
+# Also ship a stub identity-check.sh that always passes (we test
+# tag emission, not identity verification — that has its own suite).
+cat > "$FIXTURE_ROOT/scripts/identity-check.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$FIXTURE_ROOT/scripts/identity-check.sh"
+
+# Fixture manifest — only the entries the test asserts against.
+cat > "$FIXTURE_ROOT/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - name: test-consumer
+    repo: test/consumer
+    visibility: public
+paths:
+  - path: scripts/resolve-pr-threads.sh
+    type: canonical
+    consumers: all
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+YAML
+
+# Common gh stub. Routes by ($1, $2) and the rest of argv:
+#   `gh api graphql -f query=...` → branch on query body for resolveReviewThread / addPullRequestReviewThreadReply / reviewThreads
+#   `gh api repos/.../pulls/N` → HEAD oid
+#   `gh api repos/.../pulls/N/files?...` → PR file list
+#   `gh api repos/.../pulls/N/commits?...` → PR commits
+#   `gh repo view --json nameWithOwner` → fixture repo slug
+make_gh_stub() {
+  local stub_path="$1"
+  local threads_json="$2"
+  local files_json="$3"
+  local commits_json="$4"
+  cat > "$stub_path" <<GH_STUB
+#!/usr/bin/env bash
+echo "ARGV: \$*" >> "\$GH_ARGV_LOG"
+# Capture the body of any -F (typed) field so we can grep for the
+# mergepath-resolve tag in the addPullRequestReviewThreadReply body
+# field. Iterate a COPY of argv via an indexed array — shifting the
+# real \$@ here would empty it before the case statement below can
+# dispatch on \$1/\$2.
+__ARGS=("\$@")
+__i=0
+while [ "\$__i" -lt "\${#__ARGS[@]}" ]; do
+  case "\${__ARGS[\$__i]}" in
+    -F|--field)
+      __next_i=\$((__i + 1))
+      echo "FIELD: \${__ARGS[\$__next_i]}" >> "\$GH_ARGV_LOG"
+      __i=\$((__i + 2)) ;;
+    -f|--raw-field)
+      __next_i=\$((__i + 1))
+      echo "RAWFIELD: \${__ARGS[\$__next_i]}" >> "\$GH_ARGV_LOG"
+      __i=\$((__i + 2)) ;;
+    *) __i=\$((__i + 1)) ;;
+  esac
+done
+
+case "\$1" in
+  api)
+    case "\$2" in
+      graphql)
+        # Pull out the query body from argv (already logged above);
+        # branch on substring matches.
+        if grep -q "addPullRequestReviewThreadReply" "\$GH_ARGV_LOG.lastcall"; then
+          # Tag-reply mutation — return a minimal success response.
+          echo '{"data":{"addPullRequestReviewThreadReply":{"comment":{"id":"C_kwT1"}}}}'
+        elif grep -q "resolveReviewThread" "\$GH_ARGV_LOG.lastcall"; then
+          echo '{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}'
+        else
+          # reviewThreads pagination query.
+          cat <<'JSON_THREADS'
+${threads_json}
+JSON_THREADS
+        fi
+        ;;
+      "repos/"*"/pulls/"*"/files"*)
+        # The script calls this with --jq '[.[].filename]' which
+        # transforms the API response to a flat list of paths. Our
+        # stub doesn't actually parse --jq, so we return the
+        # already-transformed shape (a JSON array of path strings).
+        cat <<'JSON_FILES'
+${files_json}
+JSON_FILES
+        ;;
+      "repos/"*"/pulls/"*"/commits"*)
+        # Same shape note as /files: stub returns the already-jq-
+        # transformed shape (array of {sha,login,date} objects)
+        # because the script reads --jq output, not raw API JSON.
+        cat <<'JSON_COMMITS'
+${commits_json}
+JSON_COMMITS
+        ;;
+      "repos/"*"/pulls/"*)
+        # HEAD oid fetch — the script calls this with --jq .head.sha
+        # and captures stdout; the stub doesn't actually parse --jq,
+        # so we return the bare sha directly. Same pattern the
+        # existing tests in scripts/ci/check_resolve_pr_threads use.
+        echo "HEADCURRENT"
+        ;;
+      *)
+        echo "{}" ;;
+    esac
+    ;;
+  repo)
+    printf '{"nameWithOwner":"test/repo"}\n'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+exit 0
+GH_STUB
+  chmod +x "$stub_path"
+}
+
+# The stub uses .lastcall to remember the most-recent call's argv
+# (so it can branch on which graphql mutation was sent). A second
+# pre-hook stub wraps the main one to populate it.
+make_gh_wrapper() {
+  local wrapper_path="$1"
+  local real_stub="$2"
+  cat > "$wrapper_path" <<WRAP_STUB
+#!/usr/bin/env bash
+# Capture this call's argv into .lastcall before dispatching to the
+# real stub, so the real stub can branch on which mutation was sent.
+printf '%s\n' "\$*" > "\$GH_ARGV_LOG.lastcall"
+exec "$real_stub" "\$@"
+WRAP_STUB
+  chmod +x "$wrapper_path"
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 1: helper detects fix-commit → emits addressed-elsewhere
+# ─────────────────────────────────────────────────────────────────────
+echo "Test 1: addressed-elsewhere class (fix-commit detection)"
+
+# Thread: comment created 2026-01-01, anchored at scripts/foo.sh.
+# PR files include scripts/foo.sh. PR commits include one by
+# nathanpayne-claude on 2026-01-02 (after createdAt).
+THREADS_T1='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_1","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/foo.sh","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Some finding","databaseId":1001}]}
+  }
+]}}}}}'
+FILES_T1='["scripts/foo.sh","scripts/bar.sh"]'
+COMMITS_T1='[{"sha":"abc1234567","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
+
+GH_ARGV_LOG="$SCRATCH/t1.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T1" "$FILES_T1" "$COMMITS_T1"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: tag body contains [mergepath-resolve: addressed-elsewhere]"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: addressed-elsewhere tag not emitted (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 2: canonical-coverage when path matches manifest
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 2: canonical-coverage class (path in .mergepath-sync.yml)"
+
+# scripts/resolve-pr-threads.sh IS in the fixture manifest as canonical.
+THREADS_T2='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_2","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/resolve-pr-threads.sh","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Some finding","databaseId":2001}]}
+  }
+]}}}}}'
+FILES_T2='["scripts/resolve-pr-threads.sh"]'
+COMMITS_T2='[]'
+
+GH_ARGV_LOG="$SCRATCH/t2.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T2" "$FILES_T2" "$COMMITS_T2"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if grep -q 'FIELD: body=\[mergepath-resolve: canonical-coverage\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: tag body contains [mergepath-resolve: canonical-coverage]"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: canonical-coverage tag not emitted (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 3: nitpick-noted on Nitpick severity, no fix, no canonical path
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 3: nitpick-noted class (Nitpick severity, no other signals)"
+
+# Path NOT in manifest. Body carries CodeRabbit Nitpick badge.
+# No commits (empty PR_COMMITS_CACHE).
+THREADS_T3='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_3","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/random.md","body":"_🧹 Nitpick (assertive)_ minor wording issue","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"_🧹 Nitpick (assertive)_ minor wording issue","databaseId":3001}]}
+  }
+]}}}}}'
+FILES_T3='[]'
+COMMITS_T3='[]'
+
+GH_ARGV_LOG="$SCRATCH/t3.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T3" "$FILES_T3" "$COMMITS_T3"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if grep -q 'FIELD: body=\[mergepath-resolve: nitpick-noted\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: tag body contains [mergepath-resolve: nitpick-noted]"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: nitpick-noted tag not emitted (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 4: deferred-to-followup default fallback
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 4: deferred-to-followup class (default fallback)"
+
+# Path NOT in manifest. Body has no severity markers. No commits.
+# No agent reply. → falls through to deferred-to-followup.
+THREADS_T4='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_4","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/random.md","body":"Some opaque finding without a badge","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Some opaque finding without a badge","databaseId":4001}]}
+  }
+]}}}}}'
+FILES_T4='[]'
+COMMITS_T4='[]'
+
+GH_ARGV_LOG="$SCRATCH/t4.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T4" "$FILES_T4" "$COMMITS_T4"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: tag body contains [mergepath-resolve: deferred-to-followup]"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: deferred-to-followup tag not emitted (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 5: --rationale override emits deferred-to-followup with the
+#         custom rationale text appended verbatim.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 5: --rationale override (deferred-to-followup + custom text)"
+
+# Same thread as Test 2 (canonical path) — would normally classify
+# as canonical-coverage; the override must beat the auto-class.
+THREADS_T5="$THREADS_T2"
+FILES_T5='[]'
+COMMITS_T5='[]'
+
+GH_ARGV_LOG="$SCRATCH/t5.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T5" "$FILES_T5" "$COMMITS_T5"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+CUSTOM_RATIONALE="P2 noted; deferred to mergepath canonical follow-up #280"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots \
+    --rationale "$CUSTOM_RATIONALE" 2>&1
+)
+rc=$?
+set -e
+
+# Both the class and the custom rationale must appear in the SAME
+# tag-reply field. The stub log writes one `FIELD:` line per -F arg
+# (the body is one such line: `FIELD: body=[mergepath-resolve: deferred-to-followup] P2 noted; ...`).
+if grep -qF "FIELD: body=[mergepath-resolve: deferred-to-followup] $CUSTOM_RATIONALE" "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: override emitted deferred-to-followup tag with custom rationale text"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: rationale override not emitted as expected (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 6: --no-tag-reply suppresses the addPullRequestReviewThreadReply
+#         mutation entirely (resolve still runs).
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 6: --no-tag-reply suppresses tag emission"
+
+GH_ARGV_LOG="$SCRATCH/t6.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T4" "$FILES_T4" "$COMMITS_T4"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots --no-tag-reply 2>&1
+)
+rc=$?
+set -e
+
+# Negative assertion: no tag-reply field anywhere.
+if ! grep -q 'FIELD: body=\[mergepath-resolve:' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: --no-tag-reply suppressed tag emission (no [mergepath-resolve:] body in argv)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --no-tag-reply did NOT suppress tag emission (rc=$rc)" >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+echo
+if [ "$fail" -eq 0 ]; then
+  echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"
+  exit 0
+else
+  echo "test_resolve_pr_threads_rationale_tag: FAIL ($fail of $((pass + fail)) tests)" >&2
+  exit 1
+fi
