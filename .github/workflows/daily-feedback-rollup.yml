@@ -1,0 +1,90 @@
+name: Daily deferred-feedback rollup
+
+# Daily end-of-day rollup of bot-review threads that were resolved on
+# yesterday's PRs without an associated fix commit or substantive
+# reply. Complements weekly-feedback-sweep.yml (which catches
+# longer-tail residuals on still-open PRs); this catches the
+# deferred-and-forgotten class while the agent's context is still
+# fresh. See mergepath#299.
+#
+# Auth model:
+#   - Same-repo reads + writes. GITHUB_TOKEN works for both, but
+#     REVIEWER_ASSIGNMENT_TOKEN (the nathanpayne-claude PAT already
+#     wired for weekly sweep) keeps the issue byline showing the
+#     agent identity instead of github-actions[bot].
+#
+# Idempotency:
+#   - daily-feedback-rollup.sh's self-throttling appends to the
+#     most-recently-opened track issue if that issue has ≥ N
+#     unchecked items, rather than opening a new one every day.
+#     v1 dedupe-against-prior-triaged-items is a documented follow-up.
+#   - Re-running on the same day for the same window posts a second
+#     issue (NOT idempotent yet — also a documented follow-up).
+
+on:
+  schedule:
+    # 55 23 * * *: 23:55 UTC daily = 4:55pm Pacific / 7:55pm Eastern,
+    # late enough to capture the day's merges but before the working-
+    # memory rolls over for that day's agent sessions.
+    - cron: '55 23 * * *'
+  workflow_dispatch:
+    inputs:
+      since:
+        description: 'Window start (YYYY-MM-DD, UTC). Default: yesterday.'
+        required: false
+      until:
+        description: 'Window end (YYYY-MM-DD, UTC). Default: today.'
+        required: false
+      dry_run:
+        description: 'If true, print NDJSON to logs and skip issue mutation.'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  rollup:
+    name: Classify + post rollup issues
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Ensure jq + gh present
+        run: |
+          for dep in gh jq shasum; do
+            if ! command -v "$dep" >/dev/null 2>&1; then
+              echo "ERROR: $dep not installed on runner" >&2
+              exit 1
+            fi
+          done
+
+      - name: Run rollup
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN secret is empty. Daily rollup cannot run without a cross-repo-capable PAT." >&2
+            echo "       Set the secret in repo Settings → Secrets and variables → Actions." >&2
+            exit 1
+          fi
+
+          ARGS=()
+          if [ -n "${{ github.event.inputs.since }}" ]; then
+            ARGS+=(--since "${{ github.event.inputs.since }}")
+          fi
+          if [ -n "${{ github.event.inputs.until }}" ]; then
+            ARGS+=(--until "${{ github.event.inputs.until }}")
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+
+          chmod +x scripts/daily-feedback-rollup.sh
+          scripts/daily-feedback-rollup.sh "${ARGS[@]+"${ARGS[@]}"}"
