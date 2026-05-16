@@ -556,12 +556,58 @@ most_recent_open_rollup() {
     --limit 1 --json number,title --jq '.[0].number // ""'
 }
 
+# Idempotently create the track label if it doesn't already exist in
+# the repo, so the first rollup run on a fresh consumer doesn't fail
+# at `gh issue create --label`. `gh label create --force` updates
+# color/description in place when the label already exists and
+# creates it otherwise (the helper survives consumer label-policy
+# drift). Failure here is logged + swallowed: if label-creation
+# fails for some reason (permissions, transient API), the downstream
+# `gh issue create --label` will surface the real diagnostic.
+#
+# Closes nathanpayne-codex Phase 4b r1 on PR #303 — the live repo
+# had neither `deferred-feedback-rollup` nor `polish-feedback-rollup`
+# defined, so the workflow would have errored the first time it had
+# feedback to file.
+ensure_label() {
+  local name="$1" track="$2"
+  local color description
+  case "$track" in
+    substantive)
+      color="d73a4a"
+      description="Daily rollup of deferred bot review feedback — substantive scope (CodeRabbit Major / Codex P0-P2). Triage within a few days. See #299."
+      ;;
+    polish)
+      color="0e8a16"
+      description="Daily rollup of deferred bot review feedback — polish scope (CodeRabbit Nitpick/Trivial / Codex P3). Batch triage; low urgency. See #299."
+      ;;
+    *)
+      color="ededed"
+      description="Daily deferred-feedback rollup (#299)."
+      ;;
+  esac
+  if ! gh label create "$name" \
+       --repo "$REPO" \
+       --color "$color" \
+       --description "$description" \
+       --force >/dev/null 2>&1; then
+    echo "daily-feedback-rollup: WARN — could not ensure label '$name' (will let gh issue create surface the real error)" >&2
+  fi
+}
+
 post_or_append() {
   local ndjson_file="$1" track="$2" label="$3" throttle="$4" title="$5"
   if [ ! -s "$ndjson_file" ]; then
     echo "daily-feedback-rollup: $track — no items to surface today" >&2
     return 0
   fi
+
+  # Self-bootstrap: ensure the track label exists before we either
+  # comment on an existing issue (no label change there, but the
+  # `--label` query above could miss new labels for the same reason)
+  # or create a new one. Runs ONLY in the mutation path so
+  # `--dry-run` stays a pure read.
+  ensure_label "$label" "$track"
 
   local body
   body=$(render_rollup_body "$ndjson_file" "$track")
