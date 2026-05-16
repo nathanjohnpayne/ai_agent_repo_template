@@ -155,3 +155,53 @@ hold partial work the user wants to keep.
 
 This helper is intentionally local-only — worktree state is machine-local
 and should not gate repository CI (see #288).
+
+## Feedback-rollup cadence model
+
+Two complementary automations catch unaddressed review feedback at different
+time horizons. Agents should know which one fires when, so triage work isn't
+duplicated and missed-signal classes are surfaced at the right cadence.
+
+### Daily rollup — deferred-and-forgotten class
+
+**`.github/workflows/daily-feedback-rollup.yml`** runs daily at `55 23 * * *`
+UTC. It scans yesterday's MERGED PRs and surfaces bot review threads that
+were RESOLVED **without** an associated fix commit or substantive reply. The
+output splits into two clearly-labeled tracks (substantive / polish) so the
+high-severity stream stays high-signal even on days with a lot of nit volume.
+
+This catches the class that motivated #234 / #286 / #287: a CodeRabbit Major
+or Codex P2 the agent resolved as "non-blocking, will fix in a follow-up" —
+and then nobody wrote down. Captured while the resolving agent's context is
+still hot.
+
+See `scripts/daily-feedback-rollup.sh` (workhorse) +
+`scripts/lib/daily-feedback-rollup-helpers.sh` (classifier helpers) +
+`scripts/resolve-pr-threads.sh --auto-resolve-bots` (the upstream emit-side
+that tags each resolve with `[mergepath-resolve:<class>]` so the classifier
+prefers agent-recorded rationale over heuristics).
+
+### Weekly sweep — longer-tail residuals
+
+**`.github/workflows/weekly-feedback-sweep.yml`** runs Mondays at `09:00`
+UTC. It enumerates UNRESOLVED review threads on closed PRs across the org
+(by default a 90-day lookback). Captures items that slipped past the merge
+gate AND remained unresolved through the daily rollup's 24h window —
+typically because the resolving agent's day rolled over before triage.
+
+See `scripts/sweep-unresolved-feedback/enumerate.sh` +
+`scripts/sweep-unresolved-feedback/render.sh`.
+
+### Which one to act on
+
+- Routine end-of-day triage → the substantive `deferred-feedback-rollup
+  YYYY-MM-DD` issue from the daily cron. Items aged 0-7 days, context fresh.
+- Polish/nit batch triage → the `polish-feedback-rollup YYYY-MM-DD` issue
+  from the same daily cron. Lower urgency; can batch across multiple days.
+- Quarterly backlog review → the weekly sweep's rollup issue. Items aged
+  7+ days, context decayed but pattern recognition still possible.
+
+Both surfaces are per-repo (each consumer has its own daily + weekly rollup
+issues). Cross-repo aggregation is explicit non-goal for v1 of both
+workflows; the per-repo design preserves operator focus on the repo whose
+context they're currently in.

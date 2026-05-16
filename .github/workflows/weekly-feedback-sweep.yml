@@ -4,6 +4,16 @@ name: Weekly unresolved-feedback sweep
 # Closes the 2026-05-13 toil that produced #234 (209 backlogged
 # review threads across 9 repos). See #236 for the full design.
 #
+# Cadence model (operator-facing):
+#   - This workflow (weekly) catches LONGER-TAIL residuals — unresolved
+#     review feedback on closed PRs across the org. Captures items that
+#     slipped past the merge gate and remain unresolved N weeks later.
+#   - The DAILY complement (`.github/workflows/daily-feedback-rollup.yml`,
+#     #299/#303) catches the deferred-and-forgotten class: bot review
+#     threads that were RESOLVED on yesterday's merged PRs WITHOUT an
+#     associated fix commit or substantive reply. Inverts this workflow's
+#     scope so the two are complementary, not overlapping. See #306.
+#
 # Auth model:
 #   - The enumeration READS pull-request data from every target repo
 #     in scripts/sweep-unresolved-feedback/target-repos.txt. The default
