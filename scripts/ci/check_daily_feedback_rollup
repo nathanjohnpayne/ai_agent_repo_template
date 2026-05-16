@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# check_daily_feedback_rollup
+#
+# Structural check for scripts/daily-feedback-rollup.sh (mergepath#299).
+#
+# Two layers:
+#
+#   1. Run the paired unit tests in tests/test_daily_feedback_rollup.sh
+#      (pure-function coverage of classify_severity / severity_to_track
+#      / item_id_for / extract_tag_class / tag_class_action /
+#      is_agent_author / body_excerpt — 46 cases as of this writing).
+#
+#   2. Run the rollup script's `--dry-run` mode against a `gh`-shimmed
+#      scratch environment with canned fixture responses. Asserts the
+#      end-to-end classification + routing path produces the expected
+#      NDJSON items.
+#
+# Both layers run under hermetic PATH so the script's gh / jq / shasum
+# calls resolve to the shim or to the runner's tools rather than a
+# user-installed alternative.
+#
+# Bash 3.2 compatible (macOS default + ubuntu-latest).
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT="$ROOT/scripts/daily-feedback-rollup.sh"
+UNIT_TEST="$ROOT/tests/test_daily_feedback_rollup.sh"
+
+[ -x "$SCRIPT" ] || { echo "missing or non-executable $SCRIPT" >&2; exit 1; }
+[ -x "$UNIT_TEST" ] || { echo "missing or non-executable $UNIT_TEST" >&2; exit 1; }
+
+# ---------------------------------------------------------------------
+# Layer 1 — unit tests
+# ---------------------------------------------------------------------
+
+echo "check_daily_feedback_rollup: running unit tests"
+if ! bash "$UNIT_TEST" >&2; then
+  echo "check_daily_feedback_rollup: FAIL — unit tests did not pass" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------
+# Layer 2 — shimmed integration smoke
+# ---------------------------------------------------------------------
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/check-daily-feedback-XXXXXX")"
+trap 'rm -rf "$WORKDIR"' EXIT
+
+BIN="$WORKDIR/bin"
+mkdir -p "$BIN"
+FIXTURES="$WORKDIR/fixtures"
+mkdir -p "$FIXTURES"
+
+# ----- Fixture: one merged PR with three resolved threads -----
+#
+# Thread A: chatgpt-codex-connector P1 finding, no fix, no reply →
+#   classify as deferred-untagged, route to substantive.
+# Thread B: coderabbitai Nitpick, agent posted a 50-char substantive
+#   reply → classify as addressed-via-reply, skip.
+# Thread C: chatgpt-codex-connector P3 with a `[mergepath-resolve:
+#   nitpick-noted]` reply → tagged, route to polish.
+
+cat >"$FIXTURES/prs.json" <<'JSON'
+[
+  {
+    "number": 999,
+    "title": "test PR",
+    "url": "https://github.com/owner/repo/pull/999",
+    "mergedAt": "2026-05-15T12:00:00Z"
+  }
+]
+JSON
+
+cat >"$FIXTURES/threads.json" <<'JSON'
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "headRefOid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx",
+        "commits": {
+          "nodes": [
+            { "commit": { "oid": "commit_early_xxxxxxxxxxxxxxxxxxx", "authoredDate": "2026-05-15T07:00:00Z", "author": { "user": { "login": "nathanjohnpayne" } } } },
+            { "commit": { "oid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx", "authoredDate": "2026-05-15T07:30:00Z", "author": { "user": { "login": "nathanjohnpayne" } } } }
+          ]
+        },
+        "reviewThreads": {
+          "totalCount": 3,
+          "pageInfo": { "hasNextPage": false, "endCursor": null },
+          "nodes": [
+            {
+              "id": "PRT_thread_a",
+              "isResolved": true,
+              "isOutdated": false,
+              "path": "scripts/a.sh",
+              "line": 10,
+              "originalLine": 10,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 1,
+                    "author": { "login": "chatgpt-codex-connector[bot]" },
+                    "body": "**![P1 Badge]** Critical race condition. Fix before merge.",
+                    "createdAt": "2026-05-15T08:00:00Z",
+                    "originalCommit": { "oid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx" },
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r1"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRT_thread_b",
+              "isResolved": true,
+              "isOutdated": false,
+              "path": "scripts/b.sh",
+              "line": 20,
+              "originalLine": 20,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 2,
+                    "author": { "login": "coderabbitai[bot]" },
+                    "body": "_🧹 Nitpick (assertive)_ minor style suggestion here.",
+                    "createdAt": "2026-05-15T08:10:00Z",
+                    "originalCommit": { "oid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx" },
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r2"
+                  },
+                  {
+                    "databaseId": 3,
+                    "author": { "login": "nathanpayne-claude" },
+                    "body": "Acknowledged — addressed in commit abc1234 with the renamed variable per the suggestion.",
+                    "createdAt": "2026-05-15T09:00:00Z",
+                    "originalCommit": null,
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r3"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRT_thread_c",
+              "isResolved": true,
+              "isOutdated": false,
+              "path": "scripts/c.sh",
+              "line": 30,
+              "originalLine": 30,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 4,
+                    "author": { "login": "chatgpt-codex-connector[bot]" },
+                    "body": "**![P3 Badge]** Polish suggestion — consider extracting a helper.",
+                    "createdAt": "2026-05-15T08:20:00Z",
+                    "originalCommit": { "oid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx" },
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r4"
+                  },
+                  {
+                    "databaseId": 5,
+                    "author": { "login": "nathanpayne-claude" },
+                    "body": "[mergepath-resolve: nitpick-noted] Noted; not worth a refactor for a one-line helper.",
+                    "createdAt": "2026-05-15T09:30:00Z",
+                    "originalCommit": null,
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r5"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRT_thread_d",
+              "isResolved": true,
+              "isOutdated": true,
+              "path": "scripts/d.sh",
+              "line": 40,
+              "originalLine": 40,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 6,
+                    "author": { "login": "chatgpt-codex-connector[bot]" },
+                    "body": "**![P1 Badge]** Stale finding — original commit was force-pushed away.",
+                    "createdAt": "2026-05-15T08:30:00Z",
+                    "originalCommit": { "oid": "DEADBEEF_not_in_commits_list" },
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r6"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRT_thread_e",
+              "isResolved": true,
+              "isOutdated": false,
+              "path": "scripts/e.sh",
+              "line": 50,
+              "originalLine": 50,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 7,
+                    "author": { "login": "chatgpt-codex-connector[bot]" },
+                    "body": "**![P1 Badge]** Race condition addressed by a later fix-commit, no reply or tag.",
+                    "createdAt": "2026-05-15T05:00:00Z",
+                    "originalCommit": { "oid": "commit_early_xxxxxxxxxxxxxxxxxxx" },
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r7"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+JSON
+
+# ----- gh shim — dispatches on argv -----
+cat >"$BIN/gh" <<STUB
+#!/usr/bin/env bash
+# Minimal gh stub for check_daily_feedback_rollup. Only the calls the
+# rollup script makes in --dry-run mode are handled.
+case "\$1" in
+  repo)
+    # gh repo view --json owner,name --jq ...
+    printf '%s\n' "owner/repo"
+    exit 0
+    ;;
+  pr)
+    # gh pr list ...
+    cat "$FIXTURES/prs.json"
+    exit 0
+    ;;
+  api)
+    # gh api graphql -f query='...' -F owner=... -F name=... -F pr=999
+    # (we don't introspect the query — just return the fixture)
+    cat "$FIXTURES/threads.json"
+    exit 0
+    ;;
+  *)
+    echo "[gh-stub] unhandled: \$*" >&2
+    exit 1
+    ;;
+esac
+STUB
+chmod +x "$BIN/gh"
+
+# Capture python3/jq/shasum locations so the hermetic PATH below
+# resolves them. python3 isn't used by the rollup script directly but
+# shasum is.
+PYTHON3_DIR="$(cd "$(dirname "$(command -v python3 2>/dev/null || echo /bin/true)")" && pwd -P 2>/dev/null || echo /usr/bin)"
+JQ_DIR="$(cd "$(dirname "$(command -v jq)")" && pwd -P)"
+SHASUM_DIR="$(cd "$(dirname "$(command -v shasum)")" && pwd -P)"
+
+# Build a PATH that includes the shim, the runner tool paths, and the
+# minimal system dirs. env -i strips everything else.
+STUB_PATH="$BIN:$JQ_DIR:$SHASUM_DIR"
+if [ "$PYTHON3_DIR" != "/usr/bin" ]; then
+  STUB_PATH="$STUB_PATH:$PYTHON3_DIR"
+fi
+STUB_PATH="$STUB_PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+
+echo "check_daily_feedback_rollup: running --dry-run against fixture"
+
+OUT_FILE="$WORKDIR/dry-run.ndjson"
+ERR_FILE="$WORKDIR/dry-run.err"
+
+set +e
+env -i \
+  PATH="$STUB_PATH" \
+  HOME="$WORKDIR" \
+  TMPDIR="$WORKDIR" \
+  GH_TOKEN="stub-token" \
+  REPO="owner/repo" \
+  ROLLUP_AGENT_AUTHORS="nathanjohnpayne:nathanpayne-claude" \
+  "$SCRIPT" --dry-run --since 2026-05-15 --until 2026-05-16 \
+  >"$OUT_FILE" 2>"$ERR_FILE"
+RC=$?
+set -e
+
+if [ "$RC" -ne 0 ]; then
+  echo "FAIL: --dry-run exited rc=$RC" >&2
+  echo "  stderr:" >&2
+  sed 's/^/    /' "$ERR_FILE" >&2 || true
+  exit 1
+fi
+
+# Assertions on the NDJSON output.
+LINES=$(wc -l < "$OUT_FILE" | tr -d ' ')
+if [ "$LINES" -ne 2 ]; then
+  echo "FAIL: expected 2 NDJSON lines (A substantive + C polish; B reply-skipped, D stale-skipped, E fix-skipped), got $LINES" >&2
+  cat "$OUT_FILE" >&2
+  echo "  stderr:" >&2
+  sed 's/^/    /' "$ERR_FILE" >&2
+  exit 1
+fi
+
+# Thread A — substantive (P1, untagged)
+if ! grep -q '"thread_id":"PRT_thread_a"' "$OUT_FILE"; then
+  echo "FAIL: thread A (P1 untagged) missing from output" >&2
+  cat "$OUT_FILE" >&2
+  exit 1
+fi
+if ! grep '"thread_id":"PRT_thread_a"' "$OUT_FILE" | grep -q '"track":"substantive"'; then
+  echo "FAIL: thread A should route to substantive (P1)" >&2
+  exit 1
+fi
+if ! grep '"thread_id":"PRT_thread_a"' "$OUT_FILE" | grep -q '"severity":"P1"'; then
+  echo "FAIL: thread A should classify as P1" >&2
+  exit 1
+fi
+
+# Thread B — must be FILTERED (substantive reply from agent)
+if grep -q '"thread_id":"PRT_thread_b"' "$OUT_FILE"; then
+  echo "FAIL: thread B (addressed-via-reply) should be filtered out" >&2
+  exit 1
+fi
+
+# Thread D — must be FILTERED (stale-head: originalCommit not in
+# commits.nodes). Locks in the regression fix: the prior naive
+# `orig_commit != head_oid` check would have incorrectly classified
+# Thread A (whose originalCommit matches headRefOid) as in-history
+# AND Thread D as stale; the new membership check produces the same
+# result for D but stops mis-classifying intermediate-commit threads.
+if grep -q '"thread_id":"PRT_thread_d"' "$OUT_FILE"; then
+  echo "FAIL: thread D (stale-head, originalCommit not in commits list) should be filtered out" >&2
+  exit 1
+fi
+
+# Thread E — must be FILTERED (addressed-via-fix: agent-author
+# commits at 07:00 + 07:30 are both AFTER the comment's createdAt of
+# 05:00). Validates the per-PR fix-commit heuristic that closes the
+# codex P1 r1 finding on this PR. The other threads' createdAts
+# (08:00+) are AFTER both commits, so the fix-gate doesn't fire for
+# them — keeping the substantive/polish routing assertions intact.
+if grep -q '"thread_id":"PRT_thread_e"' "$OUT_FILE"; then
+  echo "FAIL: thread E (addressed-via-fix: agent commit after comment) should be filtered out" >&2
+  exit 1
+fi
+
+# Thread C — polish (P3, tagged nitpick-noted)
+if ! grep -q '"thread_id":"PRT_thread_c"' "$OUT_FILE"; then
+  echo "FAIL: thread C (tagged nitpick-noted P3) missing from output" >&2
+  cat "$OUT_FILE" >&2
+  exit 1
+fi
+if ! grep '"thread_id":"PRT_thread_c"' "$OUT_FILE" | grep -q '"track":"polish"'; then
+  echo "FAIL: thread C should route to polish (P3)" >&2
+  exit 1
+fi
+if ! grep '"thread_id":"PRT_thread_c"' "$OUT_FILE" | grep -q '"tag_note":"tagged: nitpick-noted"'; then
+  echo "FAIL: thread C should carry the canonical tag note" >&2
+  grep '"thread_id":"PRT_thread_c"' "$OUT_FILE" >&2
+  exit 1
+fi
+
+# Stable item IDs must be present + 12 chars
+if ! grep -oE '"item_id":"[a-f0-9]{12}"' "$OUT_FILE" | head -1 >/dev/null; then
+  echo "FAIL: item_id markers missing or wrong shape" >&2
+  cat "$OUT_FILE" >&2
+  exit 1
+fi
+
+echo "check_daily_feedback_rollup: PASS (unit tests + 5-case --dry-run smoke)"
+exit 0
