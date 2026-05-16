@@ -64,8 +64,21 @@ UNTIL=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=true; shift ;;
-    --since) SINCE="$2"; shift 2 ;;
-    --until) UNTIL="$2"; shift 2 ;;
+    --since)
+      # Arity guard: `--since` without a value would crash with
+      # `$2: unbound variable` under set -u. Surface a clean usage
+      # error instead (CodeRabbit Minor r4 on PR #303).
+      if [ $# -lt 2 ]; then
+        echo "Error: --since requires a value (YYYY-MM-DD or RFC3339 timestamp)" >&2
+        exit 1
+      fi
+      SINCE="$2"; shift 2 ;;
+    --until)
+      if [ $# -lt 2 ]; then
+        echo "Error: --until requires a value (YYYY-MM-DD or RFC3339 timestamp)" >&2
+        exit 1
+      fi
+      UNTIL="$2"; shift 2 ;;
     --help|-h) sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Error: unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -166,6 +179,12 @@ COUNT_STALE=0
 COUNT_TAGGED_SKIP=0
 COUNT_TAGGED_SURFACE=0
 COUNT_DEFERRED_UNTAGGED=0
+# Tracks per-PR GraphQL failures so the run can exit non-zero at the
+# end. v1 has no persistence/dedupe — silently dropping a transient
+# failure's PR data means missing triage signal that never recovers
+# (the daily window slides forward). CodeRabbit Major r4 on PR #303.
+FAILED_PR_COUNT=0
+FAILED_PR_LIST=""
 
 # Per-track NDJSON streams. Each surviving item gets one line.
 SUBSTANTIVE_NDJSON=$(mktemp "${TMPDIR:-/tmp}/rollup-sub-XXXXXX.ndjson")
@@ -228,12 +247,18 @@ while [ "$i" -lt "$pr_count" ]; do
       }
     }' \
     -F owner="$OWNER" -F name="$NAME" -F pr="$pr_number") || {
-    # Per-PR failure: log + skip rather than abort the whole rollup.
-    # A single PR's GraphQL fetch can fail transiently (rate limit on
-    # a specific repo, lock contention) without invalidating the rest
-    # of the day's work. The per-run-level `gh pr list` above DOES
-    # fail-closed because that failure means we have no data at all.
-    echo "daily-feedback-rollup: WARN gh api graphql failed for $REPO#$pr_number; skipping" >&2
+    # Per-PR failure: log, track, continue. v1 has no persistence/
+    # dedupe — silently dropping a PR's threads on transient failure
+    # means missing triage signal that never recovers (the daily
+    # window slides forward and the missed threads stay "resolved
+    # without rationale" forever). Continue past this PR so the rest
+    # of the day's data still surfaces, but record the failure so
+    # the script can exit non-zero at the end and the workflow can
+    # be retried via `workflow_dispatch` with the same --since/--until
+    # to reconstruct the missing data. CodeRabbit Major r4 on PR #303.
+    echo "daily-feedback-rollup: WARN gh api graphql failed for $REPO#$pr_number; threads NOT classified for this PR" >&2
+    FAILED_PR_COUNT=$((FAILED_PR_COUNT + 1))
+    FAILED_PR_LIST="${FAILED_PR_LIST:+$FAILED_PR_LIST,}$pr_number"
     continue
   }
 
@@ -545,15 +570,39 @@ unchecked_count_on() {
   # rest of the codebase (which uses `[[:space:]]`) keeps the
   # check_mktemp_portability-style regex audits happy
   # (CodeRabbit Major r1 on PR #303).
+  #
+  # Fail-closed on API errors: if `gh issue view` fails, abort the
+  # run with exit 2 rather than treating "couldn't read" as
+  # "0 unchecked items." The latter would skip throttling and
+  # potentially create a duplicate rollup issue, which is a worse
+  # operator experience than a clean failure. CodeRabbit Major r4
+  # on PR #303.
   local issue_number="$1"
-  gh issue view "$issue_number" --repo "$REPO" --json body --jq '.body' \
+  local body
+  if ! body=$(gh issue view "$issue_number" --repo "$REPO" --json body --jq '.body'); then
+    echo "daily-feedback-rollup: ERROR — could not read body of issue #$issue_number for throttle check; aborting rather than risk a duplicate rollup" >&2
+    exit 2
+  fi
+  # `grep -c` returns 1 when no matches found, which under set -e is
+  # propagated. `|| true` here is the no-match case, NOT an error-
+  # suppression — the API call already succeeded above.
+  printf '%s' "$body" \
     | grep -cE '^[[:space:]]*-[[:space:]]*\[[[:space:]]*\][[:space:]]' || true
 }
 
 most_recent_open_rollup() {
+  # Fail-closed: a `gh issue list` failure that gets swallowed as
+  # "no existing rollup" would create a duplicate rollup issue on
+  # transient API errors. Exit 2 instead. CodeRabbit Major r4 on PR
+  # #303.
   local label="$1"
-  gh issue list --repo "$REPO" --state open --label "$label" \
-    --limit 1 --json number,title --jq '.[0].number // ""'
+  local out
+  if ! out=$(gh issue list --repo "$REPO" --state open --label "$label" \
+       --limit 1 --json number,title --jq '.[0].number // ""'); then
+    echo "daily-feedback-rollup: ERROR — could not list existing '$label' rollup issues for throttle check; aborting rather than risk a duplicate rollup" >&2
+    exit 2
+  fi
+  printf '%s' "$out"
 }
 
 # Idempotently create the track label if it doesn't already exist in
@@ -613,7 +662,10 @@ post_or_append() {
   body=$(render_rollup_body "$ndjson_file" "$track")
 
   local existing=""
-  existing=$(most_recent_open_rollup "$label" || true)
+  # No `|| true` here: most_recent_open_rollup now fails-closed (exit 2)
+  # on API errors. The empty-string return value is a legitimate
+  # "no existing rollup found" signal (no label matches yet).
+  existing=$(most_recent_open_rollup "$label")
 
   if [ -n "$existing" ]; then
     local unchecked
@@ -634,5 +686,15 @@ post_or_append "$SUBSTANTIVE_NDJSON" "substantive" "$SUBSTANTIVE_LABEL" \
   "$SUBSTANTIVE_THROTTLE" "${SUBSTANTIVE_LABEL} ${DATE_STAMP}"
 post_or_append "$POLISH_NDJSON" "polish" "$POLISH_LABEL" \
   "$POLISH_THROTTLE" "${POLISH_LABEL} ${DATE_STAMP}"
+
+# Exit non-zero if any per-PR GraphQL fetch failed (CodeRabbit Major
+# r4 on PR #303). The rollup may still have posted SOME data — the
+# log line above tells the operator which PRs are missing so they
+# can re-run via `workflow_dispatch --since X --until X` to pick up
+# the missed threads.
+if [ "$FAILED_PR_COUNT" -gt 0 ]; then
+  echo "daily-feedback-rollup: ERROR — $FAILED_PR_COUNT PR(s) failed to fetch threads (PRs: $FAILED_PR_LIST). The rollup published includes what we did fetch; re-run with the same --since/--until once the API recovers to backfill the missing data." >&2
+  exit 2
+fi
 
 echo "daily-feedback-rollup: done" >&2
