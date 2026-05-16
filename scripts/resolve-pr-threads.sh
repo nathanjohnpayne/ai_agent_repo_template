@@ -14,6 +14,7 @@
 # Usage:
 #   scripts/resolve-pr-threads.sh <PR#> [--repo owner/name] [--list]
 #                                 [--auto-resolve-bots] [--dry-run]
+#                                 [--rationale <text>] [--no-tag-reply]
 #
 # Modes:
 #   --list                  List unresolved threads with author + path +
@@ -34,8 +35,48 @@
 #                           resolved regardless of mode.
 #   --dry-run               With --auto-resolve-bots, print what would
 #                           be resolved without mutating.
+#   --rationale <text>      With --auto-resolve-bots, override the
+#                           auto-synthesized class with a free-form
+#                           rationale. Class defaults to
+#                           `deferred-to-followup` (most common manual
+#                           case); the free-form text follows the tag.
+#                           Useful when the auto-heuristic would
+#                           misclassify (e.g. P2 deferred to a tracked
+#                           follow-up issue). Implies tag-reply emission.
+#   --no-tag-reply          With --auto-resolve-bots, suppress the
+#                           pre-resolution `[mergepath-resolve:<class>]`
+#                           reply emission. The resolve mutation still
+#                           runs. Useful for dry-rehearsal of the
+#                           resolve loop without polluting the thread
+#                           history. The default IS to emit the tag —
+#                           the v1 daily rollup classifier reads it.
 #
 # Default mode (no flags): equivalent to --list.
+#
+# Tag emission (mergepath#305):
+#   When --auto-resolve-bots runs WITHOUT --no-tag-reply, the helper
+#   posts a one-line reply on each bot thread BEFORE the resolve
+#   mutation:
+#
+#     [mergepath-resolve: <class>] <one-line rationale>
+#
+#   where `<class>` is one of (taxonomy mirrored from the v1 daily
+#   rollup classifier in scripts/lib/daily-feedback-rollup-helpers.sh):
+#     addressed-elsewhere   fix-commit by an agent author after the
+#                           comment's createdAt, touching the anchored
+#                           file (or any file when per-file detection
+#                           is unavailable)
+#     canonical-coverage    path matches a canonical entry in
+#                           .mergepath-sync.yml (propagated content)
+#     nitpick-noted         severity is Nitpick/Trivial/P3 and no
+#                           stronger signal applies
+#     rebuttal-recorded     a substantive agent-authored reply (≥30
+#                           chars) is on the thread
+#     deferred-to-followup  default fallback / --rationale override
+#
+#   Tag emission failure is logged + skipped (does NOT block the
+#   resolve mutation). The rollup's classifier accepts any string
+#   matching the regex; unknown classes route to "surface" per spec.
 #
 # Exit codes:
 #   0 — no unresolved threads
@@ -68,10 +109,17 @@ usage() {
   cat <<'EOF' >&2
 Usage: scripts/resolve-pr-threads.sh <PR#> [--repo owner/name] [--list]
                                             [--auto-resolve-bots] [--dry-run]
+                                            [--rationale <text>] [--no-tag-reply]
 
   --list                List unresolved threads (default).
   --auto-resolve-bots   Resolve bot-authored threads on current HEAD.
   --dry-run             With --auto-resolve-bots, print without mutating.
+  --rationale <text>    With --auto-resolve-bots, free-form rationale
+                        appended after the [mergepath-resolve: deferred-to-followup]
+                        tag (overrides auto-classification).
+  --no-tag-reply        With --auto-resolve-bots, suppress the
+                        [mergepath-resolve:<class>] reply emission
+                        (the resolve mutation still runs).
 EOF
   exit 1
 }
@@ -80,6 +128,9 @@ PR_NUM=""
 REPO=""
 MODE="list"
 DRY_RUN=false
+RATIONALE_OVERRIDE=""
+RATIONALE_FLAG_USED=false
+NO_TAG_REPLY=false
 # Match both REST and GraphQL bot-login formats. The REST API returns
 # `coderabbitai[bot]`; GraphQL `author{login}` returns `coderabbitai`
 # (un-suffixed user-facing handle). The trailing `(\[bot\])?` accepts
@@ -103,6 +154,18 @@ while [ $# -gt 0 ]; do
     --list) MODE="list"; shift ;;
     --auto-resolve-bots) MODE="auto-resolve-bots"; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
+    --rationale)
+      # Same defensive value check as --repo (Codex r2 on PR #172):
+      # require an explicit non-empty argument so a trailing
+      # `--rationale` doesn't silently produce an empty tag body.
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "Error: --rationale requires a non-empty value" >&2
+        usage
+      fi
+      RATIONALE_OVERRIDE="$2"
+      RATIONALE_FLAG_USED=true
+      shift 2 ;;
+    --no-tag-reply) NO_TAG_REPLY=true; shift ;;
     -h|--help) usage ;;
     -*) echo "Unknown flag: $1" >&2; usage ;;
     *)
@@ -249,6 +312,23 @@ QUERY='
                 commit { oid }
               }
             }
+            # `allComments` powers the rationale-tag class derivation
+            # (mergepath#305): scan agent-authored replies for an
+            # existing `[mergepath-resolve:...]` tag (skip re-emission)
+            # and substantive rebuttal detection (≥30 chars from an
+            # agent author → `rebuttal-recorded`).
+            #
+            # Cap at first 50 — same conservative limit as commentsFirst.
+            # A thread deep enough to exceed 50 replies during one
+            # auto-resolve invocation is vanishingly rare and would
+            # already be a process-smell worth surfacing manually.
+            allComments: comments(first: 50) {
+              nodes {
+                author { login }
+                body
+                databaseId
+              }
+            }
           }
         }
       }
@@ -308,11 +388,15 @@ UNRESOLVED=$(echo "$THREADS_JSON" | jq -c '
       outdated: .isOutdated,
       # commentsFirst = original review (excerpt + author for display).
       # commentsLast = guaranteed-latest comment (HEAD anchor commit_oid).
+      # allComments = full reply chain for tag-emission heuristics
+      #   (mergepath#305): existing-tag detection + rebuttal scan.
       author: (.commentsFirst.nodes[0].author.login // "unknown"),
       path: (.commentsFirst.nodes[0].path // "(no path)"),
       created: (.commentsFirst.nodes[0].createdAt // ""),
       commit_oid: (.commentsLast.nodes[0].commit.oid // ""),
-      excerpt: ((.commentsFirst.nodes[0].body // "") | .[0:160])
+      body: (.commentsFirst.nodes[0].body // ""),
+      excerpt: ((.commentsFirst.nodes[0].body // "") | .[0:160]),
+      all_comments: (.allComments.nodes // [])
     }
 ')
 
@@ -381,6 +465,402 @@ if [ "${RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK:-0}" != "1" ] && ! $DRY_RUN; then
   fi
 fi
 
+# ---------------------------------------------------------------------
+# mergepath#305 — agent-side `[mergepath-resolve:<class>]` tag emission
+# ---------------------------------------------------------------------
+#
+# Before each resolveReviewThread mutation, post a one-line reply on
+# the thread with `[mergepath-resolve: <class>] <rationale>`. The
+# v1 daily rollup classifier in
+# scripts/lib/daily-feedback-rollup-helpers.sh reads this tag and
+# prioritizes it over its own heuristics. The taxonomy (the five
+# valid `<class>` values) MUST match what the classifier accepts —
+# unknown class strings route to "surface" per the rollup spec,
+# which is acceptable but defeats the purpose.
+#
+# We intentionally do NOT source the rollup helpers file: it is not
+# in .mergepath-sync.yml, and sourcing it would either break
+# propagation OR force the helpers to travel with the canonical
+# resolve script. Instead we inline the small bits we need here
+# (regex shape, agent-author check, severity sniff). The
+# canonical taxonomy lives in the helpers file's case-statement
+# comments — this script must stay in step.
+
+# is_agent_author_local <login> → exit 0 if agent, 1 otherwise.
+# Mirrors the helpers' `is_agent_author` exactly. Bash 3.2 compatible
+# (no associative arrays). Reads MERGEPATH_AGENT_AUTHORS (colon-sep)
+# with the same default set as the rollup helpers.
+: "${MERGEPATH_AGENT_AUTHORS:=nathanjohnpayne:nathanpayne-claude:nathanpayne-cursor:nathanpayne-codex}"
+is_agent_author_local() {
+  local login="$1"
+  local oldIFS="$IFS"
+  IFS=':'
+  set -- $MERGEPATH_AGENT_AUTHORS
+  IFS="$oldIFS"
+  for a; do
+    [ "$login" = "$a" ] && return 0
+  done
+  return 1
+}
+
+# classify_severity_local <body> → P0|P1|...|Nitpick|Trivial|Unknown
+# Mirrors the rollup helpers' classify_severity, anchored on the
+# first ~600 chars to avoid false-matching severity words deep in
+# quoted context.
+classify_severity_local() {
+  local body_head
+  body_head=$(printf '%s' "$1" | head -c 600)
+  case "$body_head" in
+    *"![P0 Badge]"*|*"P0 Badge"*) echo "P0"; return ;;
+    *"![P1 Badge]"*|*"P1 Badge"*) echo "P1"; return ;;
+    *"![P2 Badge]"*|*"P2 Badge"*) echo "P2"; return ;;
+    *"![P3 Badge]"*|*"P3 Badge"*) echo "P3"; return ;;
+    *"🟠 Major"*|*"Potential issue"*|*"⚠️"*) echo "Major"; return ;;
+    *"🧹 Nitpick"*|*Nitpick*) echo "Nitpick"; return ;;
+    *"🔵 Trivial"*|*Trivial*) echo "Trivial"; return ;;
+    *"Outside diff range"*) echo "Trivial"; return ;;
+    *Minor*) echo "Minor"; return ;;
+  esac
+  echo "Unknown"
+}
+
+# One-shot fetch of PR file paths + agent-author commits, used by
+# derive_tag_class for the addressed-elsewhere heuristic. Cached so
+# we make at most one REST call per resolve invocation regardless of
+# thread count. Failure is non-fatal: tag derivation falls back to
+# the rollup's per-PR weak heuristic if files can't be retrieved.
+PR_FILES_CACHE=""
+PR_COMMITS_CACHE=""
+TAG_DATA_FETCHED=false
+fetch_pr_tag_data() {
+  $TAG_DATA_FETCHED && return 0
+  TAG_DATA_FETCHED=true
+  # REST /pulls/{pr}/files and /pulls/{pr}/commits both paginate at
+  # 100 items per page. Without pagination, threads anchored on
+  # files beyond page 1 silently misclassify on PRs with >100
+  # changed files (Codex P2 on #308). We use a manual page loop
+  # rather than gh's --paginate so the URL stays in argv-position
+  # 2 (gh injects --paginate as $2, which breaks stubs that route
+  # on $2 — including test_resolve_pr_threads_rationale_tag.sh).
+  PR_FILES_CACHE=$(_fetch_paginated \
+    "repos/$OWNER/$NAME/pulls/$PR_NUM/files" \
+    '[.[].filename]')
+  # PR_COMMITS_CACHE now includes `sha` so synth_rationale can cite
+  # the matching commit. The predicate the rationale builds must
+  # match derive_tag_class's predicate (CodeRabbit major on #308).
+  PR_COMMITS_CACHE=$(_fetch_paginated \
+    "repos/$OWNER/$NAME/pulls/$PR_NUM/commits" \
+    '[.[] | {sha: (.sha // ""), login: (.author.login // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]')
+}
+
+# _fetch_paginated <base-url> <jq-projection> → JSON array on stdout.
+# Manually walks `?per_page=100&page=N` until a page returns fewer
+# than 100 items OR a defensive 50-page cap (5,000 items) is hit.
+# Falls back to `[]` on first-page failure so downstream treats as
+# match-any rather than under-classifying. Test stubs that return a
+# pre-transformed JSON array still work: this helper applies a
+# `--jq` projection that the stubs ignore (stubs return their own
+# canned output), and the per-page-merging stops naturally because
+# the canned single-page output has fewer than 100 items.
+_fetch_paginated() {
+  local base_url="$1"
+  local projection="$2"
+  local page=1
+  local max_pages=50
+  local merged='[]'
+  local raw count
+  while [ "$page" -le "$max_pages" ]; do
+    if ! raw=$(gh_pat api "${base_url}?per_page=100&page=${page}" \
+        --jq "$projection" 2>/dev/null); then
+      [ "$page" -eq 1 ] && { echo '[]'; return; }
+      break
+    fi
+    [ -z "${raw//[[:space:]]/}" ] && break
+    count=$(printf '%s' "$raw" | jq 'length' 2>/dev/null || echo 0)
+    [ "$count" -eq 0 ] && break
+    merged=$(printf '%s\n%s\n' "$merged" "$raw" | jq -s -c '.[0] + .[1]' 2>/dev/null || printf '%s' "$merged")
+    [ "$count" -lt 100 ] && break
+    page=$((page + 1))
+  done
+  printf '%s' "$merged"
+}
+
+# manifest_canonical_paths — extract canonical + kit paths from the
+# repo's .mergepath-sync.yml once. Cached. Returns a newline-separated
+# list of path strings (kit entries end with `/`, canonical entries
+# do not). Used to classify a thread as `canonical-coverage` when the
+# comment's anchored file matches a manifest entry.
+MANIFEST_PATHS_CACHE=""
+MANIFEST_FETCHED=false
+fetch_manifest_paths() {
+  $MANIFEST_FETCHED && return 0
+  MANIFEST_FETCHED=true
+  local manifest="$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
+  [ -f "$manifest" ] || return 0
+  # Prefer yq when available — same parser the manifest validator uses.
+  # Fall back to a grep-based extraction so the helper still functions
+  # in environments without yq (the rollup-classifier-side reading is
+  # the same shape).
+  if command -v yq >/dev/null 2>&1; then
+    MANIFEST_PATHS_CACHE=$(yq -r '.paths[].path' "$manifest" 2>/dev/null || true)
+  else
+    # Best-effort: read `- path: VALUE` lines. Tolerates surrounding
+    # whitespace and optional quotes.
+    MANIFEST_PATHS_CACHE=$(grep -E '^[[:space:]]*-[[:space:]]*path:' "$manifest" \
+      | sed -E 's/^[[:space:]]*-[[:space:]]*path:[[:space:]]*["'\'']?([^"'\'']+)["'\'']?[[:space:]]*$/\1/')
+  fi
+}
+
+# path_matches_manifest <file-path> → exit 0 on match, 1 otherwise.
+# A file matches a canonical entry if the manifest path equals the
+# file path, or if the manifest path ends with `/` (kit) and the file
+# starts with it.
+path_matches_manifest() {
+  local file_path="$1"
+  [ -z "$file_path" ] && return 1
+  [ "$file_path" = "(no path)" ] && return 1
+  fetch_manifest_paths
+  [ -z "$MANIFEST_PATHS_CACHE" ] && return 1
+  while IFS= read -r mp; do
+    [ -z "$mp" ] && continue
+    if [ "${mp: -1}" = "/" ]; then
+      case "$file_path" in
+        "$mp"*) return 0 ;;
+      esac
+    else
+      [ "$file_path" = "$mp" ] && return 0
+    fi
+  done <<< "$MANIFEST_PATHS_CACHE"
+  return 1
+}
+
+# Module-load-time: pin the manifest base. We resolve REPO_ROOT_FOR_MANIFEST
+# from the script's on-disk location, NOT $REPO (which is the gh repo
+# slug). This intentionally reads the LOCAL working-tree manifest —
+# the same file scripts/sync-to-downstream.sh authors against — so the
+# helper's canonical-coverage class agrees with what would actually
+# propagate.
+REPO_ROOT_FOR_MANIFEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# derive_tag_class — given the thread JSON (one line of UNRESOLVED),
+# return one of the rollup's class strings on stdout.
+#
+# Decision ladder (highest-confidence first; matches the
+# spec § Class taxonomy from issue #305):
+#   1. canonical-coverage     anchored path is in the manifest
+#   2. addressed-elsewhere    agent-author commit after createdAt
+#                             touching the anchored file
+#   3. rebuttal-recorded      ≥30-char agent-author reply on thread
+#   4. nitpick-noted          severity is Nitpick/Trivial/P3
+#   5. deferred-to-followup   fallback
+#
+# Why canonical-coverage wins over addressed-elsewhere: a finding on
+# a propagated canonical path is structurally a mergepath concern;
+# the rollup should route it to mergepath regardless of whether the
+# local PR happened to also touch the file. (Addressed-elsewhere is
+# stronger evidence for a one-off finding but doesn't say anything
+# about WHERE the durable fix should live.)
+derive_tag_class() {
+  local thread_json="$1"
+  local thread_path
+  local thread_created
+  local thread_body
+  thread_path=$(printf '%s' "$thread_json" | jq -r '.path // ""')
+  thread_created=$(printf '%s' "$thread_json" | jq -r '.created // ""')
+  thread_body=$(printf '%s' "$thread_json" | jq -r '.body // ""')
+
+  # 1. canonical-coverage
+  if path_matches_manifest "$thread_path"; then
+    echo "canonical-coverage"
+    return
+  fi
+
+  # 2. addressed-elsewhere — agent-author commit on PR with
+  # authoredDate > createdAt AND (file in PR's changed-files OR
+  # changed-files unavailable). Per-file precision when we can get
+  # it; falls back to the rollup's per-PR weak heuristic when the
+  # files endpoint is unreachable.
+  fetch_pr_tag_data
+  if [ -n "$thread_created" ] && [ -n "$PR_COMMITS_CACHE" ]; then
+    local file_match=false
+    if [ -n "$thread_path" ] && [ "$thread_path" != "(no path)" ]; then
+      if printf '%s' "$PR_FILES_CACHE" \
+         | jq -e --arg p "$thread_path" 'any(. == $p)' >/dev/null 2>&1; then
+        file_match=true
+      fi
+    fi
+    # When PR_FILES_CACHE failed to populate (network error → '[]'),
+    # treat as match-any so we fall back to the per-PR heuristic
+    # rather than under-classifying.
+    if [ "$PR_FILES_CACHE" = "[]" ] || [ -z "$PR_FILES_CACHE" ]; then
+      file_match=true
+    fi
+    if $file_match; then
+      local commit_count
+      commit_count=$(printf '%s' "$PR_COMMITS_CACHE" | jq 'length' 2>/dev/null || echo 0)
+      local i=0
+      while [ "$i" -lt "$commit_count" ]; do
+        local c_login
+        local c_date
+        c_login=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].login // \"\"")
+        c_date=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].date // \"\"")
+        if [ -n "$c_login" ] && [ -n "$c_date" ] \
+           && [ "$c_date" \> "$thread_created" ] \
+           && is_agent_author_local "$c_login"; then
+          # Short SHA on stdout would be nice — emit the class and
+          # let the caller render the SHA into the rationale.
+          echo "addressed-elsewhere"
+          return
+        fi
+        i=$((i + 1))
+      done
+    fi
+  fi
+
+  # 3. rebuttal-recorded — ≥30-char reply from an agent author.
+  # Skip index 0 (the original review comment).
+  local reply_count
+  reply_count=$(printf '%s' "$thread_json" | jq '.all_comments | length' 2>/dev/null || echo 0)
+  if [ "$reply_count" -gt 1 ]; then
+    local k=1
+    while [ "$k" -lt "$reply_count" ]; do
+      local r_login
+      local r_body_len
+      r_login=$(printf '%s' "$thread_json" | jq -r ".all_comments[$k].author.login // \"\"")
+      r_body_len=$(printf '%s' "$thread_json" | jq -r ".all_comments[$k].body // \"\" | length")
+      if [ -n "$r_login" ] && [ "$r_body_len" -ge 30 ] && is_agent_author_local "$r_login"; then
+        echo "rebuttal-recorded"
+        return
+      fi
+      k=$((k + 1))
+    done
+  fi
+
+  # 4. nitpick-noted
+  local sev
+  sev=$(classify_severity_local "$thread_body")
+  case "$sev" in
+    Nitpick|Trivial|P3) echo "nitpick-noted"; return ;;
+  esac
+
+  # 5. fallback
+  echo "deferred-to-followup"
+}
+
+# synth_rationale <class> <thread_json> → one-line free-form rationale
+# matching the class. Kept short (≤120 chars) so the reply stays
+# compact in the GitHub UI. The classifier reads only the tag in
+# brackets; the rationale is purely human-facing.
+synth_rationale() {
+  local class="$1"
+  local thread_json="$2"
+  local thread_path
+  local thread_created
+  thread_path=$(printf '%s' "$thread_json" | jq -r '.path // ""')
+  thread_created=$(printf '%s' "$thread_json" | jq -r '.created // ""')
+  local short_sha=""
+  case "$class" in
+    addressed-elsewhere)
+      # Surface the SHA of a commit that actually satisfies
+      # derive_tag_class's predicate (agent-authored AND
+      # authoredDate > thread_created). Re-run the same check here
+      # so the cited SHA matches the one that triggered the
+      # classification — otherwise we could cite a pre-thread
+      # commit that didn't qualify.
+      local commit_count i
+      commit_count=$(printf '%s' "$PR_COMMITS_CACHE" | jq 'length' 2>/dev/null || echo 0)
+      i=0
+      while [ "$i" -lt "$commit_count" ]; do
+        local c_login c_date c_sha
+        c_login=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].login // \"\"")
+        c_date=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].date // \"\"")
+        c_sha=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].sha // \"\"")
+        if [ -n "$c_login" ] && [ -n "$c_date" ] \
+           && { [ -z "$thread_created" ] || [ "$c_date" \> "$thread_created" ]; } \
+           && is_agent_author_local "$c_login"; then
+          short_sha="$c_sha"
+          break
+        fi
+        i=$((i + 1))
+      done
+      if [ -n "$short_sha" ] && [ -n "$thread_path" ] && [ "$thread_path" != "(no path)" ]; then
+        echo "addressed by commit ${short_sha:0:7} (touching $thread_path)."
+      elif [ -n "$short_sha" ]; then
+        echo "addressed by commit ${short_sha:0:7}."
+      else
+        echo "addressed by a follow-up commit on this PR."
+      fi
+      ;;
+    canonical-coverage)
+      if [ -n "$thread_path" ] && [ "$thread_path" != "(no path)" ]; then
+        echo "path $thread_path is propagated canonical content (.mergepath-sync.yml)."
+      else
+        echo "thread is on propagated canonical content (.mergepath-sync.yml)."
+      fi
+      ;;
+    nitpick-noted)
+      echo "nitpick/trivial severity; noted, no code change."
+      ;;
+    rebuttal-recorded)
+      echo "agent rebuttal posted on thread; resolving."
+      ;;
+    deferred-to-followup|*)
+      echo "deferred to follow-up; resolving for branch-protection conversation gate."
+      ;;
+  esac
+}
+
+# We also want to capture the SHA in PR_COMMITS_CACHE for the
+# rationale — re-pull with .sha included. (Earlier fetch_pr_tag_data
+# elided it to keep the cache small. Refetch in a backwards-compatible
+# way: only add the column when the original fetch already populated.)
+augment_pr_commits_with_sha() {
+  $TAG_DATA_FETCHED || return 0
+  # If already augmented (cache has .sha), skip.
+  if printf '%s' "$PR_COMMITS_CACHE" | jq -e '.[0].sha // empty' >/dev/null 2>&1; then
+    return 0
+  fi
+  PR_COMMITS_CACHE=$(gh_pat api "repos/$OWNER/$NAME/pulls/$PR_NUM/commits?per_page=100" \
+    --jq '[.[] | {sha: .sha, login: (.author.login // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]' 2>/dev/null || echo "$PR_COMMITS_CACHE")
+}
+
+# post_tag_reply — emit a `[mergepath-resolve: <class>] <rationale>`
+# reply on the thread via the GraphQL addPullRequestReviewThreadReply
+# mutation. Logs and returns non-zero on failure; the caller should
+# log a warning and proceed to the resolve mutation regardless.
+#
+# The mutation requires the `pullRequestReviewThreadId` (the same id
+# resolveReviewThread takes) plus a body. The reply author follows
+# the PAT used for the call — same identity verification as the
+# resolve mutation, no separate gate needed.
+post_tag_reply() {
+  local thread_id="$1"
+  local class="$2"
+  local rationale="$3"
+  local body
+  body="[mergepath-resolve: $class] $rationale"
+  # Suppress stdout (the mutation response is noise), but capture
+  # stderr for failure-mode logging. The redirection order matters:
+  # `2>&1 1>/dev/null` first dups stderr to stdout (so it lands in
+  # the command substitution), then redirects the original stdout to
+  # /dev/null. The reversed form (`>/dev/null 2>&1`) discards both
+  # streams and leaves $err empty — see #shellcheck SC2327/SC2328.
+  local err
+  if ! err=$(gh_pat api graphql \
+    -f query='mutation($id: ID!, $body: String!) {
+      addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $id, body: $body}) {
+        comment { id }
+      }
+    }' \
+    -F id="$thread_id" \
+    -F body="$body" \
+    2>&1 1>/dev/null); then
+    printf 'tag-reply mutation failed: %s\n' "$err" >&2
+    return 1
+  fi
+  return 0
+}
+
 # auto-resolve-bots mode: resolve bot threads, leave human threads alone.
 # Use process substitution (`< <(...)`) instead of `echo $UNRESOLVED | while`
 # so the loop runs in the parent shell — counter increments survive past the
@@ -390,6 +870,9 @@ SKIPPED_HUMAN=0
 SKIPPED_STALE=0
 WOULD_RESOLVE_COUNT=0
 FAILED_COUNT=0
+TAG_REPLY_POSTED=0
+TAG_REPLY_FAILED=0
+TAG_REPLY_SKIPPED=0
 while IFS= read -r thread; do
   AUTHOR=$(echo "$thread" | jq -r .author)
   THREAD_ID=$(echo "$thread" | jq -r .id)
@@ -435,6 +918,54 @@ while IFS= read -r thread; do
     continue
   fi
 
+  # mergepath#305 — emit `[mergepath-resolve: <class>] <rationale>`
+  # reply BEFORE the resolve mutation. The classifier in
+  # scripts/lib/daily-feedback-rollup-helpers.sh reads this tag and
+  # prioritizes it over its own heuristics; the tag therefore must
+  # land on the thread BEFORE the thread is resolved (otherwise the
+  # rollup that runs next is reading a closed thread with no marker).
+  #
+  # Failure to post the tag is logged + counted, but does NOT block
+  # the resolve mutation. The rollup's heuristic fallback is the same
+  # behavior the script had before #305 — losing the tag is a soft
+  # regression, not a correctness bug.
+  if ! $NO_TAG_REPLY; then
+    if $RATIONALE_FLAG_USED; then
+      tag_class="deferred-to-followup"
+      tag_rationale="$RATIONALE_OVERRIDE"
+    else
+      # Warm the tag-data cache (PR_FILES_CACHE / PR_COMMITS_CACHE +
+      # the TAG_DATA_FETCHED guard) in THIS shell BEFORE the command-
+      # substitution subshells below. Without this, fetch_pr_tag_data
+      # runs inside derive_tag_class's subshell, populates the caches
+      # in that subshell, and the parent shell never sees them — so
+      # synth_rationale (also in a subshell) finds PR_COMMITS_CACHE
+      # empty, emits `[: : integer expression expected` on line ~773,
+      # and falls back to the generic no-SHA rationale. nathanpayne-
+      # codex Phase 4b on #308 reproduced this with a page-2 files
+      # fixture. Calling here also fulfills the "one-shot cache reused
+      # across threads" intention — fetch_pr_tag_data's TAG_DATA_FETCHED
+      # short-circuit only works if it's set in the loop's shell.
+      fetch_pr_tag_data
+      # Need the augmented commits cache (with .sha) for the
+      # addressed-elsewhere rationale; the bare cache from
+      # fetch_pr_tag_data doesn't carry .sha. derive_tag_class only
+      # needs login + date so it runs against either shape.
+      augment_pr_commits_with_sha
+      tag_class=$(derive_tag_class "$thread")
+      tag_rationale=$(synth_rationale "$tag_class" "$thread")
+    fi
+    if post_tag_reply "$THREAD_ID" "$tag_class" "$tag_rationale"; then
+      echo "  TAGGED [$AUTHOR] $PATH_ → [mergepath-resolve: $tag_class]"
+      TAG_REPLY_POSTED=$((TAG_REPLY_POSTED + 1))
+    else
+      echo "  WARN: tag-reply post failed for [$AUTHOR] $PATH_ (resolving anyway)" >&2
+      TAG_REPLY_FAILED=$((TAG_REPLY_FAILED + 1))
+    fi
+  else
+    TAG_REPLY_SKIPPED=$((TAG_REPLY_SKIPPED + 1))
+  fi
+
   # Identity check moved out of the loop in #293 r2 — see the
   # single-gate block above the loop.
   if gh_pat api graphql -f query='
@@ -469,6 +1000,9 @@ if $DRY_RUN; then
   exit 0
 fi
 echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Failed: $FAILED_COUNT"
+if ! $NO_TAG_REPLY; then
+  echo "Tag replies: posted=$TAG_REPLY_POSTED  failed=$TAG_REPLY_FAILED"
+fi
 # Codex r1 on PR #172: previously this exited 0 even with stale or
 # human-authored threads remaining — callers would treat it as "all
 # clear" and proceed to merge into a still-BLOCKED PR. Exit codes:

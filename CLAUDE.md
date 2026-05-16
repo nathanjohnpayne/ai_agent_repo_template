@@ -193,6 +193,58 @@ keyring active is your agent identity. No switch needed for commits.
      human-authored threads must be resolved via the GitHub UI or by
      asking the human; the helper refuses to touch them.
 
+     **Rationale-tag emission (mergepath#305).** Before each resolve
+     mutation, the helper posts a one-line reply on the thread with
+     `[mergepath-resolve: <class>] <rationale>`. The v1 daily rollup
+     classifier reads this tag and prioritizes it over its own
+     heuristics, so unresolved-feedback rollups attribute resolves
+     accurately instead of guessing from commit timestamps. Valid
+     `<class>` values (taxonomy mirrored from
+     `scripts/lib/daily-feedback-rollup-helpers.sh`). Listed in the
+     ladder order the resolver actually applies (first match wins):
+
+     - `canonical-coverage` — anchored path matches a canonical
+       entry in `.mergepath-sync.yml` (propagated content). Wins
+       over `addressed-elsewhere` because a finding on propagated
+       canonical content is structurally a mergepath concern
+       regardless of whether the local PR's fix commit also
+       happened to touch the file.
+     - `addressed-elsewhere` — fix-commit by an agent author after
+       the comment's createdAt, touching the anchored file.
+     - `rebuttal-recorded` — ≥30-char agent-authored reply already
+       on the thread.
+     - `nitpick-noted` — severity is Nitpick/Trivial/P3, no
+       stronger signal applies.
+     - `deferred-to-followup` — default fallback / `--rationale`
+       override.
+
+     The helper auto-classifies via the ladder above. To override
+     for a manual case (e.g. deferring a P2 to a tracked follow-up
+     issue), pass `--rationale "free-form text"` — class is forced
+     to `deferred-to-followup` and the free-form text follows the
+     tag verbatim. To suppress tag emission entirely (e.g. dry-
+     rehearsing the resolve loop without polluting thread history),
+     pass `--no-tag-reply`; the resolve mutation still runs.
+
+     Tag-reply failure (network blip, mutation rejected) is logged
+     and the resolve continues — losing the tag is a soft regression
+     (the rollup falls back to its own heuristics), not a
+     correctness bug.
+
+     Examples:
+
+     ```bash
+     # Default — helper picks the class per the decision ladder.
+     scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots
+
+     # Manual override with custom rationale (forces deferred-to-followup).
+     scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots \
+         --rationale "P2 noted; deferred to mergepath canonical follow-up #280"
+
+     # Suppress tag-reply (resolve only).
+     scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots --no-tag-reply
+     ```
+
      **Escape hatch — if the script reports clean but merge fails.**
      If `scripts/resolve-pr-threads.sh` exits 0 ("no unresolved
      threads") AND the merge attempt errors with `GraphQL: All
