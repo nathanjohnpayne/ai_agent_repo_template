@@ -638,13 +638,28 @@ filter_ndjson_against_triaged() {
   # filter each NDJSON line. We use a single jq invocation per stream
   # rather than a per-line shell loop (10x faster on real-world
   # rollups with >50 items).
-  jq -R -s '
+  if ! jq -R -s '
     split("\n") | map(select(length > 0)) | reduce .[] as $id ({}; . + {($id): true})
-  ' < "$TRIAGED_IDS_FILE" > "$tmp.set"
+  ' < "$TRIAGED_IDS_FILE" > "$tmp.set"; then
+    echo "daily-feedback-rollup: ERROR — failed to build dedupe set from $TRIAGED_IDS_FILE" >&2
+    rm -f "$tmp.set" "$tmp"
+    exit 2
+  fi
 
-  jq -c --slurpfile triagedSet "$tmp.set" '
+  # No `|| true` here: jq failure (parse error, runtime fault, bad
+  # NDJSON line) would silently truncate the stream and the dedupe
+  # filter would over-skip — contradicting the script's silent-data-
+  # loss-prevention contract (CodeRabbit Major r1 on PR #307). Fail-
+  # closed instead: exit 2 with a clean diagnostic, leaving the temp
+  # files trapped for cleanup by the EXIT trap. The operator's retry
+  # path is identical to the per-PR-fetch failure case above.
+  if ! jq -c --slurpfile triagedSet "$tmp.set" '
     select(.item_id as $id | ($triagedSet[0][$id] // false) | not)
-  ' < "$stream" > "$tmp.out" || true
+  ' < "$stream" > "$tmp.out"; then
+    echo "daily-feedback-rollup: ERROR — dedupe filter failed while processing $stream (jq runtime error?)" >&2
+    rm -f "$tmp.set" "$tmp.out" "$tmp"
+    exit 2
+  fi
 
   mv "$tmp.out" "$stream"
   rm -f "$tmp.set" "$tmp"
