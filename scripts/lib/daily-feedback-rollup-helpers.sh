@@ -126,3 +126,104 @@ body_excerpt() {
   local max="${2:-200}"
   printf '%s' "$1" | tr '\n\r\t' '   ' | head -c "$max"
 }
+
+# parse_triaged_ids_from_body <rollup-body> → newline-separated mp-ids
+#
+# Scans a prior rollup issue body line-by-line and emits, on stdout,
+# the `mp-id` of every line item considered "already triaged" — i.e.
+# excluded from future rollups (issue #304 dedupe pass).
+#
+# Triage signals recognised on a single rollup line:
+#   - Checkbox `[x]` or `[X]`              → fix landed / won't-fix / followup-filed
+#   - Checkbox `[~]` or `[-]`              → N/A / not-relevant
+#   - Strikethrough wrapping the bullet    → `~~- [ ] ... ~~`
+#   - A `#N` issue reference on the line   → follow-up filed
+#
+# Caller is responsible for the **closed host issue** signal: if the
+# rollup issue itself is closed, the caller should treat every mp-id
+# from its body as triaged (regardless of per-line state). We don't
+# do it here because this helper has no view of issue state — it gets
+# only the body text. The caller can use this helper's output for the
+# "closed-host implies all triaged" branch by re-running it with a
+# fall-through: parse_all_ids_from_body for closed hosts (skip the
+# per-line signal check). For simplicity, this helper exposes a
+# second mode via `parse_all_ids_from_body`.
+#
+# Per-item follow-up-link granularity trade-off: a reply ON a specific
+# checklist line is not addressable in plain Markdown — replies live
+# in the issue-comment stream, not on a specific bullet. The spec
+# permits the simpler interpretation: "any `#N` reference on the
+# line itself counts as a follow-up signal for THAT line." Reply-
+# comments on the host issue that mention `#N` without anchoring to
+# a specific mp-id are intentionally NOT consumed here; the
+# follow-up-filed user signal is to drop the `#N` into the bullet
+# text itself, which the agent or human triaging the rollup can do
+# in one edit. This keeps the helper a pure body-string parser with
+# no API I/O.
+#
+# Bash 3.2 + POSIX awk compatible. Output is mp-id per line, no
+# duplicates (dedupe within the helper so the caller's set-membership
+# check is O(1) per candidate).
+parse_triaged_ids_from_body() {
+  # awk processes the body line-by-line, extracts the mp-id from
+  # `<!-- mp-id:XXXXXXXXXXXX -->`, and prints it only if the same line
+  # carries a triage signal. We use awk (not bash + grep loop) so a
+  # 200-line rollup body parses in a single subprocess. POSIX-portable
+  # awk patterns only (no gawk-specific regex shortcuts).
+  printf '%s\n' "$1" | awk '
+    {
+      line = $0
+      # 1) extract the mp-id, if any
+      if (match(line, /<!-- *mp-id:[a-f0-9]+ *-->/)) {
+        marker = substr(line, RSTART, RLENGTH)
+        # strip prefix/suffix and any surrounding whitespace
+        sub(/^<!-- *mp-id:/, "", marker)
+        sub(/ *-->$/, "", marker)
+        id = marker
+      } else {
+        next
+      }
+
+      triaged = 0
+
+      # 2) checkbox [x] / [X]  → fix-landed / won-fix / followup-filed
+      if (line ~ /\[[ \t]*[xX][ \t]*\]/) triaged = 1
+      # 3) checkbox [~] / [-]  → N/A
+      else if (line ~ /\[[ \t]*[~\-][ \t]*\]/) triaged = 1
+      # 4) strikethrough wrapping a bullet  → ~~- [ ] ... ~~
+      else if (line ~ /~~.*\[[ \t]*\][ \t]*.*~~/) triaged = 1
+      # 5) follow-up issue ref on the same line  → #N
+      #    The hash must be preceded by a word boundary (start of
+      #    line, whitespace, or common punctuation like `(`, `[`,
+      #    `,`, `;`). POSIX awk does NOT support `\b`, so we make
+      #    the leading-boundary explicit. The digit-only requirement
+      #    on `[0-9]+` already excludes URL anchors like
+      #    `pull/999#discussion_r1` (which have a letter after `#`),
+      #    so no trailing boundary is needed.
+      else if (line ~ /(^|[ \t(\[,;])#[0-9]+/) triaged = 1
+
+      if (triaged) {
+        print id
+      }
+    }
+  ' | awk '!seen[$0]++'
+}
+
+# parse_all_ids_from_body <rollup-body> → newline-separated mp-ids
+#
+# Like parse_triaged_ids_from_body but does NOT check triage signals
+# — emits every mp-id present in the body. Used by the caller for the
+# "closed host issue → all items triaged" branch (issue #304 spec's
+# implicit won't-fix rule for closed rollup hosts).
+parse_all_ids_from_body() {
+  printf '%s\n' "$1" | awk '
+    {
+      if (match($0, /<!-- *mp-id:[a-f0-9]+ *-->/)) {
+        marker = substr($0, RSTART, RLENGTH)
+        sub(/^<!-- *mp-id:/, "", marker)
+        sub(/ *-->$/, "", marker)
+        print marker
+      }
+    }
+  ' | awk '!seen[$0]++'
+}

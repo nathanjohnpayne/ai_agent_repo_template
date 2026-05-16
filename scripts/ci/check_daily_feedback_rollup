@@ -212,6 +212,41 @@ cat >"$FIXTURES/threads.json" <<'JSON'
 }
 JSON
 
+# ----- Fake prior rollup body (#304 dedupe pass) -----
+#
+# Thread A's stable mp-id is the SHA1[1:12] of "owner/repo#999:PRT_thread_a"
+# — we hardcode it here so the dedupe assertion is reproducible. If
+# item_id_for ever changes its hashing strategy, this fixture must be
+# refreshed in lockstep (and the unit tests would catch that first).
+THREAD_A_MPID="aa2b2e31d8f9"
+# Thread C is referenced as a follow-up issue `#888` on a different
+# rollup line to exercise the `#N` triage signal end-to-end.
+THREAD_C_MPID="1d9cdc0a026f"
+
+cat >"$FIXTURES/prior-substantive-rollups.json" <<JSON
+[
+  {
+    "number": 7001,
+    "state": "OPEN",
+    "body": "## owner/repo#900 (merged 2026-05-14, fix: prior PR)\n- [x] [scripts/old.sh:1](https://github.com/owner/repo/pull/900#discussion_r99) — \`chatgpt-codex-connector[bot]\` P1 [untagged]: \"fix landed in commit\" <!-- mp-id:${THREAD_A_MPID} -->\n- [ ] [scripts/another.sh:5](https://github.com/owner/repo/pull/900#discussion_r100) — \`coderabbitai[bot]\` Major [untagged]: \"still open elsewhere\" <!-- mp-id:9999deadbeef -->"
+  }
+]
+JSON
+
+cat >"$FIXTURES/prior-polish-rollups.json" <<JSON
+[
+  {
+    "number": 7002,
+    "state": "OPEN",
+    "body": "## owner/repo#901 (merged 2026-05-13, fix: polish prior)\n- [ ] [scripts/x.sh:1](https://github.com/owner/repo/pull/901#discussion_r200) — \`coderabbitai[bot]\` Nitpick [untagged]: \"polish, filed #888\" <!-- mp-id:${THREAD_C_MPID} -->"
+  }
+]
+JSON
+
+cat >"$FIXTURES/prior-empty.json" <<'JSON'
+[]
+JSON
+
 # ----- gh shim — dispatches on argv -----
 cat >"$BIN/gh" <<STUB
 #!/usr/bin/env bash
@@ -232,6 +267,41 @@ case "\$1" in
     # gh api graphql -f query='...' -F owner=... -F name=... -F pr=999
     # (we don't introspect the query — just return the fixture)
     cat "$FIXTURES/threads.json"
+    exit 0
+    ;;
+  issue)
+    # gh issue list --repo ... --label <label> --state all|open --search ... --limit ... --json number,state,body
+    # The dedupe pass (mergepath#304) calls this twice per track:
+    # once with --state all + closed:>= search, once with --state open.
+    # Dispatch on the --label value so substantive vs polish prior
+    # rollups can be different (and so an unrelated label returns []).
+    label=""
+    state=""
+    for ((i=1; i<=\$#; i++)); do
+      arg="\${!i}"
+      if [ "\$arg" = "--label" ]; then
+        next_i=\$((i + 1))
+        label="\${!next_i}"
+      elif [ "\$arg" = "--state" ]; then
+        next_i=\$((i + 1))
+        state="\${!next_i}"
+      fi
+    done
+    case "\$label" in
+      deferred-feedback-rollup)
+        # Substantive label: return prior rollup ONLY on the --state all
+        # call (which the dedupe pass uses for closed-in-window). The
+        # second --state open call returns the same OPEN rollup so the
+        # dedupe pass picks it up regardless of which branch hits.
+        cat "$FIXTURES/prior-substantive-rollups.json"
+        ;;
+      polish-feedback-rollup)
+        cat "$FIXTURES/prior-polish-rollups.json"
+        ;;
+      *)
+        cat "$FIXTURES/prior-empty.json"
+        ;;
+    esac
     exit 0
     ;;
   *)
@@ -283,37 +353,36 @@ if [ "$RC" -ne 0 ]; then
 fi
 
 # Assertions on the NDJSON output.
+#
+# Pre-#304 baseline was 2 NDJSON lines (Thread A substantive + Thread C
+# polish; B reply-skipped, D stale-skipped, E fix-skipped). With the
+# #304 dedupe pass active and prior rollups in the gh shim containing
+# Thread A's mp-id as `[x]` and Thread C's mp-id on a line with `#888`,
+# BOTH should now be dedupe-skipped — so the expected line count is 0.
 LINES=$(wc -l < "$OUT_FILE" | tr -d ' ')
-if [ "$LINES" -ne 2 ]; then
-  echo "FAIL: expected 2 NDJSON lines (A substantive + C polish; B reply-skipped, D stale-skipped, E fix-skipped), got $LINES" >&2
+if [ "$LINES" -ne 0 ]; then
+  echo "FAIL: expected 0 NDJSON lines after #304 dedupe pass (A + C both triaged on prior rollups), got $LINES" >&2
   cat "$OUT_FILE" >&2
   echo "  stderr:" >&2
   sed 's/^/    /' "$ERR_FILE" >&2
   exit 1
 fi
 
-# Thread A — substantive (P1, untagged)
-if ! grep -q '"thread_id":"PRT_thread_a"' "$OUT_FILE"; then
-  echo "FAIL: thread A (P1 untagged) missing from output" >&2
+# Thread A must be FILTERED — its mp-id appeared `[x]` on the prior
+# substantive rollup fixture (gh-shim returns prior-substantive-rollups.json).
+if grep -q '"thread_id":"PRT_thread_a"' "$OUT_FILE"; then
+  echo "FAIL: thread A should be dedupe-filtered (prior [x] in substantive rollup)" >&2
   cat "$OUT_FILE" >&2
   exit 1
 fi
-if ! grep '"thread_id":"PRT_thread_a"' "$OUT_FILE" | grep -q '"track":"substantive"'; then
-  echo "FAIL: thread A should route to substantive (P1)" >&2
-  exit 1
-fi
-if ! grep '"thread_id":"PRT_thread_a"' "$OUT_FILE" | grep -q '"severity":"P1"'; then
-  echo "FAIL: thread A should classify as P1" >&2
-  exit 1
-fi
 
-# Thread B — must be FILTERED (substantive reply from agent)
+# Thread B — still FILTERED (substantive reply from agent, classifier-level skip)
 if grep -q '"thread_id":"PRT_thread_b"' "$OUT_FILE"; then
   echo "FAIL: thread B (addressed-via-reply) should be filtered out" >&2
   exit 1
 fi
 
-# Thread D — must be FILTERED (stale-head: originalCommit not in
+# Thread D — still FILTERED (stale-head: originalCommit not in
 # commits.nodes). Locks in the regression fix: the prior naive
 # `orig_commit != head_oid` check would have incorrectly classified
 # Thread A (whose originalCommit matches headRefOid) as in-history
@@ -324,39 +393,41 @@ if grep -q '"thread_id":"PRT_thread_d"' "$OUT_FILE"; then
   exit 1
 fi
 
-# Thread E — must be FILTERED (addressed-via-fix: agent-author
+# Thread E — still FILTERED (addressed-via-fix: agent-author
 # commits at 07:00 + 07:30 are both AFTER the comment's createdAt of
-# 05:00). Validates the per-PR fix-commit heuristic that closes the
-# codex P1 r1 finding on this PR. The other threads' createdAts
-# (08:00+) are AFTER both commits, so the fix-gate doesn't fire for
-# them — keeping the substantive/polish routing assertions intact.
+# 05:00).
 if grep -q '"thread_id":"PRT_thread_e"' "$OUT_FILE"; then
   echo "FAIL: thread E (addressed-via-fix: agent commit after comment) should be filtered out" >&2
   exit 1
 fi
 
-# Thread C — polish (P3, tagged nitpick-noted)
-if ! grep -q '"thread_id":"PRT_thread_c"' "$OUT_FILE"; then
-  echo "FAIL: thread C (tagged nitpick-noted P3) missing from output" >&2
-  cat "$OUT_FILE" >&2
-  exit 1
-fi
-if ! grep '"thread_id":"PRT_thread_c"' "$OUT_FILE" | grep -q '"track":"polish"'; then
-  echo "FAIL: thread C should route to polish (P3)" >&2
-  exit 1
-fi
-if ! grep '"thread_id":"PRT_thread_c"' "$OUT_FILE" | grep -q '"tag_note":"tagged: nitpick-noted"'; then
-  echo "FAIL: thread C should carry the canonical tag note" >&2
-  grep '"thread_id":"PRT_thread_c"' "$OUT_FILE" >&2
-  exit 1
-fi
-
-# Stable item IDs must be present + 12 chars
-if ! grep -oE '"item_id":"[a-f0-9]{12}"' "$OUT_FILE" | head -1 >/dev/null; then
-  echo "FAIL: item_id markers missing or wrong shape" >&2
+# Thread C must be FILTERED — its mp-id appeared on a line with `#888`
+# follow-up reference on the prior polish rollup fixture (the `#N`
+# follow-up triage signal added in #304).
+if grep -q '"thread_id":"PRT_thread_c"' "$OUT_FILE"; then
+  echo "FAIL: thread C should be dedupe-filtered (prior #N follow-up ref in polish rollup)" >&2
   cat "$OUT_FILE" >&2
   exit 1
 fi
 
-echo "check_daily_feedback_rollup: PASS (unit tests + 5-case --dry-run smoke)"
+# Methodology counter (stderr): confirm the dedupe pass actually fired.
+# We want to see `dedup=2` in the per-track summary stderr line. This
+# is the load-bearing observable proving #304 is wired end-to-end.
+if ! grep -q 'dedup=2' "$ERR_FILE"; then
+  echo "FAIL: expected stderr summary to report dedup=2 (Threads A + C filtered by prior-rollup signals)" >&2
+  echo "  stderr:" >&2
+  sed 's/^/    /' "$ERR_FILE" >&2
+  exit 1
+fi
+
+# Confirm the prior-triaged set was assembled. Verifies both labels
+# were scanned (substantive + polish), so a regression that scans only
+# one would surface here.
+if ! grep -qE 'dedupe: [0-9]+ prior-triaged mp-id' "$ERR_FILE"; then
+  echo "FAIL: expected stderr to log the prior-triaged mp-id count" >&2
+  sed 's/^/    /' "$ERR_FILE" >&2
+  exit 1
+fi
+
+echo "check_daily_feedback_rollup: PASS (unit tests + 5-case --dry-run smoke + #304 dedupe)"
 exit 0
