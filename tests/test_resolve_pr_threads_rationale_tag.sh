@@ -36,6 +36,23 @@ SCRIPT="$ROOT/scripts/resolve-pr-threads.sh"
 pass=0
 fail=0
 
+# tag_before_resolve <argv-log> → 0 if reply call appears before resolve
+# call in the cumulative argv log, 1 otherwise. The script's contract
+# is "post tag reply BEFORE resolveReviewThread"; without this check,
+# tests would pass even if the helper accidentally inverted the order
+# (CodeRabbit Major r2 on #308). Uses grep -n line numbers because the
+# argv log preserves call sequence by append-only writes.
+tag_before_resolve() {
+  local log="$1"
+  local reply_line resolve_line
+  reply_line=$(grep -n 'addPullRequestReviewThreadReply' "$log" 2>/dev/null | head -1 | cut -d: -f1)
+  resolve_line=$(grep -n 'resolveReviewThread' "$log" 2>/dev/null | head -1 | cut -d: -f1)
+  if [ -z "$reply_line" ] || [ -z "$resolve_line" ]; then
+    return 1
+  fi
+  [ "$reply_line" -lt "$resolve_line" ]
+}
+
 SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH"' EXIT
 
@@ -220,7 +237,7 @@ out=$(
 rc=$?
 set -e
 
-if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: tag body contains [mergepath-resolve: addressed-elsewhere]"
 else
@@ -263,7 +280,7 @@ out=$(
 rc=$?
 set -e
 
-if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: canonical-coverage\]' "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -q 'FIELD: body=\[mergepath-resolve: canonical-coverage\]' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: tag body contains [mergepath-resolve: canonical-coverage]"
 else
@@ -307,7 +324,7 @@ out=$(
 rc=$?
 set -e
 
-if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: nitpick-noted\]' "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -q 'FIELD: body=\[mergepath-resolve: nitpick-noted\]' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: tag body contains [mergepath-resolve: nitpick-noted]"
 else
@@ -351,7 +368,7 @@ out=$(
 rc=$?
 set -e
 
-if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: tag body contains [mergepath-resolve: deferred-to-followup]"
 else
@@ -401,7 +418,7 @@ set -e
 # Both the class and the custom rationale must appear in the SAME
 # tag-reply field. The stub log writes one `FIELD:` line per -F arg
 # (the body is one such line: `FIELD: body=[mergepath-resolve: deferred-to-followup] P2 noted; ...`).
-if [ "$rc" -eq 0 ] && grep -qF "FIELD: body=[mergepath-resolve: deferred-to-followup] $CUSTOM_RATIONALE" "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -qF "FIELD: body=[mergepath-resolve: deferred-to-followup] $CUSTOM_RATIONALE" "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: override emitted deferred-to-followup tag with custom rationale text"
 else
@@ -434,15 +451,18 @@ out=$(
 rc=$?
 set -e
 
-# Negative assertion: no tag-reply field anywhere.
-# Positive assertion: rc == 0 AND the resolveReviewThread mutation
-# DID run — confirming "--no-tag-reply" suppresses tag emission
-# while leaving the resolve path intact (CodeRabbit Major on #308).
+# Tightened assertions (CodeRabbit Major r2 on #308):
+#   - rc == 0 — script exited cleanly
+#   - addPullRequestReviewThreadReply mutation NEVER ran — proves
+#     reply path is fully short-circuited (the prior body-text check
+#     was weaker: a reply with a non-tag body would have slipped past)
+#   - resolveReviewThread mutation DID run — proves "suppress tag,
+#     still resolve" contract
 if [ "$rc" -eq 0 ] \
-   && ! grep -q 'FIELD: body=\[mergepath-resolve:' "$GH_ARGV_LOG" \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG" \
    && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
-  echo "  PASS: --no-tag-reply suppressed tag emission and still resolved thread"
+  echo "  PASS: --no-tag-reply skipped reply mutation and still resolved thread"
 else
   fail=$((fail + 1))
   echo "  FAIL: --no-tag-reply behavior incorrect (rc=$rc, missing suppression or resolve)" >&2
@@ -492,7 +512,7 @@ out=$(
 rc=$?
 set -e
 
-if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: tag body contains [mergepath-resolve: rebuttal-recorded]"
 else
