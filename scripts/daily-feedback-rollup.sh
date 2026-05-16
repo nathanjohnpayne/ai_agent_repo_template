@@ -7,17 +7,20 @@
 # per track (substantive / polish), so the deferred-and-forgotten
 # class of feedback gets surfaced while the context is still hot.
 #
-# Implements the first slice of mergepath#299. The follow-ups
-# explicitly NOT in this slice:
+# Implements the first slice of mergepath#299 + the v2 dedupe pass
+# from mergepath#304. The remaining follow-up explicitly NOT in this
+# script:
 #
 #   - Agent-side `[mergepath-resolve:<class>]` tag emission in
 #     `scripts/resolve-pr-threads.sh`. This script reads the tag if
 #     present (forward-compatibility) and falls back to heuristics
 #     when it isn't.
-#   - Full triage-state persistence / dedupe-against-prior-rollups
-#     (the `<!-- mp-id:... -->` marker + 14-day window). v1 emits
-#     the stable IDs so a future PR can layer dedupe on top without
-#     a data migration; the dedupe logic itself is deferred.
+#
+# Dedupe pass (#304): before emitting today's per-track NDJSON, the
+# script fetches the set of already-triaged `mp-id`s from prior
+# rollups (open + recently-closed in the 14-day window) and filters
+# them out. Triage signals: `[x]`, `[~]`, strikethrough, `#N` ref on
+# the line, or a closed host issue (implies all its items triaged).
 #
 # Architecture mirrors `scripts/sweep-unresolved-feedback/enumerate.sh`
 # + `render.sh` but inverted: enumerate looks for UNresolved feedback
@@ -116,6 +119,14 @@ SUBSTANTIVE_THROTTLE="${ROLLUP_SUBSTANTIVE_THROTTLE:-5}"
 POLISH_THROTTLE="${ROLLUP_POLISH_THROTTLE:-20}"
 MAX_PRS_PER_DAY="${ROLLUP_MAX_PRS_PER_DAY:-100}"
 AGENT_AUTHORS="${ROLLUP_AGENT_AUTHORS:-nathanjohnpayne:nathanpayne-claude:nathanpayne-cursor:nathanpayne-codex}"
+# Dedupe window (in days): prior rollups closed more than N days ago
+# are presumed stale and their items re-list per #304 spec. Open
+# rollups always contribute regardless of age.
+DEDUPE_WINDOW_DAYS="${ROLLUP_DEDUPE_WINDOW_DAYS:-14}"
+# Cap on prior rollups to scan per label (safety net against runaway
+# label scopes). The 14-day window already bounds expected volume;
+# this is belt-and-suspenders.
+MAX_PRIOR_ROLLUPS_PER_LABEL="${ROLLUP_MAX_PRIOR_ROLLUPS_PER_LABEL:-50}"
 
 # Compute the window. Default: yesterday 00:00:00Z → today 00:00:00Z UTC.
 # BSD date (macOS) and GNU date have divergent flag syntax — try GNU first.
@@ -179,6 +190,15 @@ COUNT_STALE=0
 COUNT_TAGGED_SKIP=0
 COUNT_TAGGED_SURFACE=0
 COUNT_DEFERRED_UNTAGGED=0
+# Dedupe pass (#304): items skipped because their mp-id appears
+# triaged on a prior rollup issue (open in the 14-day window OR
+# closed in that window). Surfaces in the methodology footer.
+COUNT_DEDUP_SKIPPED=0
+# Tracks per-prior-rollup fetch failures so the script can warn but
+# continue: dedupe is best-effort — if we can't read a prior rollup,
+# the worst case is re-listing an already-triaged item, which is the
+# pre-#304 behaviour. Loud warn + continue beats fail-closed here.
+DEDUP_FETCH_FAILURES=0
 # Tracks per-PR GraphQL failures so the run can exit non-zero at the
 # end. v1 has no persistence/dedupe — silently dropping a transient
 # failure's PR data means missing triage signal that never recovers
@@ -482,11 +502,181 @@ while [ "$i" -lt "$pr_count" ]; do
   done
 done
 
+PRE_DEDUP_SUBSTANTIVE=$(wc -l < "$SUBSTANTIVE_NDJSON" | tr -d ' ')
+PRE_DEDUP_POLISH=$(wc -l < "$POLISH_NDJSON" | tr -d ' ')
+
+# ---------------------------------------------------------------------
+# Step 2.5 — dedupe against prior rollups (mergepath#304)
+# ---------------------------------------------------------------------
+#
+# Fetch open + recently-closed rollup issues (both tracks) within the
+# 14-day window, parse the `<!-- mp-id:... -->` markers off each
+# triaged line, and filter today's NDJSON streams to drop any mp-id
+# already in the triaged set.
+#
+# Triage signals (per parse_triaged_ids_from_body in the helpers):
+#   - `[x]` / `[X]`            → fix landed / won't-fix / followup-filed
+#   - `[~]` / `[-]`            → N/A / not-relevant
+#   - Strikethrough `~~...~~`  → preserves item visibility, excludes from re-list
+#   - `#N` ref on same line    → follow-up issue filed
+# Plus the implicit signal:
+#   - Closed host issue        → ALL its items are triaged
+#
+# Cross-track scan: a substantive item triaged on a prior polish-track
+# rollup also counts (and vice versa). Track-routing can flip across
+# days as severity classification changes; the mp-id is the canonical
+# identity, not the track. (Closes a foot-gun the spec didn't call
+# out explicitly but is the natural read.)
+
+TRIAGED_IDS_FILE=$(mktemp "${TMPDIR:-/tmp}/rollup-triaged-XXXXXX.ids")
+# Extend the EXIT trap to clean this up too.
+trap 'rm -f "$SUBSTANTIVE_NDJSON" "$POLISH_NDJSON" "$TRIAGED_IDS_FILE"' EXIT
+
+# Compute the dedupe-window cutoff. We pass it to `gh issue list` as
+# `closed:>=YYYY-MM-DD` so the search server-side filters out stale
+# closed rollups; open rollups aren't filtered (an open rollup is
+# triage-active regardless of age — the cap is just protection
+# against runaway label scopes).
+if date -u -d "@0" '+%Y-%m-%d' >/dev/null 2>&1; then
+  DEDUP_CUTOFF=$(date -u -d "${DEDUPE_WINDOW_DAYS} days ago" '+%Y-%m-%d')
+else
+  DEDUP_CUTOFF=$(date -u -v-"${DEDUPE_WINDOW_DAYS}"d '+%Y-%m-%d')
+fi
+
+# Fetch prior rollup issues for one label and append their triaged
+# mp-ids to TRIAGED_IDS_FILE. Best-effort: on transient API failure,
+# warn-and-continue rather than fail-closed — dedupe is an
+# optimisation, not a correctness invariant. (The post-create
+# atomicity gate above protects the all-or-nothing post path; the
+# dedupe pass is read-only and additive.)
+collect_triaged_ids_for_label() {
+  local label="$1"
+  local list_json
+  # Search query: every issue with this label that's either open OR
+  # closed within the dedupe window. The `is:issue` qualifier is
+  # implicit for `gh issue list`. The label scope is the rollup
+  # label; the `--search` filters by date.
+  if ! list_json=$(gh issue list \
+       --repo "$REPO" \
+       --label "$label" \
+       --state all \
+       --search "is:issue label:$label closed:>=$DEDUP_CUTOFF" \
+       --limit "$MAX_PRIOR_ROLLUPS_PER_LABEL" \
+       --json number,state,body 2>/dev/null); then
+    echo "daily-feedback-rollup: WARN dedupe: could not list prior '$label' rollups (best-effort, continuing)" >&2
+    DEDUP_FETCH_FAILURES=$((DEDUP_FETCH_FAILURES + 1))
+    return 0
+  fi
+  # Also fold in OPEN rollups (no date filter — open = live triage
+  # surface regardless of age). The earlier `gh issue list` with the
+  # `closed:>=` search excludes open issues (the search clause
+  # `closed:` doesn't match open ones), so we do a second pass.
+  local open_json
+  if ! open_json=$(gh issue list \
+       --repo "$REPO" \
+       --label "$label" \
+       --state open \
+       --limit "$MAX_PRIOR_ROLLUPS_PER_LABEL" \
+       --json number,state,body 2>/dev/null); then
+    echo "daily-feedback-rollup: WARN dedupe: could not list open '$label' rollups (best-effort, continuing)" >&2
+    DEDUP_FETCH_FAILURES=$((DEDUP_FETCH_FAILURES + 1))
+    open_json='[]'
+  fi
+  # Merge the two arrays, de-dupe on issue number (an open issue
+  # showing up only in `open_json`, a closed-in-window issue only in
+  # `list_json` — no overlap in normal cases, but unique just in
+  # case the search query semantics drift).
+  local merged
+  merged=$(jq -s '
+    (.[0] // []) + (.[1] // [])
+    | unique_by(.number)
+  ' <(printf '%s' "$list_json") <(printf '%s' "$open_json"))
+
+  local n
+  n=$(printf '%s' "$merged" | jq 'length')
+  local x=0
+  while [ "$x" -lt "$n" ]; do
+    local issue_state issue_body
+    issue_state=$(printf '%s' "$merged" | jq -r ".[$x].state")
+    issue_body=$(printf '%s' "$merged" | jq -r ".[$x].body // \"\"")
+    if [ "$issue_state" = "CLOSED" ] || [ "$issue_state" = "closed" ]; then
+      # Closed host → ALL mp-ids on this rollup are implicitly triaged.
+      parse_all_ids_from_body "$issue_body" >> "$TRIAGED_IDS_FILE"
+    else
+      # Open host → only lines with an explicit triage signal count.
+      parse_triaged_ids_from_body "$issue_body" >> "$TRIAGED_IDS_FILE"
+    fi
+    x=$((x + 1))
+  done
+}
+
+# Scan BOTH track labels. mp-ids are track-agnostic so cross-track
+# triage signals must apply.
+collect_triaged_ids_for_label "$SUBSTANTIVE_LABEL"
+collect_triaged_ids_for_label "$POLISH_LABEL"
+
+# De-dupe the triaged set (a single mp-id can appear on multiple
+# prior rollups via the throttling-append path).
+if [ -s "$TRIAGED_IDS_FILE" ]; then
+  sort -u "$TRIAGED_IDS_FILE" -o "$TRIAGED_IDS_FILE"
+fi
+TRIAGED_ID_COUNT=$(wc -l < "$TRIAGED_IDS_FILE" | tr -d ' ')
+echo "daily-feedback-rollup: dedupe: ${TRIAGED_ID_COUNT} prior-triaged mp-id(s) in 14-day window (window from ${DEDUP_CUTOFF})" >&2
+
+# Filter both NDJSON streams against TRIAGED_IDS_FILE. Track skipped
+# count per stream and update COUNT_DEDUP_SKIPPED.
+filter_ndjson_against_triaged() {
+  local stream="$1"
+  if [ ! -s "$stream" ] || [ ! -s "$TRIAGED_IDS_FILE" ]; then
+    return 0
+  fi
+  local tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/rollup-filter-XXXXXX.ndjson")
+  local pre post
+  pre=$(wc -l < "$stream" | tr -d ' ')
+  # jq -R reads raw text. Slurp the triaged IDs into a set, then
+  # filter each NDJSON line. We use a single jq invocation per stream
+  # rather than a per-line shell loop (10x faster on real-world
+  # rollups with >50 items).
+  if ! jq -R -s '
+    split("\n") | map(select(length > 0)) | reduce .[] as $id ({}; . + {($id): true})
+  ' < "$TRIAGED_IDS_FILE" > "$tmp.set"; then
+    echo "daily-feedback-rollup: ERROR — failed to build dedupe set from $TRIAGED_IDS_FILE" >&2
+    rm -f "$tmp.set" "$tmp"
+    exit 2
+  fi
+
+  # No `|| true` here: jq failure (parse error, runtime fault, bad
+  # NDJSON line) would silently truncate the stream and the dedupe
+  # filter would over-skip — contradicting the script's silent-data-
+  # loss-prevention contract (CodeRabbit Major r1 on PR #307). Fail-
+  # closed instead: exit 2 with a clean diagnostic, leaving the temp
+  # files trapped for cleanup by the EXIT trap. The operator's retry
+  # path is identical to the per-PR-fetch failure case above.
+  if ! jq -c --slurpfile triagedSet "$tmp.set" '
+    select(.item_id as $id | ($triagedSet[0][$id] // false) | not)
+  ' < "$stream" > "$tmp.out"; then
+    echo "daily-feedback-rollup: ERROR — dedupe filter failed while processing $stream (jq runtime error?)" >&2
+    rm -f "$tmp.set" "$tmp.out" "$tmp"
+    exit 2
+  fi
+
+  mv "$tmp.out" "$stream"
+  rm -f "$tmp.set" "$tmp"
+  post=$(wc -l < "$stream" | tr -d ' ')
+  local skipped=$((pre - post))
+  COUNT_DEDUP_SKIPPED=$((COUNT_DEDUP_SKIPPED + skipped))
+}
+
+filter_ndjson_against_triaged "$SUBSTANTIVE_NDJSON"
+filter_ndjson_against_triaged "$POLISH_NDJSON"
+
 SUBSTANTIVE_COUNT=$(wc -l < "$SUBSTANTIVE_NDJSON" | tr -d ' ')
 POLISH_COUNT=$(wc -l < "$POLISH_NDJSON" | tr -d ' ')
 
 echo "daily-feedback-rollup: classified substantive=$SUBSTANTIVE_COUNT polish=$POLISH_COUNT" \
-     "(skipped fix=$COUNT_FIX reply=$COUNT_REPLY stale=$COUNT_STALE tagged-skip=$COUNT_TAGGED_SKIP)" >&2
+     "(skipped fix=$COUNT_FIX reply=$COUNT_REPLY stale=$COUNT_STALE tagged-skip=$COUNT_TAGGED_SKIP dedup=$COUNT_DEDUP_SKIPPED)" \
+     "(pre-dedupe substantive=$PRE_DEDUP_SUBSTANTIVE polish=$PRE_DEDUP_POLISH)" >&2
 
 # ---------------------------------------------------------------------
 # Dry-run short-circuit
@@ -583,8 +773,9 @@ INTRO
   - tagged-skip: ${COUNT_TAGGED_SKIP}
   - tagged-surface: ${COUNT_TAGGED_SURFACE}
   - deferred-untagged (heuristic): ${COUNT_DEFERRED_UNTAGGED}
+- Dedupe pass (#304): ${COUNT_DEDUP_SKIPPED} item(s) previously triaged on prior rollups in the ${DEDUPE_WINDOW_DAYS}-day window (since ${DEDUP_CUTOFF})
 
-Generator: \`scripts/daily-feedback-rollup.sh\` (mergepath#299)
+Generator: \`scripts/daily-feedback-rollup.sh\` (mergepath#299 v1 + #304 dedupe)
 </details>
 FOOTER
 }
