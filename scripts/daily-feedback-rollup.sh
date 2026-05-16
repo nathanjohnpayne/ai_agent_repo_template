@@ -130,9 +130,13 @@ echo "daily-feedback-rollup: repo=$REPO window=[$SINCE, $UNTIL) date_stamp=$DATE
 # Step 1 — fetch PRs merged in the window
 # ---------------------------------------------------------------------
 
-# Use the search API. `closed:>=$SINCE` includes both merged and
-# closed-without-merge — that's intentional; closed-without-merge
-# may still carry resolved-without-fix threads worth surfacing.
+# Use the search API. `is:merged merged:>=...` scopes the scan to
+# PRs that actually merged in the window — abandoned (closed-without-
+# merge) PRs are excluded because their unaddressed feedback is
+# typically not actionable (the work didn't land). The earlier broader
+# `closed:>=$SINCE` scope swept those in, producing rollup entries
+# with `mergedAt: n/a` that confused triage (CodeRabbit Major r2 on
+# PR #303).
 #
 # No `|| echo '[]'` fallback: an API failure here (auth, rate limit,
 # network) MUST fail the run loudly. Treating a failed call as "zero
@@ -141,8 +145,8 @@ echo "daily-feedback-rollup: repo=$REPO window=[$SINCE, $UNTIL) date_stamp=$DATE
 # Major r1 on PR #303).
 if ! prs_json=$(gh pr list \
     --repo "$REPO" \
-    --state closed \
-    --search "closed:>=$SINCE closed:<$UNTIL" \
+    --state merged \
+    --search "is:merged merged:>=$SINCE merged:<$UNTIL" \
     --limit "$MAX_PRS_PER_DAY" \
     --json number,title,url,mergedAt); then
   echo "daily-feedback-rollup: ERROR — gh pr list failed (auth/rate-limit/network?). Aborting rather than producing an empty rollup." >&2
@@ -366,13 +370,20 @@ while [ "$i" -lt "$pr_count" ]; do
 
       # Heuristic 4: thread is stale-head — its originalCommit isn't
       # in the PR's current commit history (got rebased away or force-
-      # pushed off). The naive `orig_commit != head_oid` check was
-      # over-broad: many bot comments anchor to intermediate commits
-      # that are still in the PR history and remain valid findings.
-      # Use membership against the commits list we already pulled in
-      # the GraphQL query (CodeRabbit Major r1 on PR #303).
+      # pushed off). Membership check against the commits list we
+      # pulled in the GraphQL query (CodeRabbit Major r1 on PR #303
+      # tightened the prior naive `orig_commit != head_oid` check).
+      #
+      # IMPORTANT: the GraphQL query pulls `commits(last: 100)`, which
+      # is only the tail of the PR's history. On a PR with >100
+      # commits, an older `originalCommit` can be in-history but
+      # absent from this slice — we'd falsely classify as stale and
+      # suppress a real deferred thread. Gate the stale-head branch
+      # on `commit_count < 100` so we prefer surfacing over false-
+      # skipping in the slice-saturated case (CodeRabbit Major r2 on
+      # PR #303).
       orig_commit=$(printf '%s' "$t" | jq -r '.comments.nodes[0].originalCommit.oid // ""')
-      if [ -n "$orig_commit" ]; then
+      if [ -n "$orig_commit" ] && [ "$commit_count" -lt 100 ]; then
         if ! printf '%s' "$threads_json" | jq -e --arg oid "$orig_commit" \
              '.data.repository.pullRequest.commits.nodes
               | any(.commit.oid == $oid)' >/dev/null; then
