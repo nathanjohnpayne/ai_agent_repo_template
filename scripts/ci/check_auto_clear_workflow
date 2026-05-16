@@ -183,10 +183,18 @@ perm_block=$(
   awk '
     /^permissions:/ {in_block=1; next}
     in_block && /^[^[:space:]]/ {exit}
+    # Skip blank lines AND comment-only lines so inline rationale
+    # comments inside the permissions block don'"'"'t leak into the
+    # allowlist comparison (CodeRabbit Major on PR #311 / #310).
+    in_block && /^[[:space:]]*#/ {next}
     in_block && NF { sub(/^[[:space:]]+/, "", $0); print }
   ' "$WORKFLOW" | sort
 )
-expected_perms=$'checks: read\ncontents: read\npull-requests: write'
+# `actions: read` added in #310 — codex-review-check.sh's GraphQL
+# drill into statusCheckRollup.checkSuite.workflowRun requires it
+# in addition to `checks: read`. See the inline rationale comment
+# next to the new permission in auto-clear-blocking-labels.yml.
+expected_perms=$'actions: read\nchecks: read\ncontents: read\npull-requests: write'
 if [ "$perm_block" = "$expected_perms" ]; then
   pass=$((pass + 1))
   echo "  PASS: workflow permissions exactly match the least-privilege set"
