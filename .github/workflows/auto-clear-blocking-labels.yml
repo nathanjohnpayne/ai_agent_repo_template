@@ -48,6 +48,15 @@ permissions:
   pull-requests: write
   contents: read
   checks: read
+  # codex-review-check.sh drills statusCheckRollup →
+  # checkSuite.workflowRun, which needs `actions: read` in addition
+  # to `checks: read`. Without it the GraphQL fails with `Resource
+  # not accessible by integration` and the gate evaluation aborts
+  # with rc=3, leaving `needs-external-review` stuck on every
+  # consumer PR after Codex approves. Surfaced on
+  # nathanjohnpayne/matchline#233 (#306 propagation canary); see
+  # #310 for the full repro + permission scope rationale.
+  actions: read
 
 jobs:
   evaluate-and-clear:
