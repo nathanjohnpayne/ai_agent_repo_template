@@ -1,14 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Set up keyless Firebase deploy auth for any project.
-# Creates a deployer service account, grants deploy roles, grants the current
-# principal permission to impersonate it, and creates a dedicated gcloud config
-# with explicit quota attribution for the target project.
+# Set up Firebase deploy auth for any project.
+#
+# Default behavior creates a deployer service account, grants deploy
+# roles, grants the current principal permission to impersonate it,
+# and creates a dedicated gcloud config with explicit quota
+# attribution for the target project. This is the keyless
+# impersonation path — historically the only path this script set up.
+#
+# With `--provision-sa-key`, the script also mints a JSON key for the
+# deployer SA, uploads it to the 1Password Firebase vault as
+# `op://Firebase/{project-id} — Firebase Deployer SA Key`, and wipes
+# the local copy. The SA key is the standard day-to-day deploy
+# credential per DEPLOYMENT.md § Deploy credential precedence
+# (canonical) (#154). Provisioning is opt-in to preserve the prior
+# behavior contract and to keep key minting an explicit human
+# decision — see DEPLOYMENT.md § Secrets Management for the trade-off.
 #
 # Usage:
-#   op-firebase-setup                    # auto-detect project from .firebaserc
-#   op-firebase-setup my-project-id      # explicit project ID
+#   op-firebase-setup                              # auto-detect project, impersonation only
+#   op-firebase-setup my-project-id                # explicit project ID, impersonation only
+#   op-firebase-setup --provision-sa-key           # also mint + upload SA key to 1Password
+#   op-firebase-setup my-project --provision-sa-key
 
 SA_NAME="firebase-deployer"
 MEMBER_EMAIL="${FIREBASE_IMPERSONATION_MEMBER:-}"
@@ -21,18 +35,50 @@ ROLES=(
 )
 
 PROJECT=""
-if [[ "${1:-}" != "" ]]; then
-  PROJECT="$1"
-elif [[ -f .firebaserc ]]; then
-  PROJECT="$(python3 -c "import json; print(json.load(open('.firebaserc'))['projects']['default'])")"
-else
-  echo "Error: No project specified and no .firebaserc found." >&2
-  echo "Usage: op-firebase-setup [project-id]" >&2
-  exit 1
+PROVISION_SA_KEY=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --provision-sa-key)
+      PROVISION_SA_KEY=true
+      ;;
+    --no-provision-sa-key)
+      PROVISION_SA_KEY=false
+      ;;
+    --help|-h)
+      sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    --*)
+      echo "Error: unknown flag: $arg" >&2
+      echo "Usage: op-firebase-setup [project-id] [--provision-sa-key]" >&2
+      exit 1
+      ;;
+    *)
+      if [[ -z "$PROJECT" ]]; then
+        PROJECT="$arg"
+      else
+        echo "Error: unexpected positional argument: $arg" >&2
+        echo "Usage: op-firebase-setup [project-id] [--provision-sa-key]" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$PROJECT" ]]; then
+  if [[ -f .firebaserc ]]; then
+    PROJECT="$(python3 -c "import json; print(json.load(open('.firebaserc'))['projects']['default'])")"
+  else
+    echo "Error: No project specified and no .firebaserc found." >&2
+    echo "Usage: op-firebase-setup [project-id] [--provision-sa-key]" >&2
+    exit 1
+  fi
 fi
 
 SA_EMAIL="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 CONFIG_NAME="${PROJECT}"
+SA_KEY_OP_TITLE="${PROJECT} — Firebase Deployer SA Key"
 
 if [[ -z "${MEMBER_EMAIL}" ]]; then
   MEMBER_EMAIL="$(gcloud config get-value account 2>/dev/null || true)"
@@ -44,11 +90,25 @@ if [[ -z "${MEMBER_EMAIL}" ]]; then
   exit 1
 fi
 
+# Preflight 1Password CLI availability when SA-key provisioning is
+# requested. Fail fast so the user doesn't get through the IAM setup
+# and then discover the upload can't run.
+if $PROVISION_SA_KEY && ! command -v op >/dev/null 2>&1; then
+  echo "Error: --provision-sa-key requires the 1Password CLI (op) on PATH." >&2
+  echo "Install op (https://1password.com/downloads/command-line/) or re-run without --provision-sa-key." >&2
+  exit 1
+fi
+
 echo ""
 echo "Project:           $PROJECT"
 echo "Service account:   $SA_EMAIL"
 echo "Impersonation via: user:${MEMBER_EMAIL}"
 echo "gcloud config:     $CONFIG_NAME"
+if $PROVISION_SA_KEY; then
+  echo "Provision SA key:  yes (upload to op://Firebase/$SA_KEY_OP_TITLE)"
+else
+  echo "Provision SA key:  no (impersonation only; pass --provision-sa-key to mint + upload)"
+fi
 echo ""
 
 # 1. Enable IAMCredentials API for impersonation
@@ -97,10 +157,111 @@ gcloud config set auth/impersonate_service_account "$SA_EMAIL" --configuration="
 gcloud config set billing/quota_project "$PROJECT" --configuration="$CONFIG_NAME" >/dev/null
 echo "Configured gcloud impersonation and quota attribution for $CONFIG_NAME."
 
+# 6. (Optional) Mint and upload the deployer SA key to 1Password.
+#    Implements the previously-manual procedure documented under
+#    DEPLOYMENT.md § Provisioning the Firebase-vault SA key, gated
+#    behind --provision-sa-key so existing setup runs are unchanged.
+if $PROVISION_SA_KEY; then
+  echo ""
+  echo "Provisioning Firebase-vault SA key (--provision-sa-key)..."
+
+  # If an item with the canonical title already exists, refuse to
+  # double-provision silently. Operators rotating a key should follow
+  # the rotation procedure (DEPLOYMENT.md § Rotating a Firebase deploy
+  # SA key), not re-run setup.
+  if op item get "$SA_KEY_OP_TITLE" --vault Firebase >/dev/null 2>&1; then
+    echo "Skipping SA-key provisioning: item already exists in op://Firebase/$SA_KEY_OP_TITLE." >&2
+    echo "To rotate, follow DEPLOYMENT.md § Rotating a Firebase deploy SA key." >&2
+  else
+    # Mint into a chmod-600 tempfile we delete unconditionally on
+    # exit. The trap is scoped to this branch — installing it at the
+    # top of the script would surprise callers in the impersonation-
+    # only path (they have no tempfile to clean up).
+    #
+    # Trap also revokes the just-minted GCP key if the 1Password
+    # upload fails partway through. Without revoke-on-failure, a
+    # transient `op document create` error (stale auth, vault perms,
+    # network) would leave an active deployer-SA key in IAM that
+    # nothing local references — the tempfile gets wiped by the trap
+    # and the key is orphaned. Repeated failed provisioning runs
+    # would eventually hit GCP's 10-keys-per-SA limit and block all
+    # future minting. (codex P1 r1 on PR #302.)
+    umask 077
+    KEY_PATH="$(mktemp "${TMPDIR:-/tmp}/firebase-sa-key-XXXXXX.json")"
+    KEY_ID=""
+    UPLOAD_OK=false
+    cleanup_provision() {
+      local rc=$?
+      if ! $UPLOAD_OK && [ -n "$KEY_ID" ]; then
+        echo "Revoking just-minted key $KEY_ID (1Password upload did not complete)..." >&2
+        # Best-effort revoke. If the revoke itself fails (auth lost,
+        # network drop, IAM policy denial), surface the orphan KEY_ID
+        # for manual cleanup rather than silently swallowing the loss.
+        if ! gcloud iam service-accounts keys delete "$KEY_ID" \
+             --iam-account="$SA_EMAIL" \
+             --project="$PROJECT" \
+             --quiet 2>&1; then
+          echo "WARNING: Failed to revoke key $KEY_ID on $SA_EMAIL." >&2
+          echo "Manually revoke with:" >&2
+          echo "  gcloud iam service-accounts keys delete $KEY_ID \\" >&2
+          echo "    --iam-account=$SA_EMAIL --project=$PROJECT" >&2
+        else
+          echo "Revoked $KEY_ID." >&2
+        fi
+      fi
+      rm -f "$KEY_PATH"
+      return $rc
+    }
+    trap cleanup_provision EXIT
+
+    echo "Minting SA key (requires iam.serviceAccountKeyAdmin on $PROJECT)..."
+    gcloud iam service-accounts keys create "$KEY_PATH" \
+      --iam-account="$SA_EMAIL" \
+      --project="$PROJECT" \
+      --quiet
+
+    # Capture the minted key's private_key_id so the trap can revoke
+    # it if upload fails. If extraction errors (malformed JSON, etc.),
+    # KEY_ID stays empty and the trap surfaces the orphan for manual
+    # cleanup rather than guessing at a key ID.
+    KEY_ID="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('private_key_id',''))" "$KEY_PATH" 2>/dev/null || true)"
+    if [ -z "$KEY_ID" ]; then
+      echo "WARNING: Could not extract private_key_id from minted SA key file." >&2
+      echo "If the upload below fails, manually list + revoke recent keys with:" >&2
+      echo "  gcloud iam service-accounts keys list --iam-account=$SA_EMAIL --project=$PROJECT" >&2
+    fi
+
+    echo "Uploading to op://Firebase/$SA_KEY_OP_TITLE..."
+    # `op document create` reads the file from disk. The title is
+    # exactly what materialize_firebase_vault_sa_key in op-firebase-
+    # deploy reads — keep them in sync.
+    op document create "$KEY_PATH" \
+      --vault Firebase \
+      --title "$SA_KEY_OP_TITLE" >/dev/null
+
+    UPLOAD_OK=true
+
+    # Explicit wipe (the trap will also fire on EXIT, but doing it
+    # eagerly here narrows the on-disk-key window).
+    rm -f "$KEY_PATH"
+    trap - EXIT
+    echo "SA key uploaded and local tempfile wiped."
+  fi
+fi
+
 echo ""
 echo "Setup complete."
 echo ""
 echo "Next steps:"
 echo "  gcloud config configurations activate $CONFIG_NAME"
-echo "  op-firebase-deploy      # keyless deploy via impersonation"
+if $PROVISION_SA_KEY; then
+  echo "  op-firebase-deploy      # uses project Firebase-vault SA key (rank 2)"
+else
+  echo "  op-firebase-deploy      # uses keyless impersonation (no SA key provisioned)"
+  echo ""
+  echo "  To switch to the stable SA-key-first deploy path (recommended for"
+  echo "  routine deploys — avoids the #137 firebase login --reauth churn),"
+  echo "  re-run with --provision-sa-key, or follow DEPLOYMENT.md"
+  echo "  § Provisioning the Firebase-vault SA key."
+fi
 echo ""
