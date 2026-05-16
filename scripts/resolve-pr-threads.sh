@@ -934,6 +934,19 @@ while IFS= read -r thread; do
       tag_class="deferred-to-followup"
       tag_rationale="$RATIONALE_OVERRIDE"
     else
+      # Warm the tag-data cache (PR_FILES_CACHE / PR_COMMITS_CACHE +
+      # the TAG_DATA_FETCHED guard) in THIS shell BEFORE the command-
+      # substitution subshells below. Without this, fetch_pr_tag_data
+      # runs inside derive_tag_class's subshell, populates the caches
+      # in that subshell, and the parent shell never sees them — so
+      # synth_rationale (also in a subshell) finds PR_COMMITS_CACHE
+      # empty, emits `[: : integer expression expected` on line ~773,
+      # and falls back to the generic no-SHA rationale. nathanpayne-
+      # codex Phase 4b on #308 reproduced this with a page-2 files
+      # fixture. Calling here also fulfills the "one-shot cache reused
+      # across threads" intention — fetch_pr_tag_data's TAG_DATA_FETCHED
+      # short-circuit only works if it's set in the loop's shell.
+      fetch_pr_tag_data
       # Need the augmented commits cache (with .sha) for the
       # addressed-elsewhere rationale; the bare cache from
       # fetch_pr_tag_data doesn't carry .sha. derive_tag_class only

@@ -247,6 +247,32 @@ else
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
 
+# Regression: synth_rationale's PR_COMMITS_CACHE must be populated
+# in the parent shell so the addressed-elsewhere rationale cites
+# the SPECIFIC matched commit SHA instead of falling back to the
+# generic "addressed by a follow-up commit on this PR" text. If
+# fetch_pr_tag_data only runs inside derive_tag_class's command-
+# substitution subshell, synth_rationale (also subshelled) sees an
+# empty PR_COMMITS_CACHE → emits `[: : integer expression expected`
+# on its commit_count loop guard → silently degrades to the generic
+# rationale. nathanpayne-codex Phase 4b r4 on #308 reproduced this
+# with a page-2 files fixture; gate added at the call site by
+# warming the cache in the parent shell before the subshells.
+if [ "$rc" -eq 0 ] \
+   && ! grep -q 'integer expression expected' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\] addressed by commit abc1234' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: addressed-elsewhere rationale cites matched commit (no subshell-cache regression)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: addressed-elsewhere rationale degraded — subshell-cache regression?" >&2
+  echo "    expected rationale: 'addressed by commit abc1234 (touching ...)'" >&2
+  echo "    script output (looking for 'integer expression expected'):" >&2
+  echo "$out" | grep -E '(integer expression|abc1234|follow-up commit)' | sed 's/^/      /' >&2 || true
+  echo "    captured tag-reply field:" >&2
+  grep 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" | sed 's/^/      /' >&2 || true
+fi
+
 # ─────────────────────────────────────────────────────────────────────
 # Test 2: canonical-coverage when path matches manifest
 # ─────────────────────────────────────────────────────────────────────
