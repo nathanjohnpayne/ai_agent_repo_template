@@ -535,15 +535,54 @@ TAG_DATA_FETCHED=false
 fetch_pr_tag_data() {
   $TAG_DATA_FETCHED && return 0
   TAG_DATA_FETCHED=true
-  # REST /pulls/{pr}/files: up to 100 files, one page. PRs with >100
-  # files are rare; the fallback is to treat the path-match check as
-  # "match-any" which is the rollup's existing behavior.
-  PR_FILES_CACHE=$(gh_pat api "repos/$OWNER/$NAME/pulls/$PR_NUM/files?per_page=100" \
-    --jq '[.[].filename]' 2>/dev/null || echo '[]')
-  # REST /pulls/{pr}/commits: same shape; we need committer login +
-  # authored date.
-  PR_COMMITS_CACHE=$(gh_pat api "repos/$OWNER/$NAME/pulls/$PR_NUM/commits?per_page=100" \
-    --jq '[.[] | {login: (.author.login // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]' 2>/dev/null || echo '[]')
+  # REST /pulls/{pr}/files and /pulls/{pr}/commits both paginate at
+  # 100 items per page. Without pagination, threads anchored on
+  # files beyond page 1 silently misclassify on PRs with >100
+  # changed files (Codex P2 on #308). We use a manual page loop
+  # rather than gh's --paginate so the URL stays in argv-position
+  # 2 (gh injects --paginate as $2, which breaks stubs that route
+  # on $2 — including test_resolve_pr_threads_rationale_tag.sh).
+  PR_FILES_CACHE=$(_fetch_paginated \
+    "repos/$OWNER/$NAME/pulls/$PR_NUM/files" \
+    '[.[].filename]')
+  # PR_COMMITS_CACHE now includes `sha` so synth_rationale can cite
+  # the matching commit. The predicate the rationale builds must
+  # match derive_tag_class's predicate (CodeRabbit major on #308).
+  PR_COMMITS_CACHE=$(_fetch_paginated \
+    "repos/$OWNER/$NAME/pulls/$PR_NUM/commits" \
+    '[.[] | {sha: (.sha // ""), login: (.author.login // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]')
+}
+
+# _fetch_paginated <base-url> <jq-projection> → JSON array on stdout.
+# Manually walks `?per_page=100&page=N` until a page returns fewer
+# than 100 items OR a defensive 50-page cap (5,000 items) is hit.
+# Falls back to `[]` on first-page failure so downstream treats as
+# match-any rather than under-classifying. Test stubs that return a
+# pre-transformed JSON array still work: this helper applies a
+# `--jq` projection that the stubs ignore (stubs return their own
+# canned output), and the per-page-merging stops naturally because
+# the canned single-page output has fewer than 100 items.
+_fetch_paginated() {
+  local base_url="$1"
+  local projection="$2"
+  local page=1
+  local max_pages=50
+  local merged='[]'
+  local raw count
+  while [ "$page" -le "$max_pages" ]; do
+    if ! raw=$(gh_pat api "${base_url}?per_page=100&page=${page}" \
+        --jq "$projection" 2>/dev/null); then
+      [ "$page" -eq 1 ] && { echo '[]'; return; }
+      break
+    fi
+    [ -z "${raw//[[:space:]]/}" ] && break
+    count=$(printf '%s' "$raw" | jq 'length' 2>/dev/null || echo 0)
+    [ "$count" -eq 0 ] && break
+    merged=$(printf '%s\n%s\n' "$merged" "$raw" | jq -s -c '.[0] + .[1]' 2>/dev/null || printf '%s' "$merged")
+    [ "$count" -lt 100 ] && break
+    page=$((page + 1))
+  done
+  printf '%s' "$merged"
 }
 
 # manifest_canonical_paths — extract canonical + kit paths from the
@@ -716,13 +755,18 @@ synth_rationale() {
   local class="$1"
   local thread_json="$2"
   local thread_path
+  local thread_created
   thread_path=$(printf '%s' "$thread_json" | jq -r '.path // ""')
+  thread_created=$(printf '%s' "$thread_json" | jq -r '.created // ""')
   local short_sha=""
   case "$class" in
     addressed-elsewhere)
-      # Best-effort: surface the first agent-author commit's short
-      # SHA. The detection loop above doesn't capture the SHA, so we
-      # re-scan here.
+      # Surface the SHA of a commit that actually satisfies
+      # derive_tag_class's predicate (agent-authored AND
+      # authoredDate > thread_created). Re-run the same check here
+      # so the cited SHA matches the one that triggered the
+      # classification — otherwise we could cite a pre-thread
+      # commit that didn't qualify.
       local commit_count i
       commit_count=$(printf '%s' "$PR_COMMITS_CACHE" | jq 'length' 2>/dev/null || echo 0)
       i=0
@@ -731,7 +775,9 @@ synth_rationale() {
         c_login=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].login // \"\"")
         c_date=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].date // \"\"")
         c_sha=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].sha // \"\"")
-        if is_agent_author_local "$c_login"; then
+        if [ -n "$c_login" ] && [ -n "$c_date" ] \
+           && { [ -z "$thread_created" ] || [ "$c_date" \> "$thread_created" ]; } \
+           && is_agent_author_local "$c_login"; then
           short_sha="$c_sha"
           break
         fi
@@ -794,8 +840,11 @@ post_tag_reply() {
   local body
   body="[mergepath-resolve: $class] $rationale"
   # Suppress stdout (the mutation response is noise), but capture
-  # stderr for failure-mode logging. `2>&1 1>/dev/null` swaps
-  # streams so we can grep the diagnostic on failure.
+  # stderr for failure-mode logging. The redirection order matters:
+  # `2>&1 1>/dev/null` first dups stderr to stdout (so it lands in
+  # the command substitution), then redirects the original stdout to
+  # /dev/null. The reversed form (`>/dev/null 2>&1`) discards both
+  # streams and leaves $err empty — see #shellcheck SC2327/SC2328.
   local err
   if ! err=$(gh_pat api graphql \
     -f query='mutation($id: ID!, $body: String!) {
@@ -805,7 +854,8 @@ post_tag_reply() {
     }' \
     -F id="$thread_id" \
     -F body="$body" \
-    >/dev/null 2>&1); then
+    2>&1 1>/dev/null); then
+    printf 'tag-reply mutation failed: %s\n' "$err" >&2
     return 1
   fi
   return 0

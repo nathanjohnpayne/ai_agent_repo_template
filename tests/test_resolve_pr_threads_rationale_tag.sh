@@ -368,8 +368,13 @@ echo "Test 5: --rationale override (deferred-to-followup + custom text)"
 
 # Same thread as Test 2 (canonical path) — would normally classify
 # as canonical-coverage; the override must beat the auto-class.
+# FILES_T5 mirrors FILES_T2 ("scripts/resolve-pr-threads.sh") so the
+# would-be auto-class actually evaluates to canonical-coverage and
+# the test genuinely exercises --rationale's precedence over the
+# ladder. With an empty FILES_T5 the auto-class would fall through
+# to deferred-to-followup anyway, making the override untestable.
 THREADS_T5="$THREADS_T2"
-FILES_T5='[]'
+FILES_T5='["scripts/resolve-pr-threads.sh"]'
 COMMITS_T5='[]'
 
 GH_ARGV_LOG="$SCRATCH/t5.log"; : > "$GH_ARGV_LOG"

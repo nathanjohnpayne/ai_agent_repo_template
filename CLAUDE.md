@@ -200,16 +200,21 @@ keyring active is your agent identity. No switch needed for commits.
      heuristics, so unresolved-feedback rollups attribute resolves
      accurately instead of guessing from commit timestamps. Valid
      `<class>` values (taxonomy mirrored from
-     `scripts/lib/daily-feedback-rollup-helpers.sh`):
+     `scripts/lib/daily-feedback-rollup-helpers.sh`). Listed in the
+     ladder order the resolver actually applies (first match wins):
 
+     - `canonical-coverage` — anchored path matches a canonical
+       entry in `.mergepath-sync.yml` (propagated content). Wins
+       over `addressed-elsewhere` because a finding on propagated
+       canonical content is structurally a mergepath concern
+       regardless of whether the local PR's fix commit also
+       happened to touch the file.
      - `addressed-elsewhere` — fix-commit by an agent author after
        the comment's createdAt, touching the anchored file.
-     - `canonical-coverage` — anchored path matches a canonical
-       entry in `.mergepath-sync.yml` (propagated content).
-     - `nitpick-noted` — severity is Nitpick/Trivial/P3, no
-       stronger signal applies.
      - `rebuttal-recorded` — ≥30-char agent-authored reply already
        on the thread.
+     - `nitpick-noted` — severity is Nitpick/Trivial/P3, no
+       stronger signal applies.
      - `deferred-to-followup` — default fallback / `--rationale`
        override.
 
