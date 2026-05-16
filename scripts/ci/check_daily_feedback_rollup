@@ -78,7 +78,11 @@ cat >"$FIXTURES/threads.json" <<'JSON'
     "repository": {
       "pullRequest": {
         "headRefOid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx",
-        "commits": { "nodes": [] },
+        "commits": {
+          "nodes": [
+            { "commit": { "oid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx", "authoredDate": "2026-05-15T10:00:00Z", "author": { "user": { "login": "nathanjohnpayne" } } } }
+          ]
+        },
         "reviewThreads": {
           "totalCount": 3,
           "pageInfo": { "hasNextPage": false, "endCursor": null },
@@ -155,6 +159,26 @@ cat >"$FIXTURES/threads.json" <<'JSON'
                     "createdAt": "2026-05-15T09:30:00Z",
                     "originalCommit": null,
                     "url": "https://github.com/owner/repo/pull/999#discussion_r5"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRT_thread_d",
+              "isResolved": true,
+              "isOutdated": true,
+              "path": "scripts/d.sh",
+              "line": 40,
+              "originalLine": 40,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 6,
+                    "author": { "login": "chatgpt-codex-connector[bot]" },
+                    "body": "**![P1 Badge]** Stale finding — original commit was force-pushed away.",
+                    "createdAt": "2026-05-15T07:00:00Z",
+                    "originalCommit": { "oid": "DEADBEEF_not_in_commits_list" },
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r6"
                   }
                 ]
               }
@@ -240,7 +264,7 @@ fi
 # Assertions on the NDJSON output.
 LINES=$(wc -l < "$OUT_FILE" | tr -d ' ')
 if [ "$LINES" -ne 2 ]; then
-  echo "FAIL: expected 2 NDJSON lines, got $LINES" >&2
+  echo "FAIL: expected 2 NDJSON lines (A substantive + C polish; B reply-skipped, D stale-skipped), got $LINES" >&2
   cat "$OUT_FILE" >&2
   echo "  stderr:" >&2
   sed 's/^/    /' "$ERR_FILE" >&2
@@ -268,6 +292,17 @@ if grep -q '"thread_id":"PRT_thread_b"' "$OUT_FILE"; then
   exit 1
 fi
 
+# Thread D — must be FILTERED (stale-head: originalCommit not in
+# commits.nodes). Locks in the regression fix: the prior naive
+# `orig_commit != head_oid` check would have incorrectly classified
+# Thread A (whose originalCommit matches headRefOid) as in-history
+# AND Thread D as stale; the new membership check produces the same
+# result for D but stops mis-classifying intermediate-commit threads.
+if grep -q '"thread_id":"PRT_thread_d"' "$OUT_FILE"; then
+  echo "FAIL: thread D (stale-head, originalCommit not in commits list) should be filtered out" >&2
+  exit 1
+fi
+
 # Thread C — polish (P3, tagged nitpick-noted)
 if ! grep -q '"thread_id":"PRT_thread_c"' "$OUT_FILE"; then
   echo "FAIL: thread C (tagged nitpick-noted P3) missing from output" >&2
@@ -291,5 +326,5 @@ if ! grep -oE '"item_id":"[a-f0-9]{12}"' "$OUT_FILE" | head -1 >/dev/null; then
   exit 1
 fi
 
-echo "check_daily_feedback_rollup: PASS (unit tests + 3-case --dry-run smoke)"
+echo "check_daily_feedback_rollup: PASS (unit tests + 4-case --dry-run smoke)"
 exit 0

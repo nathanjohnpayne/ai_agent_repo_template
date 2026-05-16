@@ -133,18 +133,34 @@ echo "daily-feedback-rollup: repo=$REPO window=[$SINCE, $UNTIL) date_stamp=$DATE
 # Use the search API. `closed:>=$SINCE` includes both merged and
 # closed-without-merge — that's intentional; closed-without-merge
 # may still carry resolved-without-fix threads worth surfacing.
-prs_json=$(gh pr list \
-  --repo "$REPO" \
-  --state closed \
-  --search "closed:>=$SINCE closed:<$UNTIL" \
-  --limit "$MAX_PRS_PER_DAY" \
-  --json number,title,url,mergedAt 2>/dev/null || echo '[]')
+#
+# No `|| echo '[]'` fallback: an API failure here (auth, rate limit,
+# network) MUST fail the run loudly. Treating a failed call as "zero
+# PRs" makes deferred feedback silently disappear, which is exactly
+# the failure mode this whole script exists to prevent (CodeRabbit
+# Major r1 on PR #303).
+if ! prs_json=$(gh pr list \
+    --repo "$REPO" \
+    --state closed \
+    --search "closed:>=$SINCE closed:<$UNTIL" \
+    --limit "$MAX_PRS_PER_DAY" \
+    --json number,title,url,mergedAt); then
+  echo "daily-feedback-rollup: ERROR — gh pr list failed (auth/rate-limit/network?). Aborting rather than producing an empty rollup." >&2
+  exit 2
+fi
 
 pr_count=$(printf '%s' "$prs_json" | jq 'length')
 echo "daily-feedback-rollup: $pr_count PRs in window" >&2
 
-# Counters for the methodology footer.
-COUNT_FIX=0
+# Counters for the methodology footer. Deliberately no COUNT_FIX in
+# v1 — the per-file fix-commit heuristic from the spec
+# (commit-by-an-agent-author touching the same file between
+# comment.createdAt and thread.resolvedAt) requires another GraphQL
+# round-trip per commit to get the file list. v2 adds it. Until
+# then, threads addressed by commit only (no reply) classify as
+# deferred-untagged — a known false-positive class that the v2
+# agent-side `[mergepath-resolve: addressed-elsewhere]` tagging
+# closes more directly than commit-introspection ever would.
 COUNT_REPLY=0
 COUNT_STALE=0
 COUNT_TAGGED_SKIP=0
@@ -211,7 +227,15 @@ while [ "$i" -lt "$pr_count" ]; do
         }
       }
     }' \
-    -F owner="$OWNER" -F name="$NAME" -F pr="$pr_number" 2>/dev/null || echo '{}')
+    -F owner="$OWNER" -F name="$NAME" -F pr="$pr_number") || {
+    # Per-PR failure: log + skip rather than abort the whole rollup.
+    # A single PR's GraphQL fetch can fail transiently (rate limit on
+    # a specific repo, lock contention) without invalidating the rest
+    # of the day's work. The per-run-level `gh pr list` above DOES
+    # fail-closed because that failure means we have no data at all.
+    echo "daily-feedback-rollup: WARN gh api graphql failed for $REPO#$pr_number; skipping" >&2
+    continue
+  }
 
   has_next=$(printf '%s' "$threads_json" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false')
   if [ "$has_next" = "true" ]; then
@@ -312,19 +336,21 @@ while [ "$i" -lt "$pr_count" ]; do
         continue
       fi
 
-      # Heuristic 3: thread was on a stale commit (its originalCommit
-      # is older than the PR's headRefOid). If the originalCommit
-      # isn't in the last-100 commits list, treat as stale-head.
+      # Heuristic 3: thread is stale-head — its originalCommit isn't
+      # in the PR's current commit history (got rebased away or force-
+      # pushed off). The naive `orig_commit != head_oid` check was
+      # over-broad: many bot comments anchor to intermediate commits
+      # that are still in the PR history and remain valid findings.
+      # Use membership against the commits list we already pulled in
+      # the GraphQL query (CodeRabbit Major r1 on PR #303).
       orig_commit=$(printf '%s' "$t" | jq -r '.comments.nodes[0].originalCommit.oid // ""')
-      head_oid=$(printf '%s' "$threads_json" | jq -r '.data.repository.pullRequest.headRefOid // ""')
-      if [ -n "$orig_commit" ] && [ -n "$head_oid" ] && [ "$orig_commit" != "$head_oid" ]; then
-        # Stale if the comment's originalCommit isn't the current HEAD.
-        # Stricter "is the commit in the PR's last-100 list" check
-        # would require looking it up; the simpler "different from
-        # HEAD" check captures the common case (codex/CodeRabbit
-        # commenting on a commit that got rebased away).
-        COUNT_STALE=$((COUNT_STALE + 1))
-        continue
+      if [ -n "$orig_commit" ]; then
+        if ! printf '%s' "$threads_json" | jq -e --arg oid "$orig_commit" \
+             '.data.repository.pullRequest.commits.nodes
+              | any(.commit.oid == $oid)' >/dev/null; then
+          COUNT_STALE=$((COUNT_STALE + 1))
+          continue
+        fi
       fi
 
       # No tag, no substantive reply, not stale → deferred-untagged.
@@ -396,7 +422,7 @@ SUBSTANTIVE_COUNT=$(wc -l < "$SUBSTANTIVE_NDJSON" | tr -d ' ')
 POLISH_COUNT=$(wc -l < "$POLISH_NDJSON" | tr -d ' ')
 
 echo "daily-feedback-rollup: classified substantive=$SUBSTANTIVE_COUNT polish=$POLISH_COUNT" \
-     "(skipped fix=$COUNT_FIX reply=$COUNT_REPLY stale=$COUNT_STALE tagged-skip=$COUNT_TAGGED_SKIP)" >&2
+     "(skipped reply=$COUNT_REPLY stale=$COUNT_STALE tagged-skip=$COUNT_TAGGED_SKIP)" >&2
 
 # ---------------------------------------------------------------------
 # Dry-run short-circuit
@@ -458,7 +484,6 @@ INTRO
 - Window: ${SINCE} — ${UNTIL}
 - PRs scanned: ${pr_count}
 - Threads classified:
-  - addressed-via-fix (heuristic): ${COUNT_FIX}
   - addressed-via-reply (heuristic): ${COUNT_REPLY}
   - stale-head (heuristic): ${COUNT_STALE}
   - tagged-skip: ${COUNT_TAGGED_SKIP}
@@ -474,9 +499,15 @@ FOOTER
 # rollup issue with the track's label. If ≥ threshold, append today's
 # items as a comment instead of opening a new issue.
 unchecked_count_on() {
+  # POSIX character classes — `\s` is GNU-grep-specific and not part
+  # of POSIX ERE. The ubuntu-latest runner has GNU grep but the
+  # downstream propagation path may not, and consistency with the
+  # rest of the codebase (which uses `[[:space:]]`) keeps the
+  # check_mktemp_portability-style regex audits happy
+  # (CodeRabbit Major r1 on PR #303).
   local issue_number="$1"
   gh issue view "$issue_number" --repo "$REPO" --json body --jq '.body' \
-    | grep -cE '^\s*-\s*\[\s*\]\s' || true
+    | grep -cE '^[[:space:]]*-[[:space:]]*\[[[:space:]]*\][[:space:]]' || true
 }
 
 most_recent_open_rollup() {
