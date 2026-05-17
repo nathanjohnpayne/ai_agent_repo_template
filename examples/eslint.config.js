@@ -100,9 +100,13 @@ export default [
 // <<<
 
 // >>> if frameworks contains astro
-  // Astro recommended ruleset — applied to .astro files. The plugin
-  // exposes its flat-config-compatible preset under .configs.recommended.
-  ...astro.configs.recommended,
+  // Astro flat-config recommended ruleset — applied to .astro files.
+  // The plugin exposes its flat-config preset under the bracketed
+  // `configs['flat/recommended']` key (NOT the legacy
+  // `configs.recommended` which is the eslintrc-shape config).
+  // Same key for ESM and CJS — the plugin's export shape is
+  // module-system-agnostic.
+  ...astro.configs['flat/recommended'],
 // <<<
 
 // >>> if frameworks contains react
