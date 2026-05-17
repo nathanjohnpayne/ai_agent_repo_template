@@ -227,6 +227,15 @@ fi
 # names so the choice is unambiguous. Codex Phase 4b
 # CHANGES_REQUESTED on PR #316 by nathanpayne-codex surfaced the
 # empty-dest gap that made this field-stability issue visible.
+#
+# Why the outer `[ -n "$path_rows" ]` guard: an empty `.paths: []`
+# (yq emits no lines) combined with `<<< "$path_rows"` (here-string
+# always appends a newline) yields one blank `read` iteration, which
+# the new `has_path != "true"` fail-closed check below would treat
+# as a malformed entry. Same guard pattern as the consumer_rows
+# loop above. Codex Phase 4b P2 on PR #320 by nathanpayne-codex
+# caught this regression from PR #320's own fail-closed addition.
+if [ -n "$path_rows" ]; then
 while IFS='|' read -r path type consumers dest source has_dest has_source has_path; do
   # An entry without a `path` field (or with `path: ""`) is a
   # malformed manifest entry. Previously coerced to empty + silently
@@ -401,6 +410,7 @@ while IFS='|' read -r path type consumers dest source has_dest has_source has_pa
     done
   fi
 done <<< "$path_rows"
+fi  # end: if [ -n "$path_rows" ]
 
 # 7. requires: closure invariant (#264).
 #

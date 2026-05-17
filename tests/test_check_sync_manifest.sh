@@ -542,6 +542,28 @@ else
   fail "Case 18 unexpected (rc=$rc): $out"
 fi
 
+# Case 18bis: .paths: [] (empty sequence) passes — yq emits no
+# rows, the outer guard skips the loop, and validation completes
+# without firing the new fail-closed has_path check on the
+# bash-here-string-injected blank iteration. Codex Phase 4b P2 on
+# PR #320 by nathanpayne-codex caught the regression from the
+# original PR #320 patch where the guard was missing.
+MANIFEST_EMPTY_PATHS='version: 1
+consumers:
+  - name: example
+    repo: example-org/example
+    visibility: public
+paths: []
+'
+set +e
+out=$(run_with_fixture "$MANIFEST_EMPTY_PATHS" ""); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case 18bis: empty .paths: [] passes (no false-positive from has_path check)"
+else
+  fail "Case 18bis unexpected (rc=$rc): $out"
+fi
+
 # Case 18c: .paths[] entry missing `path` field rejected (fail-closed,
 # was silent-skip). CodeRabbit Major + Codex Phase 4b CHANGES_REQUESTED
 # on Phase D consumer PRs both flagged the same gap.
