@@ -126,6 +126,35 @@ fi
 # of mappings are not — the lib expects flat scalar/list values, and
 # rejecting nested mappings here catches the misconfiguration at
 # manifest validation rather than at the first render attempt.
+
+# 3.5a: assert `.facts` ITSELF is a mapping when present. Without
+# this, a sequence-typed facts block (e.g. `facts: [react, typescript]`)
+# silently passes — `to_entries` on a sequence yields numeric
+# indices that pass the [a-z0-9_-]+ key charset check (digits are
+# valid), so the per-entry validation below false-passes. Codex
+# Phase 4b CHANGES_REQUESTED on PR #316 by nathanpayne-codex caught
+# this gap. Fail-closed at the structural-shape layer before the
+# per-entry iteration.
+if ! facts_shape_rows=$(yq -r '
+  .consumers[]
+  | select(.facts != null)
+  | .name + "\t" + (.facts | tag)
+' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract consumer facts-block tags (yq error):"
+  printf '%s\n' "$facts_shape_rows"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
+if [ -n "$facts_shape_rows" ]; then
+  while IFS=$'\t' read -r facts_consumer facts_yaml_tag; do
+    [ -z "$facts_consumer" ] && continue
+    if [ "$facts_yaml_tag" != "!!map" ]; then
+      echo "FAIL: consumer '$facts_consumer' facts: must be a YAML mapping (got tag '$facts_yaml_tag')"
+      FAILED=1
+    fi
+  done <<< "$facts_shape_rows"
+fi
+
 if ! facts_rows=$(yq -r '
   .consumers[]
   | select(.facts != null)
@@ -178,17 +207,45 @@ if [ "$paths_tag" != "!!seq" ]; then
 fi
 if ! path_rows=$(yq -r '
   .paths[]
-  | ((.path // "") + "\t" + (.type // "") + "\t"
+  | ((.path // "") + "|" + (.type // "") + "|"
      + (.consumers | (select(tag == "!!str") // (join(","))) | tostring)
-     + "\t" + (.dest // "") + "\t" + (.source // ""))
+     + "|" + (.dest // "") + "|" + (.source // "")
+     + "|" + (has("dest") | tostring) + "|" + (has("source") | tostring))
 ' "$MANIFEST" 2>&1); then
   echo "FAIL: could not extract .paths from the manifest (yq error):"
   printf '%s\n' "$path_rows"
   echo "check_sync_manifest: FAIL"
   exit 1
 fi
-while IFS=$'\t' read -r path type consumers dest source; do
+# Why IFS='|' and not '\t': bash `read` with IFS=$'\t' collapses
+# runs of whitespace (including tabs), so an empty-valued field
+# between two tabs gets eaten and downstream fields shift left
+# (turning an explicit `dest: ""` into the next field's value).
+# `|` is non-whitespace, so empty fields are preserved positionally.
+# Pipes don't appear in repo-relative paths, type names, or consumer
+# names so the choice is unambiguous. Codex Phase 4b
+# CHANGES_REQUESTED on PR #316 by nathanpayne-codex surfaced the
+# empty-dest gap that made this field-stability issue visible.
+while IFS='|' read -r path type consumers dest source has_dest has_source; do
   [ -z "$path" ] && continue
+
+  # 4a-ter: empty-string `dest:` or `source:` is a misconfiguration —
+  # the yq `(.dest // "")` extraction collapses "absent" and
+  # "explicitly empty" to the same empty string, so we use the
+  # parallel `has("dest")` / `has("source")` probes to distinguish.
+  # An explicit `dest: ""` would pass through to materialize and
+  # blow up there (Codex P1 / Phase 4b CHANGES_REQUESTED on PR
+  # #316 by nathanpayne-codex). Reject at validation.
+  if [ "$has_dest" = "true" ] && [ -z "$dest" ]; then
+    echo "FAIL: path '$path' has explicit dest: \"\" — dest must be non-empty when set"
+    FAILED=1
+    continue
+  fi
+  if [ "$has_source" = "true" ] && [ -z "$source" ]; then
+    echo "FAIL: path '$path' has explicit source: \"\" — source must be non-empty when set"
+    FAILED=1
+    continue
+  fi
 
   # 4a: reject repo-escaping paths. An absolute path or one
   # containing a `..` segment would make the on-disk existence check

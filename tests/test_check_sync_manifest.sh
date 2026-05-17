@@ -495,6 +495,70 @@ else
   fail "Case 16 unexpected (rc=$rc): $out"
 fi
 
+# Case 17b: facts as a sequence rejected (must be a mapping).
+# Codex Phase 4b CHANGES_REQUESTED on PR #316 by nathanpayne-codex
+# caught this gap — `to_entries` on a sequence yields numeric-index
+# keys that pass the [a-z0-9_-]+ charset check, so per-entry
+# validation false-passed.
+MANIFEST_FACTS_SEQ='version: 1
+consumers:
+  - name: example
+    repo: example-org/example
+    visibility: public
+    facts: [react, typescript]
+paths:
+  - path: scripts/foo.sh
+    type: canonical
+    consumers: all
+'
+set +e
+out=$(run_with_fixture "$MANIFEST_FACTS_SEQ" "scripts/foo.sh"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "facts: must be a YAML mapping (got tag '!!seq')"; then
+  pass "Case 17b: facts as sequence rejected"
+else
+  fail "Case 17b unexpected (rc=$rc): $out"
+fi
+
+# Case 18: explicit dest: "" on templated entry rejected. Same Codex
+# Phase 4b finding — empty-string dest would pass through to
+# materialize_templated_targets which then aborts with a less-clear
+# error. Reject at validation. (Also exercises the IFS='|' field-
+# stability fix, since with IFS=$'\t' the empty dest field would
+# collapse and the validator would never see it as "" specifically.)
+MANIFEST_DEST_EMPTY="$MIN_HEADER
+  - path: examples/foo.js
+    type: templated
+    dest: \"\"
+    consumers: all
+"
+PATHS_DEST_EMPTY="examples/foo.js"
+set +e
+out=$(run_with_fixture "$MANIFEST_DEST_EMPTY" "$PATHS_DEST_EMPTY"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q 'explicit dest: "" — dest must be non-empty when set'; then
+  pass "Case 18: explicit empty dest: \"\" rejected"
+else
+  fail "Case 18 unexpected (rc=$rc): $out"
+fi
+
+# Case 18b: explicit source: "" rejected (parallel to dest).
+MANIFEST_SRC_EMPTY="$MIN_HEADER
+  - path: examples/foo.js
+    type: templated
+    source: \"\"
+    dest: eslint.config.js
+    consumers: all
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_SRC_EMPTY" "examples/foo.js"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q 'explicit source: "" — source must be non-empty when set'; then
+  pass "Case 18b: explicit empty source: \"\" rejected"
+else
+  fail "Case 18b unexpected (rc=$rc): $out"
+fi
+
 # Case 17: consumer without facts: block still validates (facts is optional).
 MANIFEST_NO_FACTS='version: 1
 consumers:
