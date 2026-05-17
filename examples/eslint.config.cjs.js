@@ -1,9 +1,15 @@
-// eslint.config.js
+// eslint.config.js (CommonJS variant)
 //
 // Auto-generated from nathanjohnpayne/mergepath's templated source
-// at examples/eslint.config.js (per the Mergepath ESLint standard,
-// mergepath#250). Edit upstream, not this rendered copy — local
-// edits will be overwritten on the next propagation run.
+// at examples/eslint.config.cjs.js (per the Mergepath ESLint
+// standard, mergepath#250). Edit upstream, not this rendered copy
+// — local edits will be overwritten on the next propagation run.
+//
+// This is the CommonJS variant. It's rendered for consumers whose
+// package.json does NOT declare `"type": "module"` (default CJS
+// resolution). ESM consumers get the sibling examples/
+// eslint.config.js (ESM variant) instead — see .mergepath-sync.yml
+// for the consumers: partitioning.
 //
 // >>> if _template_only_notes
 // Template-author notes (this block is stripped from every
@@ -12,35 +18,44 @@
 //
 // Rendered per consumer by scripts/lib/template-substitution.sh
 // (#313) using the consumer's `facts.frameworks` from
-// `.mergepath-sync.yml`, then propagated to the consumer repo's
-// root as `eslint.config.js` via the templated path-type in
-// scripts/sync-to-downstream.sh (Phase B2, #316).
+// `.mergepath-sync.yml`. The CJS variant exists because ESM-syntax
+// `eslint.config.js` in a CJS package fails to load (Codex P1 on
+// PR #318 by chatgpt-codex-connector caught this gap). Module-
+// format partitioning lives in the manifest's consumers: lists
+// rather than a per-consumer fact, so the template-author only
+// edits one variant at a time and the rendered output is
+// trivially CommonJS for every entry in this template's consumers
+// list.
 //
-// Per-consumer facts.frameworks vocabulary (closed set):
+// Per-consumer facts.frameworks vocabulary (closed set, same as
+// ESM variant):
 //   typescript  → enables typescript-eslint baseline + TS parsing
 //   astro       → enables eslint-plugin-astro
 //   react       → enables eslint-plugin-react + react-hooks
 //
 // A consumer with no frameworks (e.g., swipewatch — pure Node +
 // vitest) gets the JS baseline only. Multiple frameworks stack in
-// declaration order.
+// declaration order. Keep this template's body byte-identical (modulo
+// import/export syntax) to the ESM variant — divergence between the
+// two would render differently for nominally-equivalent CJS vs ESM
+// consumers, which is a misfeature.
 // <<<
 
-import js from "@eslint/js";
-import globals from "globals";
+const js = require("@eslint/js");
+const globals = require("globals");
 
 // >>> if frameworks contains typescript
-import tseslint from "typescript-eslint";
+const tseslint = require("typescript-eslint");
 // <<<
 // >>> if frameworks contains astro
-import astro from "eslint-plugin-astro";
+const astro = require("eslint-plugin-astro");
 // <<<
 // >>> if frameworks contains react
-import react from "eslint-plugin-react";
-import reactHooks from "eslint-plugin-react-hooks";
+const react = require("eslint-plugin-react");
+const reactHooks = require("eslint-plugin-react-hooks");
 // <<<
 
-export default [
+module.exports = [
   // Ignore generated / vendored output. Customize per-consumer via
   // a follow-up commit on the propagation PR if a repo needs extras
   // (e.g., functions/lib for cloud-functions repos).
@@ -103,9 +118,10 @@ export default [
   // Astro flat-config recommended ruleset — applied to .astro files.
   // The plugin exposes its flat-config preset under the bracketed
   // `configs['flat/recommended']` key (NOT the legacy
-  // `configs.recommended` which is the eslintrc-shape config).
-  // Same key for ESM and CJS — the plugin's export shape is
-  // module-system-agnostic.
+  // `configs.recommended` which is the eslintrc-shape config). Same
+  // key for ESM and CJS — the plugin's export shape is module-
+  // system-agnostic. Codex P2 round 2 on PR #318 caught this gap
+  // for the CJS variant; ESM variant fixed in parallel for symmetry.
   ...astro.configs['flat/recommended'],
 // <<<
 
