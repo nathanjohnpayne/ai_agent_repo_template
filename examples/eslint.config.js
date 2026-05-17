@@ -229,6 +229,20 @@ export default [
       ...react.configs.recommended.rules,
       ...reactHooks.configs.recommended.rules,
       "react/react-in-jsx-scope": "off",
+      // React Compiler advisories — disabled by default because they
+      // only fire usefully once the React Compiler is adopted; until
+      // then they're noisy on idiomatic React (set-state-in-effect
+      // for init, ref-during-render in TipTap-style editors). Inlined
+      // here (vs a sibling block) so they inherit this entry's
+      // `files:` and `plugins:` scope — codex P1 #327 round 3
+      // caught the standalone block referencing react-hooks/* rules
+      // without a scope, breaking ESLint on .js files of React
+      // consumers (where the plugin isn't loaded for that glob).
+      // React Compiler adopters override locally back to "error".
+      "react-hooks/set-state-in-effect": "off",
+      "react-hooks/preserve-manual-memoization": "off",
+      "react-hooks/refs": "off",
+      "react-hooks/immutability": "off",
     },
     settings: {
       react: { version: "detect" },
@@ -263,6 +277,20 @@ export default [
       ...react.configs.recommended.rules,
       ...reactHooks.configs.recommended.rules,
       "react/react-in-jsx-scope": "off",
+      // React Compiler advisories — disabled by default because they
+      // only fire usefully once the React Compiler is adopted; until
+      // then they're noisy on idiomatic React (set-state-in-effect
+      // for init, ref-during-render in TipTap-style editors). Inlined
+      // here (vs a sibling block) so they inherit this entry's
+      // `files:` and `plugins:` scope — codex P1 #327 round 3
+      // caught the standalone block referencing react-hooks/* rules
+      // without a scope, breaking ESLint on .js files of React
+      // consumers (where the plugin isn't loaded for that glob).
+      // React Compiler adopters override locally back to "error".
+      "react-hooks/set-state-in-effect": "off",
+      "react-hooks/preserve-manual-memoization": "off",
+      "react-hooks/refs": "off",
+      "react-hooks/immutability": "off",
     },
     settings: {
       react: { version: "detect" },
@@ -270,34 +298,11 @@ export default [
   },
 // <<<
 
-// >>> if frameworks contains react
-  // React Compiler advisories — disabled by default for React
-  // consumers. These rules ship in eslint-plugin-react-hooks but
-  // are only meaningful once the React Compiler is adopted; until
-  // then they fire noisily on idiomatic React (set-state-in-effect
-  // for init, ref-during-render in TipTap-style editors).
-  //
-  // Gated on `frameworks contains react` ONLY because the v1
-  // template lib doesn't support compound expressions or nested
-  // conditionals — codex P1 on PR #327 round 2 flagged the earlier
-  // `react_compiler != true` form for emitting react-hooks/* rule
-  // IDs into non-React configs (where the plugin isn't loaded and
-  // ESLint fails with "Definition for rule X was not found").
-  //
-  // The trade-off: React consumers who have adopted the React
-  // Compiler need to re-enable these rules in their local config
-  // override (set each rule to "error" after the rendered config).
-  // The `facts.react_compiler` knob is reserved for v2 when
-  // compound expressions land — until then it has no effect.
-  {
-    rules: {
-      "react-hooks/set-state-in-effect": "off",
-      "react-hooks/preserve-manual-memoization": "off",
-      "react-hooks/refs": "off",
-      "react-hooks/immutability": "off",
-    },
-  },
-// <<<
+// React Compiler advisory disables are now INSIDE the React block(s)
+// above (so they inherit the same `files:` and `plugins:` scope and
+// don't reference react-hooks/* on files where the plugin isn't
+// loaded — codex P1 #327 round 3). The standalone block previously
+// at this position has been removed.
 
 // >>> if testing contains vitest
   // Vitest globals — applied to common test file patterns. Without
