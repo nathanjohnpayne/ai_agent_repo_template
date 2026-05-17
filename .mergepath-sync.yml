@@ -126,10 +126,65 @@ consumers:
 #                are ignored. This matches scripts/ci/, where each
 #                consumer adds repo-specific check_* scripts alongside
 #                the canonical ones.
-#   templated  — RESERVED for Layer 5 (#168). Not yet supported by
-#                --audit; scripts/sync-to-downstream.sh refuses to
-#                process templated entries until the substitution
-#                lib lands.
+#   templated  — rendered per consumer via scripts/lib/template-
+#                substitution.sh (#313). The Mergepath source is a
+#                template with `>>> if <expr> ... <<<` conditional
+#                blocks and `{{key}}` variable substitutions; the
+#                consumer's facts (see consumer.facts below) drive
+#                the rendering. Audit re-renders per consumer and
+#                byte-diffs against the on-disk destination. Sync
+#                materializes the rendered output into the destination
+#                path.
+#
+#                v1 NOTE: the propagation-PR review lane (#264) does
+#                NOT YET re-render-and-verify templated entries. The
+#                lane's parse_manifest_paths.sh emits only source
+#                paths, so a PR touching a templated `dest` reads as
+#                "off propagation surface" and the lane gate denies
+#                exemption — templated propagation PRs route to
+#                normal Phase 4 review. A follow-up PR will extend
+#                verify-propagation-pr.sh to re-render against
+#                mergepath@<sha> with the consumer's facts and
+#                byte-verify the PR content. See docs/agents/
+#                templated-propagation.md § Propagation-lane
+#                verification — v1 limitation.
+#
+#                Templated entries require explicit `source:` and
+#                `dest:` fields (the source path in Mergepath does
+#                NOT equal the destination path in the consumer —
+#                this is the whole point of templated propagation,
+#                e.g., examples/eslint.config.js → eslint.config.js).
+#                For canonical and kit, source = dest = path; the
+#                source/dest fields are optional and default to path
+#                when omitted.
+#
+# Per-entry source/dest fields:
+#   source:     path within Mergepath where the source template lives
+#               (defaults to `path` when omitted)
+#   dest:       path within each consumer where the rendered output
+#               (or canonical/kit content) lands (defaults to `path`)
+#
+# Per-consumer facts (templated propagation only):
+#   Each consumer entry MAY carry a `facts:` block — a mapping of
+#   fact keys (matching [a-z0-9_-]+) to values. Facts are exported
+#   as MERGEPATH_FACT_<KEY> env vars before invoking the template
+#   substitution lib, where uppercase + hyphen-to-underscore is
+#   applied per the lib's contract. List-valued facts (yaml `[a, b]`)
+#   are serialized as space-separated for the lib's `contains`
+#   expression form.
+#
+#   Example:
+#     consumers:
+#       - name: matchline
+#         repo: nathanjohnpayne/matchline
+#         visibility: private
+#         facts:
+#           frameworks: [react, typescript]
+#           node_version: "20"
+#
+#   Canonical/kit consumers don't require facts; the block is
+#   optional and only consulted for templated entries the consumer
+#   opts into.
 #
 # `consumers: all` means every entry in the consumers list above.
 # Per-consumer exclusions live under the `exclusions:` block at the

@@ -314,6 +314,271 @@ fi
 # recurses through the new "run regression suite" call at the bottom
 # of check_sync_manifest. Trust the CI invocation to do the smoke.
 
+# --- Templated + source/dest + facts validation (PR following #313) --
+
+# Case 9: templated with explicit source ≠ path + dest passes.
+MANIFEST_TPL_OK="$MIN_HEADER
+  - path: examples/eslint.config.js
+    type: templated
+    source: examples/eslint.config.js
+    dest: eslint.config.js
+    consumers: all
+"
+PATHS_TPL_OK="examples/eslint.config.js"
+set +e
+out=$(run_with_fixture "$MANIFEST_TPL_OK" "$PATHS_TPL_OK"); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case 9: templated with source/dest passes"
+else
+  fail "Case 9 unexpected (rc=$rc): $out"
+fi
+
+# Case 10: templated without dest emits WARN but passes.
+MANIFEST_TPL_NODEST="$MIN_HEADER
+  - path: examples/eslint.config.js
+    type: templated
+    consumers: all
+"
+PATHS_TPL_NODEST="examples/eslint.config.js"
+set +e
+out=$(run_with_fixture "$MANIFEST_TPL_NODEST" "$PATHS_TPL_NODEST"); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "WARN: templated path" && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case 10: templated without dest warns but passes"
+else
+  fail "Case 10 unexpected (rc=$rc): $out"
+fi
+
+# Case 11: absolute `dest:` is rejected.
+MANIFEST_DEST_ABS="$MIN_HEADER
+  - path: examples/x.js
+    type: templated
+    dest: /etc/passwd
+    consumers: all
+"
+PATHS_DEST_ABS="examples/x.js"
+set +e
+out=$(run_with_fixture "$MANIFEST_DEST_ABS" "$PATHS_DEST_ABS"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "dest '/etc/passwd' that is absolute"; then
+  pass "Case 11: absolute dest rejected"
+else
+  fail "Case 11 unexpected (rc=$rc): $out"
+fi
+
+# Case 12: dest with '..' segment is rejected.
+MANIFEST_DEST_DOTDOT="$MIN_HEADER
+  - path: examples/x.js
+    type: templated
+    dest: ../escape.js
+    consumers: all
+"
+PATHS_DEST_DOTDOT="examples/x.js"
+set +e
+out=$(run_with_fixture "$MANIFEST_DEST_DOTDOT" "$PATHS_DEST_DOTDOT"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "containing a '..' segment"; then
+  pass "Case 12: dest with '..' rejected"
+else
+  fail "Case 12 unexpected (rc=$rc): $out"
+fi
+
+# Case 13: source ≠ path triggers source existence check, fails on missing.
+MANIFEST_SRC_MISSING="$MIN_HEADER
+  - path: eslint.config.js
+    type: templated
+    source: examples/missing.js
+    dest: eslint.config.js
+    consumers: all
+"
+# Materialize path (existence requirement) but NOT source.
+PATHS_SRC_MISSING="eslint.config.js"
+set +e
+out=$(run_with_fixture "$MANIFEST_SRC_MISSING" "$PATHS_SRC_MISSING"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "source 'examples/missing.js' must be a regular file for templated entries"; then
+  pass "Case 13: source ≠ path with missing source rejected (templated: requires regular file)"
+else
+  fail "Case 13 unexpected (rc=$rc): $out"
+fi
+
+# Case 13b: templated source pointing at a DIRECTORY is rejected (a
+# directory can't be a template). CodeRabbit Major on PR #316 caught
+# this gap — the previous `-e` check would have accepted a directory.
+MANIFEST_SRC_ISDIR="$MIN_HEADER
+  - path: eslint.config.js
+    type: templated
+    source: examples/somedir
+    dest: eslint.config.js
+    consumers: all
+"
+PATHS_SRC_ISDIR="eslint.config.js
+examples/somedir/"
+set +e
+out=$(run_with_fixture "$MANIFEST_SRC_ISDIR" "$PATHS_SRC_ISDIR"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "must be a regular file for templated entries"; then
+  pass "Case 13b: templated source pointing at a directory rejected"
+else
+  fail "Case 13b unexpected (rc=$rc): $out"
+fi
+
+# Case 14: valid consumer facts (scalar + list) pass.
+MANIFEST_FACTS_OK='version: 1
+consumers:
+  - name: example
+    repo: example-org/example
+    visibility: public
+    facts:
+      frameworks: [react, typescript]
+      node_version: "20"
+      has_ts: yes
+paths:
+  - path: scripts/foo.sh
+    type: canonical
+    consumers: all
+'
+PATHS_FACTS_OK="scripts/foo.sh"
+set +e
+out=$(run_with_fixture "$MANIFEST_FACTS_OK" "$PATHS_FACTS_OK"); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case 14: valid consumer facts (scalar + list) pass"
+else
+  fail "Case 14 unexpected (rc=$rc): $out"
+fi
+
+# Case 15: facts key with uppercase rejected.
+MANIFEST_FACTS_KEY_BAD='version: 1
+consumers:
+  - name: example
+    repo: example-org/example
+    visibility: public
+    facts:
+      Frameworks: [react]
+paths:
+  - path: scripts/foo.sh
+    type: canonical
+    consumers: all
+'
+set +e
+out=$(run_with_fixture "$MANIFEST_FACTS_KEY_BAD" "scripts/foo.sh"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "facts: key 'Frameworks' must match"; then
+  pass "Case 15: facts key with uppercase rejected"
+else
+  fail "Case 15 unexpected (rc=$rc): $out"
+fi
+
+# Case 16: facts value as nested mapping rejected.
+MANIFEST_FACTS_NESTED='version: 1
+consumers:
+  - name: example
+    repo: example-org/example
+    visibility: public
+    facts:
+      framework_config:
+        react: true
+        ts: true
+paths:
+  - path: scripts/foo.sh
+    type: canonical
+    consumers: all
+'
+set +e
+out=$(run_with_fixture "$MANIFEST_FACTS_NESTED" "scripts/foo.sh"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "unsupported value type '!!map'"; then
+  pass "Case 16: facts value as nested mapping rejected"
+else
+  fail "Case 16 unexpected (rc=$rc): $out"
+fi
+
+# Case 17b: facts as a sequence rejected (must be a mapping).
+# Codex Phase 4b CHANGES_REQUESTED on PR #316 by nathanpayne-codex
+# caught this gap — `to_entries` on a sequence yields numeric-index
+# keys that pass the [a-z0-9_-]+ charset check, so per-entry
+# validation false-passed.
+MANIFEST_FACTS_SEQ='version: 1
+consumers:
+  - name: example
+    repo: example-org/example
+    visibility: public
+    facts: [react, typescript]
+paths:
+  - path: scripts/foo.sh
+    type: canonical
+    consumers: all
+'
+set +e
+out=$(run_with_fixture "$MANIFEST_FACTS_SEQ" "scripts/foo.sh"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "facts: must be a YAML mapping (got tag '!!seq')"; then
+  pass "Case 17b: facts as sequence rejected"
+else
+  fail "Case 17b unexpected (rc=$rc): $out"
+fi
+
+# Case 18: explicit dest: "" on templated entry rejected. Same Codex
+# Phase 4b finding — empty-string dest would pass through to
+# materialize_templated_targets which then aborts with a less-clear
+# error. Reject at validation. (Also exercises the IFS='|' field-
+# stability fix, since with IFS=$'\t' the empty dest field would
+# collapse and the validator would never see it as "" specifically.)
+MANIFEST_DEST_EMPTY="$MIN_HEADER
+  - path: examples/foo.js
+    type: templated
+    dest: \"\"
+    consumers: all
+"
+PATHS_DEST_EMPTY="examples/foo.js"
+set +e
+out=$(run_with_fixture "$MANIFEST_DEST_EMPTY" "$PATHS_DEST_EMPTY"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q 'explicit dest: "" — dest must be non-empty when set'; then
+  pass "Case 18: explicit empty dest: \"\" rejected"
+else
+  fail "Case 18 unexpected (rc=$rc): $out"
+fi
+
+# Case 18b: explicit source: "" rejected (parallel to dest).
+MANIFEST_SRC_EMPTY="$MIN_HEADER
+  - path: examples/foo.js
+    type: templated
+    source: \"\"
+    dest: eslint.config.js
+    consumers: all
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_SRC_EMPTY" "examples/foo.js"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q 'explicit source: "" — source must be non-empty when set'; then
+  pass "Case 18b: explicit empty source: \"\" rejected"
+else
+  fail "Case 18b unexpected (rc=$rc): $out"
+fi
+
+# Case 17: consumer without facts: block still validates (facts is optional).
+MANIFEST_NO_FACTS='version: 1
+consumers:
+  - name: example
+    repo: example-org/example
+    visibility: public
+paths:
+  - path: scripts/foo.sh
+    type: canonical
+    consumers: all
+'
+set +e
+out=$(run_with_fixture "$MANIFEST_NO_FACTS" "scripts/foo.sh"); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case 17: consumer without facts: passes (facts is optional)"
+else
+  fail "Case 17 unexpected (rc=$rc): $out"
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then

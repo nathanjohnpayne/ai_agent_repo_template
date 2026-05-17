@@ -118,6 +118,77 @@ if [ -n "$consumer_rows" ]; then
   done <<< "$consumer_rows"
 fi
 
+# 3.5: per-consumer `facts:` block validation (optional; required
+# for templated propagation per docs/agents/templated-propagation.md).
+# Each fact key must match the lib's accepted charset [a-z0-9_-]+
+# (anything else is rejected at render time as malformed). List-valued
+# facts (yaml `[a, b]`) are allowed; scalar values are too. Mappings
+# of mappings are not — the lib expects flat scalar/list values, and
+# rejecting nested mappings here catches the misconfiguration at
+# manifest validation rather than at the first render attempt.
+
+# 3.5a: assert `.facts` ITSELF is a mapping when present. Without
+# this, a sequence-typed facts block (e.g. `facts: [react, typescript]`)
+# silently passes — `to_entries` on a sequence yields numeric
+# indices that pass the [a-z0-9_-]+ key charset check (digits are
+# valid), so the per-entry validation below false-passes. Codex
+# Phase 4b CHANGES_REQUESTED on PR #316 by nathanpayne-codex caught
+# this gap. Fail-closed at the structural-shape layer before the
+# per-entry iteration.
+if ! facts_shape_rows=$(yq -r '
+  .consumers[]
+  | select(.facts != null)
+  | .name + "\t" + (.facts | tag)
+' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract consumer facts-block tags (yq error):"
+  printf '%s\n' "$facts_shape_rows"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
+if [ -n "$facts_shape_rows" ]; then
+  while IFS=$'\t' read -r facts_consumer facts_yaml_tag; do
+    [ -z "$facts_consumer" ] && continue
+    if [ "$facts_yaml_tag" != "!!map" ]; then
+      echo "FAIL: consumer '$facts_consumer' facts: must be a YAML mapping (got tag '$facts_yaml_tag')"
+      FAILED=1
+    fi
+  done <<< "$facts_shape_rows"
+fi
+
+if ! facts_rows=$(yq -r '
+  .consumers[]
+  | select(.facts != null)
+  | .name as $cn
+  | .facts | to_entries[]
+  | $cn + "\t" + .key + "\t" + (.value | tag)
+' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract consumer facts from the manifest (yq error):"
+  printf '%s\n' "$facts_rows"
+  echo "check_sync_manifest: FAIL"
+  exit 1
+fi
+if [ -n "$facts_rows" ]; then
+  while IFS=$'\t' read -r fact_consumer fact_key fact_tag; do
+    [ -z "$fact_consumer" ] && continue
+    # Key charset — same as the lib's `_fact_value` validator.
+    case "$fact_key" in
+      ''|*[!a-z0-9_-]*)
+        echo "FAIL: consumer '$fact_consumer' facts: key '$fact_key' must match [a-z0-9_-]+ (per scripts/lib/template-substitution.sh contract)"
+        FAILED=1
+        ;;
+    esac
+    # Value type — scalar (any !!str/!!int/!!float/!!bool) or sequence.
+    # A nested mapping (!!map) is the misconfiguration this guards.
+    case "$fact_tag" in
+      '!!str'|'!!int'|'!!float'|'!!bool'|'!!seq'|'!!null') ;;
+      *)
+        echo "FAIL: consumer '$fact_consumer' fact '$fact_key' has unsupported value type '$fact_tag' (must be scalar or list)"
+        FAILED=1
+        ;;
+    esac
+  done <<< "$facts_rows"
+fi
+
 # Build a set of valid consumer names for cross-check
 valid_consumers=$(yq -r '.consumers[].name' "$MANIFEST" | tr '\n' ',')
 
@@ -136,16 +207,45 @@ if [ "$paths_tag" != "!!seq" ]; then
 fi
 if ! path_rows=$(yq -r '
   .paths[]
-  | ((.path // "") + "\t" + (.type // "") + "\t"
-     + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
+  | ((.path // "") + "|" + (.type // "") + "|"
+     + (.consumers | (select(tag == "!!str") // (join(","))) | tostring)
+     + "|" + (.dest // "") + "|" + (.source // "")
+     + "|" + (has("dest") | tostring) + "|" + (has("source") | tostring))
 ' "$MANIFEST" 2>&1); then
   echo "FAIL: could not extract .paths from the manifest (yq error):"
   printf '%s\n' "$path_rows"
   echo "check_sync_manifest: FAIL"
   exit 1
 fi
-while IFS=$'\t' read -r path type consumers; do
+# Why IFS='|' and not '\t': bash `read` with IFS=$'\t' collapses
+# runs of whitespace (including tabs), so an empty-valued field
+# between two tabs gets eaten and downstream fields shift left
+# (turning an explicit `dest: ""` into the next field's value).
+# `|` is non-whitespace, so empty fields are preserved positionally.
+# Pipes don't appear in repo-relative paths, type names, or consumer
+# names so the choice is unambiguous. Codex Phase 4b
+# CHANGES_REQUESTED on PR #316 by nathanpayne-codex surfaced the
+# empty-dest gap that made this field-stability issue visible.
+while IFS='|' read -r path type consumers dest source has_dest has_source; do
   [ -z "$path" ] && continue
+
+  # 4a-ter: empty-string `dest:` or `source:` is a misconfiguration —
+  # the yq `(.dest // "")` extraction collapses "absent" and
+  # "explicitly empty" to the same empty string, so we use the
+  # parallel `has("dest")` / `has("source")` probes to distinguish.
+  # An explicit `dest: ""` would pass through to materialize and
+  # blow up there (Codex P1 / Phase 4b CHANGES_REQUESTED on PR
+  # #316 by nathanpayne-codex). Reject at validation.
+  if [ "$has_dest" = "true" ] && [ -z "$dest" ]; then
+    echo "FAIL: path '$path' has explicit dest: \"\" — dest must be non-empty when set"
+    FAILED=1
+    continue
+  fi
+  if [ "$has_source" = "true" ] && [ -z "$source" ]; then
+    echo "FAIL: path '$path' has explicit source: \"\" — source must be non-empty when set"
+    FAILED=1
+    continue
+  fi
 
   # 4a: reject repo-escaping paths. An absolute path or one
   # containing a `..` segment would make the on-disk existence check
@@ -173,6 +273,45 @@ while IFS=$'\t' read -r path type consumers; do
       ;;
   esac
 
+  # 4a-bis: same safety checks on `dest:` (optional) and `source:`
+  # (optional) — both must be repo-relative, no absolute paths, no
+  # `..` segments. dest lives in the CONSUMER repo (so the existence
+  # check below doesn't apply), but the safety rule protects every
+  # consumer from a write-outside-root via a bad manifest entry.
+  # source lives in mergepath but defaults to `.path` when omitted;
+  # only validate when explicitly set.
+  for field_pair in "dest:$dest" "source:$source"; do
+    field_name="${field_pair%%:*}"
+    field_val="${field_pair#*:}"
+    [ -z "$field_val" ] && continue
+    case "$field_val" in
+      /*)
+        echo "FAIL: path '$path' has $field_name '$field_val' that is absolute — must be repo-relative"
+        FAILED=1
+        continue 2
+        ;;
+    esac
+    case "/$field_val/" in
+      */../*)
+        echo "FAIL: path '$path' has $field_name '$field_val' containing a '..' segment — must not escape the repo root"
+        FAILED=1
+        continue 2
+        ;;
+    esac
+  done
+
+  # 4b: templated entries SHOULD declare `dest:` explicitly (their
+  # whole point is source-dest decoupling — `examples/eslint.config.js`
+  # in mergepath renders to `eslint.config.js` at the consumer). A
+  # templated entry that omits `dest:` would land the rendered output
+  # at the same path the source lives at, which is almost never what
+  # you want. Warn-not-fail: there might be a future use case for
+  # path-preserving templated rendering (e.g., per-consumer customization
+  # of a same-name file), so don't block, but make the omission noisy.
+  if [ "$type" = "templated" ] && [ -z "$dest" ]; then
+    echo "WARN: templated path '$path' omits 'dest:' — rendered output will land at the same path as the source. If that's intentional, explicitly set 'dest: $path' to silence this warning."
+  fi
+
   # 4: path exists on disk
   case "$type" in
     kit)
@@ -194,6 +333,31 @@ while IFS=$'\t' read -r path type consumers; do
       FAILED=1
       ;;
   esac
+
+  # 4c: existence-check source override. If `source:` is set
+  # (currently only meaningful for templated entries with source ≠
+  # path, but accepted for canonical/kit too for future flexibility),
+  # verify the source-of-truth file exists in mergepath. The default
+  # source = path case was already covered by the existence check
+  # above; this only fires when source is explicitly set to a
+  # different path.
+  if [ -n "$source" ] && [ "$source" != "$path" ]; then
+    src_target="$REPO_ROOT/$source"
+    # Templated sources must be regular files (a directory can't be a
+    # template). Canonical/kit also accept the explicit source
+    # override for future flexibility; use `-f` (regular file) for
+    # templated and `-e` (any FS entry, since kit could point at a
+    # directory) for the others. CodeRabbit Major on PR #316.
+    if [ "$type" = "templated" ]; then
+      if [ ! -f "$src_target" ]; then
+        echo "FAIL: path '$path' source '$source' must be a regular file for templated entries"
+        FAILED=1
+      fi
+    elif [ ! -e "$src_target" ]; then
+      echo "FAIL: path '$path' source '$source' does not exist on disk"
+      FAILED=1
+    fi
+  fi
 
   # 6: consumers field
   if [ "$consumers" = "all" ]; then

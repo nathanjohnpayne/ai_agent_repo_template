@@ -1,8 +1,8 @@
 # Templated propagation — Layer 5 substitution lib
 
-Status: **lib landed; sync integration pending in follow-up PR.**
+Status: **lib + sync/audit integration landed.** Propagation-lane verification of templated PRs is deferred to a follow-up (templated PRs go through normal Phase 4 review in v1).
 
-This doc covers `scripts/lib/template-substitution.sh` — the rendering engine that activates `type: templated` entries in `.mergepath-sync.yml`. It exists ahead of integration so the lib's contract can be reviewed and stabilized before code paths in `scripts/sync-to-downstream.sh`, `scripts/workflow/verify-propagation-pr.sh`, and `scripts/ci/check_sync_manifest` depend on it.
+This doc covers `scripts/lib/template-substitution.sh` — the rendering engine that activates `type: templated` entries in `.mergepath-sync.yml` — plus the sync integration that wires it into `scripts/sync-to-downstream.sh` for both audit and materialize.
 
 ## What the lib does
 
@@ -11,7 +11,7 @@ Renders a source template to per-consumer output using two surfaces:
 1. **Variable substitution** — anywhere in the file, `{{key}}` is replaced by the value of `MERGEPATH_FACT_KEY` (uppercased, hyphens → underscores). Keys must match `[a-z0-9_-]+` (lowercase letters, digits, underscore, hyphen); a malformed key — e.g. one containing shell metacharacters — is rejected as malformed template (render exit code 1), distinct from a syntactically valid but unset fact (which is empty in lenient mode or exit code 3 in strict mode).
 2. **Conditional blocks** — `>>> if <expr> ... <<<` markers gate body lines on per-consumer facts. Marker lines are **always stripped** from output regardless of the expression; only the body lines between them are conditional. If `<expr>` is true, body lines are emitted verbatim; if false, body lines are dropped.
 
-Sync-side integration (follow-up PR) is responsible for exporting per-consumer facts from the manifest before invoking the lib. The lib itself reads facts only from the environment.
+Sync-side integration (landed; see § Sync integration below) is responsible for exporting per-consumer facts from the manifest before invoking the lib. The lib itself reads facts only from the environment.
 
 ## Syntax reference
 
@@ -116,16 +116,56 @@ Real templates will accumulate optional-fact references over time (`{{node_versi
 
 ## Limits and known gaps
 
-- **The lib alone produces no output anywhere yet.** It's wired into `repo_lint.yml` via `scripts/ci/check_template_substitution` so its tests run on every PR, but no manifest entry uses `type: templated` yet. The follow-up integration PR adds that.
+- **No live templated entry in the manifest yet.** The lib + sync integration are wired (audit, materialize for per-commit + sync-all), but `.mergepath-sync.yml` has zero entries of `type: templated` today. Phase C adds the first one (`examples/eslint.config.js` → `eslint.config.js`) to unblock the [mergepath#250](https://github.com/nathanjohnpayne/mergepath/issues/250) ESLint rollout.
 - **The lib doesn't know about consumer name or repo.** Facts must be uniform across consumers (e.g., `frameworks`, `node_version`); per-consumer name substitution (`mergepath` → `<consumer>`) still goes through `scripts/bootstrap/substitute.sh`'s allow-list-driven path. Long-term, both should share a single substitution lib (per [#168 Layer 5's original sketch](https://github.com/nathanjohnpayne/mergepath/issues/168) — "factor the substitution logic into `scripts/lib/template-substitution.sh` so bootstrap and sync share the lib"), but that consolidation is non-trivial because the two callers have different semantics (literal name allow-list vs. fact-driven substitution). Tracked as future work.
-- **No `--audit`-side rendering yet.** Until the integration PR lands, `--audit` will continue to print "templated (deferred — Layer 5, #168)" for `type: templated` entries.
+- **Propagation-lane verification not yet implemented for templated.** See § Propagation-lane verification — v1 limitation below. Templated propagation PRs route to normal Phase 4 review until `verify-propagation-pr.sh` learns to re-render + byte-verify.
 
-## What the follow-up PR adds
+## Sync integration — what's wired up
 
-The next PR builds on this lib to:
+The follow-up integration PR landed:
 
-1. Add `facts:` schema to consumer entries in `.mergepath-sync.yml`, plus `source:` + `dest:` fields on path entries (so `examples/eslint.config.js` can land at consumer-root `eslint.config.js`).
-2. Extend `scripts/sync-to-downstream.sh` to handle `type: templated` — render per consumer using their facts, write to `dest`, commit/PR via the propagation lane.
-3. Extend `scripts/ci/check_sync_manifest` to validate the new schema (facts vocabulary, source/dest mapping consistency).
-4. Extend `scripts/workflow/verify-propagation-pr.sh` to re-render the source against `mergepath@<sha>` with consumer facts and byte-verify the PR content — closes the propagation-lane gate for templated paths.
-5. First templated entry: `examples/eslint.config.js` → `eslint.config.js` across the 6 consumers with non-empty JS/TS surface area, unblocking the [mergepath#250](https://github.com/nathanjohnpayne/mergepath/issues/250) ESLint rollout backlog.
+1. **Manifest schema** — `.mergepath-sync.yml` supports `facts:` blocks on consumers (mapping of `[a-z0-9_-]+` keys to scalar/list values) and `source:` + `dest:` fields on path entries (both default to `.path` when omitted; templated entries typically declare both because source ≠ dest is the point).
+
+2. **`scripts/ci/check_sync_manifest`** — validates the new schema. Templated entries without an explicit `dest:` produce a WARN (the source-dest decoupling is the whole point). Facts values that are nested mappings are rejected (the lib expects scalar/list); facts keys outside `[a-z0-9_-]+` are rejected (lib contract).
+
+3. **`scripts/sync-to-downstream.sh --audit`** — `compare_templated()` renders the source with the consumer's facts and byte-diffs against the consumer's on-disk dest. Reports `ok` / `drift:<lines>` / `missing` in the same tag scheme as canonical/kit.
+
+4. **`scripts/sync-to-downstream.sh <commit-sha>`** (per-commit slice) — `materialize_templated_targets()` renders each opted-in templated entry that changed at the commit and writes to the consumer's dest. Honors `.sync-overrides.yml` on the dest path. The commit body lists the templated paths with a "(templated, rendered from <source>)" annotation.
+
+5. **`scripts/sync-to-downstream.sh --sync-all`** (steady-state) — same materialize behavior for every templated entry the consumer opts into, regardless of changed-at-commit. Dry-run plan output shows templated targets explicitly.
+
+### Manifest example
+
+```yaml
+consumers:
+  - name: matchline
+    repo: nathanjohnpayne/matchline
+    visibility: private
+    facts:
+      frameworks: [react, typescript]
+      node_version: "20"
+
+paths:
+  - path: examples/eslint.config.js
+    type: templated
+    source: examples/eslint.config.js
+    dest: eslint.config.js
+    consumers: [matchline, swipewatch, ...]
+```
+
+A render for matchline exports `MERGEPATH_FACT_FRAMEWORKS="react typescript"` and `MERGEPATH_FACT_NODE_VERSION=20`, then runs the lib against `examples/eslint.config.js`. The output lands at `eslint.config.js` in the consumer's PR branch.
+
+## Propagation-lane verification — v1 limitation
+
+The `propagation_prs` review-lane exemption in `.github/review-policy.yml` (#264) currently does NOT cover templated entries: `scripts/workflow/verify-propagation-pr.sh` and its `parse_manifest_paths.sh` helper emit only mergepath-side `.path` values, so a PR touching a templated `dest` (which doesn't equal `.path`) reads as "off propagation surface" and the lane gate denies exemption — the PR routes to normal Phase 4 review.
+
+This is the **intentional v1 behavior**: templated rendering is new infrastructure, and an external review per templated propagation PR is appropriate while we build confidence. A follow-up PR will extend `verify-propagation-pr.sh` to re-render the source against `mergepath@<sha>` with the consumer's facts and byte-verify the PR content, at which point templated PRs become lane-eligible.
+
+Until then, expect templated propagation PRs to carry `needs-external-review`; they're not stuck — Phase 4a (Codex) or 4b (CLI handoff) will clear the gate normally.
+
+## What's queued next
+
+1. **Phase C** — restructure `examples/eslint.config.js` into a conditional-block template, add `facts.frameworks` to all 8 consumer entries, add the manifest entry for `eslint.config.js`.
+2. **Phase D** — canary propagation to swipewatch (smallest JS surface), then fanout to the remaining 5 consumers. Each consumer's PR carries the rendered config + a devDeps install + findings triage per its consumer-side issue.
+3. **Phase E** — close the 6 consumer issues and the [mergepath#250](https://github.com/nathanjohnpayne/mergepath/issues/250) parent tracker; file a retrospective on Layer 5 cost vs. payoff for future "should we templated-ize X?" judgment calls.
+4. **Lane-eligibility for templated** — extend `verify-propagation-pr.sh` to re-render-and-verify templated entries. Order vs. Phase D is flexible; v1 doesn't block on it.
