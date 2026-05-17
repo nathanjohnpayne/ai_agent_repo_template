@@ -64,6 +64,20 @@
 #   if present; without the file the hook conservatively assumes
 #   over-threshold so the self-approve block fires on safer side.
 #
+#   The self-approve guard has one carve-out (#334): propagation-lane
+#   sync PRs are EXEMPT. A PR qualifies as a lane PR when (1) its
+#   branch name starts with `mergepath-sync/` (configurable via
+#   GH_PR_GUARD_PROPAGATION_BRANCH_PREFIX) and (2) its GitHub author
+#   is the configured `nathanjohnpayne` identity. For lane PRs, the
+#   self-approve guard returns exit 0 without checking
+#   Authoring-Agent, size, or threshold — REVIEW_POLICY.md
+#   § Propagation PR review lane explicitly allows internal reviewer-
+#   identity APPROVED regardless of size, because the content is a
+#   verbatim mirror that was already reviewed in the upstream
+#   mergepath PR. The manifest-confinement third lane criterion is
+#   intentionally deferred to scripts/workflow/verify-propagation-
+#   pr.sh; branch_prefix + author is sufficient signal at this layer.
+#
 #   These guards are scoped to `gh pr comment` / `gh pr review` /
 #   `gh issue comment` / `gh issue create` exactly. `gh issue create`
 #   was added by #317 after the concrete misattribution of mergepath
@@ -782,11 +796,16 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
     esac
 
     if [ -n "$KEYRING_AGENT" ]; then
-      # Fetch PR body + lines-changed to determine (a) the
-      # Authoring-Agent line and (b) over-threshold status.
-      review_gh_args=(pr view --json body,additions,deletions,files --jq '{body: .body, additions: .additions, deletions: .deletions, files: [.files[].path]}')
+      # Fetch PR body + lines-changed + headRefName + author for the
+      # self-approve check. headRefName + author drive the propagation-
+      # lane bypass (#334): lane PRs (branch starts with
+      # `mergepath-sync/`, author = nathanjohnpayne) are exempt from
+      # cross-agent review per REVIEW_POLICY.md § Propagation PR
+      # review lane, so the same-agent self-approve guard shouldn't
+      # fire on them regardless of size or Authoring-Agent body line.
+      review_gh_args=(pr view --json body,additions,deletions,files,headRefName,author --jq '{body: .body, additions: .additions, deletions: .deletions, files: [.files[].path], head: .headRefName, author: .author.login}')
       if [ -n "$REVIEW_PR_SELECTOR" ]; then
-        review_gh_args=(pr view "$REVIEW_PR_SELECTOR" --json body,additions,deletions,files --jq '{body: .body, additions: .additions, deletions: .deletions, files: [.files[].path]}')
+        review_gh_args=(pr view "$REVIEW_PR_SELECTOR" --json body,additions,deletions,files,headRefName,author --jq '{body: .body, additions: .additions, deletions: .deletions, files: [.files[].path], head: .headRefName, author: .author.login}')
       fi
       if [ -n "$REVIEW_REPO" ]; then
         review_gh_args+=(--repo "$REVIEW_REPO")
@@ -801,6 +820,40 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
         echo "  stderr: $(cat "$REVIEW_GH_STDERR")" >&2
         echo "  command: gh ${review_gh_args[*]}" >&2
         exit 2
+      fi
+
+      # Propagation-lane bypass (#334). The lane criteria are:
+      #   (1) branch name starts with the configured branch_prefix
+      #       (default `mergepath-sync/`; override via
+      #       GH_PR_GUARD_PROPAGATION_BRANCH_PREFIX)
+      #   (2) PR author = configured author identity (default
+      #       nathanjohnpayne; reuses GH_PR_GUARD_EXPECTED_AUTHOR)
+      #
+      # REVIEW_POLICY.md § Propagation PR review lane explicitly
+      # exempts these PRs from the cross-agent Phase 4 requirement,
+      # because the content is a verbatim mirror that was already
+      # reviewed in the upstream mergepath PR. The lane PR still
+      # needs an internal reviewer-identity APPROVED, which is what
+      # the agent is trying to post — so the self-approve guard
+      # MUST step aside for lane PRs even when active=reviewer-agent
+      # AND PR body has `Authoring-Agent: <agent>` AND size > threshold.
+      #
+      # We deliberately skip the manifest-confinement third lane
+      # criterion (every changed file under a manifest-declared
+      # path) — that check belongs in verify-propagation-pr.sh, not
+      # the local pre-write hook. Branch_prefix + author is enough
+      # signal that this is a sync PR and the agent's approve is
+      # the documented next step.
+      PR_HEAD_REF=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oE '"head":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"head":[[:space:]]*"([^"]*)".*/\1/' || true)
+      PR_AUTHOR=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oE '"author":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"author":[[:space:]]*"([^"]*)".*/\1/' || true)
+      LANE_BRANCH_PREFIX="${GH_PR_GUARD_PROPAGATION_BRANCH_PREFIX:-mergepath-sync/}"
+      LANE_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-nathanjohnpayne}"
+      if [ -n "$PR_HEAD_REF" ] && [ -n "$PR_AUTHOR" ] \
+         && [ "$PR_AUTHOR" = "$LANE_AUTHOR" ] \
+         && [ "${PR_HEAD_REF#"$LANE_BRANCH_PREFIX"}" != "$PR_HEAD_REF" ]; then
+        # Lane criteria met — skip the self-approve guard entirely.
+        # Allow the gh pr review --approve to proceed.
+        exit 0
       fi
 
       PR_AUTHORING_AGENT=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oiE 'Authoring-Agent:[[:space:]]*[A-Za-z0-9_-]+' | head -1 | sed -E 's/Authoring-Agent:[[:space:]]*//I' | tr '[:upper:]' '[:lower:]' || true)
