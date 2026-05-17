@@ -118,11 +118,25 @@ consumers:
     visibility: public
     facts:
       frameworks: [react]
+      # ffb hand-added a vitest globals block during the Phase D
+      # fanout (#250); folding it into the template removes the
+      # override. See mergepath#322.
+      testing: vitest
+      # ffb's tests + several src/main.js patterns put JSX in `.js`
+      # files (no JSX in *.jsx). The default `**/*.{jsx,tsx}` glob
+      # misses them; jsx_in_js: true adds a second React rule entry
+      # that covers `.js` too. See mergepath#322.
+      jsx_in_js: true
   - name: device-platform-reporting
     repo: nathanjohnpayne/device-platform-reporting
     visibility: public
     facts:
       frameworks: [react]
+      # dpr uses Jest (not vitest); same template gap as ffb above.
+      testing: jest
+      # dpr is JS-only and uses babel-loader to transpile JSX inside
+      # `.js` files. Same opt-in as ffb. See mergepath#322.
+      jsx_in_js: true
   # swipewatch has minimal Node + vitest code, no frameworks. The
   # empty `frameworks: []` list opts it into the JS baseline only.
   - name: swipewatch
