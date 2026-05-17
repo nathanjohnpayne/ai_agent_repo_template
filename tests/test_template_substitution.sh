@@ -608,6 +608,91 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 12. Fact-driven defaults added in mergepath#322 — testing globals,
+#     jsx_in_js React glob extension, react_compiler advisory disables.
+#
+# These mirror the per-fact toggles that the ESLint template (post-#322)
+# uses. Each case exercises one fact in isolation against a minimal
+# template snippet so a regression in the lib's evaluator is caught
+# by a tightly-scoped failure rather than a full-template byte diff.
+# ---------------------------------------------------------------------------
+
+# 12a: testing == vitest renders vitest block, jest block does not.
+r=$(render_case "// >>> if testing contains vitest
+vitest globals
+// <<<
+// >>> if testing contains jest
+jest globals
+// <<<
+" "MERGEPATH_FACT_TESTING=vitest")
+expect_output "12a testing=vitest renders only vitest block" "$r" "vitest globals"
+
+# 12b: testing == jest renders jest block, vitest block does not.
+r=$(render_case "// >>> if testing contains vitest
+vitest globals
+// <<<
+// >>> if testing contains jest
+jest globals
+// <<<
+" "MERGEPATH_FACT_TESTING=jest")
+expect_output "12b testing=jest renders only jest block" "$r" "jest globals"
+
+# 12c: testing unset → neither block renders.
+r=$(render_case "// >>> if testing contains vitest
+vitest globals
+// <<<
+// >>> if testing contains jest
+jest globals
+// <<<
+")
+expect_output "12c testing unset → no testing block" "$r" ""
+
+# 12d: jsx_in_js: true (truthy) → js-included files glob renders.
+r=$(render_case "// >>> if jsx_in_js
+files: js+jsx+tsx
+// <<<
+" "MERGEPATH_FACT_JSX_IN_JS=true")
+expect_output "12d jsx_in_js=true → jsx-in-js block renders" "$r" "files: js+jsx+tsx"
+
+# 12e: jsx_in_js unset → block does NOT render (default behavior).
+r=$(render_case "// >>> if jsx_in_js
+files: js+jsx+tsx
+// <<<
+")
+expect_output "12e jsx_in_js unset → jsx-in-js block omitted" "$r" ""
+
+# 12f: React Compiler disable block gated on `frameworks contains
+# react` ONLY (codex P1 #327 round 2). For non-React consumers, the
+# block must NOT render — otherwise it'd inject react-hooks/* rule
+# IDs whose plugin isn't loaded, breaking ESLint config load with
+# "Definition for rule X was not found".
+r=$(render_case "// >>> if frameworks contains react
+react-hooks/set-state-in-effect: off
+// <<<
+" "MERGEPATH_FACT_FRAMEWORKS=react")
+expect_output "12f React Compiler block renders for React consumers" "$r" "react-hooks/set-state-in-effect: off"
+
+# 12g: For non-React consumers, the React Compiler disable block must
+# NOT render. Codex P1 round 2 caught this concretely on JS/TS-only
+# consumers — the rendered config previously emitted react-hooks/*
+# rules even when the plugin wasn't loaded.
+r=$(render_case "// >>> if frameworks contains react
+react-hooks/set-state-in-effect: off
+// <<<
+" "MERGEPATH_FACT_FRAMEWORKS=typescript")
+expect_output "12g React Compiler block omitted for non-React consumers" "$r" ""
+
+# 12h: facts.react_compiler is reserved for v2 (when the template lib
+# adds compound expressions or nested conditionals). It currently has
+# no effect on rendering — regression guard for accidental re-use of
+# the fact in template logic.
+r=$(render_case "// >>> if frameworks contains react
+react-hooks/set-state-in-effect: off
+// <<<
+" "MERGEPATH_FACT_FRAMEWORKS=react MERGEPATH_FACT_REACT_COMPILER=true")
+expect_output "12h react_compiler=true does NOT suppress disable block (v1 limitation)" "$r" "react-hooks/set-state-in-effect: off"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

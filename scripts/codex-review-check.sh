@@ -98,6 +98,23 @@ if [ -r "$__CODEX_CHECK_DIR/lib/preflight-helpers.sh" ]; then
   preflight_require_token reviewer || true
 fi
 
+# --- gh retry helper (#324) ------------------------------------------------
+# Wrap gh calls (statusCheckRollup read in particular) in 3×30s retry on
+# transient failures (HTTP 5xx, rate-limit, "Resource not accessible by
+# integration"). Permanent 4xx errors break out immediately. The
+# canonical helper lives at scripts/lib/gh-retry-helpers.sh and is
+# declared as a `requires:` dep of this script in .mergepath-sync.yml,
+# so propagated consumers always carry it. The existence-guarded
+# fallback below means a hand-built or partial install still runs
+# (without retry) rather than aborting with "with_gh_retry: command
+# not found" at the call site.
+if [ -r "$__CODEX_CHECK_DIR/lib/gh-retry-helpers.sh" ]; then
+  # shellcheck source=lib/gh-retry-helpers.sh
+  . "$__CODEX_CHECK_DIR/lib/gh-retry-helpers.sh"
+else
+  with_gh_retry() { "$@"; }
+fi
+
 # --- argument parsing -------------------------------------------------------
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
@@ -521,8 +538,15 @@ log "gate (a): checking CI state"
 # state. A check still running (no conclusion yet) is treated as not-green
 # — the caller should wait or retry. SKIPPED is treated as success because
 # many Agent Review Pipeline jobs skip by design when the label is set.
-ROLLUP_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json statusCheckRollup 2>&1) \
-  || die 3 "failed to fetch statusCheckRollup: $ROLLUP_JSON"
+# Drop `2>&1`: with_gh_retry emits per-attempt diagnostics to stderr on
+# transient failures, and merging those lines into ROLLUP_JSON would
+# corrupt the jq parse below — a transient 5xx + successful retry would
+# look like an infra error (gate (a) fail) when the retry actually
+# recovered. Caught by codex P1 on PR #328 round 1. The retry diagnostics
+# still surface in the workflow log via stderr, so the visibility cost
+# is zero.
+ROLLUP_JSON=$(with_gh_retry gh pr view "$PR_NUMBER" --repo "$REPO" --json statusCheckRollup) \
+  || die 3 "failed to fetch statusCheckRollup (see stderr above for retry diagnostics)"
 
 # statusCheckRollup mixes two entry types:
 #   - CheckRun (GitHub Actions jobs): uses .name, .workflowName,
