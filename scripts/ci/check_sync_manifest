@@ -45,8 +45,25 @@ if ! command -v yq >/dev/null 2>&1; then
 fi
 
 if [ ! -f "$MANIFEST" ]; then
-  echo "FAIL: .mergepath-sync.yml is missing at repo root"
-  exit 1
+  # The manifest is mergepath-only — `.mergepath-sync.yml` is
+  # deliberately NOT propagated to consumers (the entire manifest
+  # lists every consumer repo's privacy-sensitive metadata, so the
+  # propagation lane keeps it mergepath-internal; see the inline
+  # comment in `.mergepath-sync.yml` around the canonical-workflows
+  # block referencing #268/#271). The check_* wrapper IS propagated
+  # via the scripts/ci/ kit, so when consumers run it ad-hoc they
+  # land in a checkout where the manifest is absent.
+  #
+  # Pre-mergepath#320 this exited 1 with a "missing" FAIL, which
+  # made the check perpetually red on every consumer that invoked
+  # it. The consumer-side failure was acceptable noise as long as
+  # consumer CI didn't gate on it (it didn't — repo_lint.yml is
+  # consumer-specific and never wired this check), but it tripped
+  # nathanpayne-codex's Phase D 4b ad-hoc run on every consumer PR
+  # because the wrapper is in the diff's propagated content.
+  # Skipping with a clear diagnostic is the right semantic.
+  echo "check_sync_manifest: SKIP (mergepath-only: .mergepath-sync.yml not present in this checkout)"
+  exit 0
 fi
 
 # Parse-check: yq exits non-zero on a malformed YAML.

@@ -12,6 +12,17 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_export_consumer_facts.sh"
+SYNC_SCRIPT="$REPO_ROOT/scripts/sync-to-downstream.sh"
+
+# Skip when running in a consumer checkout — the script being
+# tested (scripts/sync-to-downstream.sh's export_consumer_facts
+# function) is mergepath-internal and not propagated. Same
+# rationale as check_template_substitution above; same Phase D 4b
+# review surfacing.
+if [ ! -f "$SYNC_SCRIPT" ]; then
+  echo "check_export_consumer_facts: SKIP (mergepath-only: scripts/sync-to-downstream.sh not present in this checkout)"
+  exit 0
+fi
 
 if [ ! -f "$TEST_SCRIPT" ]; then
   echo "check_export_consumer_facts: ERROR (missing $TEST_SCRIPT)" >&2
