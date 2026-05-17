@@ -23,17 +23,33 @@ set -euo pipefail
 with_gh_retry() {
   local attempts=${GH_RETRY_ATTEMPTS:-3}
   local backoff=${GH_RETRY_BACKOFF_SECONDS:-30}
-  # Validate env knobs (CR Major #328 round 2). Non-numeric or
-  # non-positive values previously could skip the loop entirely
-  # (returning success with empty output) or break `sleep` under
-  # `set -e`. Fall back to the defaults with a stderr warning rather
-  # than silently no-op'ing.
+  # Validate env knobs (CR Major #328 round 2, Minor round 3). Non-
+  # numeric or non-positive values previously could skip the loop
+  # entirely (returning success with empty output) or break `sleep`
+  # under `set -e`. Fall back to the defaults with a stderr warning
+  # rather than silently no-op'ing.
+  #
+  # Two-phase validation: first reject non-numeric strings via case
+  # pattern, then reject non-positive integers via arithmetic. The
+  # arithmetic phase closes the leading-zero hole CR caught on round
+  # 2 — `case "00" in 0)` doesn't match (case patterns are literal,
+  # not numeric) but bash arithmetic treats "00" as 0, so the prior
+  # validation passed but the while loop never entered.
   case "$attempts" in
-    ''|*[!0-9]*|0) printf '[gh-retry] WARN: GH_RETRY_ATTEMPTS=%q invalid; using default 3\n' "$attempts" >&2; attempts=3 ;;
+    ''|*[!0-9]*) printf '[gh-retry] WARN: GH_RETRY_ATTEMPTS=%q non-numeric; using default 3\n' "$attempts" >&2; attempts=3 ;;
   esac
+  if [ "$attempts" -le 0 ] 2>/dev/null; then
+    printf '[gh-retry] WARN: GH_RETRY_ATTEMPTS=%q non-positive; using default 3\n' "$attempts" >&2
+    attempts=3
+  fi
   case "$backoff" in
-    ''|*[!0-9]*) printf '[gh-retry] WARN: GH_RETRY_BACKOFF_SECONDS=%q invalid; using default 30\n' "$backoff" >&2; backoff=30 ;;
+    ''|*[!0-9]*) printf '[gh-retry] WARN: GH_RETRY_BACKOFF_SECONDS=%q non-numeric; using default 30\n' "$backoff" >&2; backoff=30 ;;
   esac
+  # Backoff can legitimately be 0 (no sleep between retries — useful
+  # for tests), so the arithmetic-positivity check applies only to
+  # `attempts`. A negative `backoff` would only occur if a user
+  # passed e.g. `-1`, which fails the case pattern above and is
+  # already caught.
   local attempt=1
   local rc=0
   local output=""
