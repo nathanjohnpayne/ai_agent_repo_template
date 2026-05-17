@@ -41,14 +41,17 @@
 #     - gh pr comment <PR#> --body "..."
 #     - gh pr review <PR#> --comment / --approve / --request-changes
 #     - gh issue comment <issue#> --body "..."
+#     - gh issue create --title "..." --body "..."     (#317)
 #
-#   For all three, the keyring's active account must be the agent's
+#   For all four, the keyring's active account must be the agent's
 #   REVIEWER identity (nathanpayne-<agent>, default nathanpayne-claude;
 #   override via GH_PR_GUARD_EXPECTED_REVIEWER). Posting these as the
 #   AUTHOR identity (nathanjohnpayne) breaks the audit-trail
 #   convention REVIEW_POLICY.md depends on — reviewer comments must
-#   attribute to the reviewer. The check fires before the keyring
-#   write so misattributed comments never land.
+#   attribute to the reviewer, and an agent filing their own bug must
+#   attribute to that agent (not to the author identity). The check
+#   fires before the keyring write so misattributed comments / issues
+#   never land.
 #
 #   Additionally, `gh pr review --approve` is blocked when the
 #   target PR is OVER-threshold AND the keyring is the agent's own
@@ -62,12 +65,21 @@
 #   over-threshold so the self-approve block fires on safer side.
 #
 #   These guards are scoped to `gh pr comment` / `gh pr review` /
-#   `gh issue comment` exactly. Raw `gh api -X POST .../comments` is
-#   intentionally NOT covered in this PR — the token/keyring auth
-#   matrix for raw `gh api` writes is not yet precise enough to
-#   block on without false positives. See REVIEW_POLICY.md
-#   § Operation-to-Identity Matrix (graphql write — PAT-attributed)
-#   for the auth-split context and the follow-up tracked under #284.
+#   `gh issue comment` / `gh issue create` exactly. `gh issue create`
+#   was added by #317 after the concrete misattribution of mergepath
+#   #315 — a `nathanpayne-claude` agent session filed a bug, but the
+#   keyring had drifted to `nathanpayne-codex` from the prior Phase
+#   4b CLI run, and the issue landed under the wrong byline. The
+#   guard treats `gh issue create` the same as `gh issue comment`:
+#   keyring active must be the REVIEWER identity (an agent posting
+#   their own work).
+#
+#   Raw `gh api -X POST .../comments` is still intentionally NOT
+#   covered — the token/keyring auth matrix for raw `gh api` writes
+#   is not yet precise enough to block on without false positives.
+#   See REVIEW_POLICY.md § Operation-to-Identity Matrix (graphql
+#   write — PAT-attributed) for the auth-split context and the
+#   follow-up tracked under #284.
 #
 # The identity check (1a) honors a
 # BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK=1 escape hatch for tests
@@ -576,44 +588,61 @@ EFFECTIVE_CODEX_CLEARED="${CODEX_CLEARED:-${INLINE_CODEX_CLEARED:-}}"
 EFFECTIVE_BREAK_GLASS_ADMIN="${BREAK_GLASS_ADMIN:-${INLINE_BREAK_GLASS_ADMIN:-}}"
 EFFECTIVE_BREAK_GLASS_MERGE_STATE="${BREAK_GLASS_MERGE_STATE:-${INLINE_BREAK_GLASS_MERGE_STATE:-}}"
 
-# Distinguish `gh pr comment` from `gh issue comment` — both share the
-# same subcommand label `comment` but route through different parent
-# tokens. We track this with IS_ISSUE_COMMENT so downstream guard
-# branches can emit the right diagnostic label.
+# Distinguish `gh pr comment` from `gh issue comment` (both share the
+# subcommand label `comment` but route through different parent
+# tokens) AND `gh pr create` from `gh issue create` (same shape, with
+# `gh issue create` added by #317). Downstream guard branches use
+# these flags to pick the right diagnostic label and the right
+# expected-identity policy.
 IS_ISSUE_COMMENT=0
+IS_ISSUE_CREATE=0
 if [ "$SAW_ISSUE" -eq 1 ] && [ "$PR_SUBCOMMAND" = "comment" ]; then
   IS_ISSUE_COMMENT=1
 fi
+if [ "$SAW_ISSUE" -eq 1 ] && [ "$PR_SUBCOMMAND" = "create" ]; then
+  IS_ISSUE_CREATE=1
+fi
 
 # A `gh issue <X>` invocation where X is anything OTHER than `comment`
-# (issue create / close / view / list / etc.) is out of scope for this
-# PR. Allow.
-if [ "$SAW_ISSUE" -eq 1 ] && [ "$IS_ISSUE_COMMENT" -eq 0 ]; then
+# or `create` (issue close / view / list / edit / etc.) is out of
+# scope for this hook. Allow.
+if [ "$SAW_ISSUE" -eq 1 ] && [ "$IS_ISSUE_COMMENT" -eq 0 ] && [ "$IS_ISSUE_CREATE" -eq 0 ]; then
   exit 0
 fi
 
-# Not a covered command? Allow.
+# Not a covered command? Allow. `gh pr create` and `gh issue create`
+# both have PR_SUBCOMMAND=="create"; the IS_ISSUE_CREATE flag is what
+# routes them to different identity expectations below (author for pr,
+# reviewer for issue).
 if [ "$PR_SUBCOMMAND" != "create" ] && \
    [ "$PR_SUBCOMMAND" != "merge" ] && \
    [ "$PR_SUBCOMMAND" != "comment" ] && \
    [ "$PR_SUBCOMMAND" != "review" ] && \
-   [ "$IS_ISSUE_COMMENT" -eq 0 ]; then
+   [ "$IS_ISSUE_COMMENT" -eq 0 ] && \
+   [ "$IS_ISSUE_CREATE" -eq 0 ]; then
   exit 0
 fi
 
-# --- byline guard for pr comment / pr review / issue comment ----------
+# --- byline guard for pr comment / pr review / issue comment / issue create ---
 #
-# These three subcommands share a single policy: the keyring's active
+# These four subcommands share a single policy: the keyring's active
 # account must be the agent's REVIEWER identity (not the author
 # identity). Posting any of them under nathanjohnpayne mis-attributes
 # the byline in a way that breaks the audit-trail invariant
 # REVIEW_POLICY.md depends on.
 #
+# `gh issue create` was added by #317 after mergepath#315 landed
+# under the wrong byline (a nathanpayne-claude agent filed the bug
+# but the keyring had drifted to nathanpayne-codex from a prior
+# Phase 4b CLI session). Same byline-attribution rule as the other
+# three: an agent filing their own bug must attribute to their
+# REVIEWER identity.
+#
 # The `gh pr review --approve` self-approve sub-guard runs after this
 # block — only if we made it past the basic byline check does the
 # self-approve question even arise.
 EXPECTED_REVIEWER="${GH_PR_GUARD_EXPECTED_REVIEWER:-nathanpayne-claude}"
-if [ "$PR_SUBCOMMAND" = "comment" ] || [ "$PR_SUBCOMMAND" = "review" ] || [ "$IS_ISSUE_COMMENT" -eq 1 ]; then
+if [ "$PR_SUBCOMMAND" = "comment" ] || [ "$PR_SUBCOMMAND" = "review" ] || [ "$IS_ISSUE_COMMENT" -eq 1 ] || [ "$IS_ISSUE_CREATE" -eq 1 ]; then
   if [ "${BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
     ACTIVE_GH_USER=$(gh config get -h github.com user 2>/dev/null || echo "")
     if [ -z "$ACTIVE_GH_USER" ]; then
@@ -635,12 +664,19 @@ if [ "$PR_SUBCOMMAND" = "comment" ] || [ "$PR_SUBCOMMAND" = "review" ] || [ "$IS
         review)  cmd_label="gh pr review" ;;
       esac
       [ "$IS_ISSUE_COMMENT" -eq 1 ] && cmd_label="gh issue comment"
+      [ "$IS_ISSUE_CREATE" -eq 1 ] && cmd_label="gh issue create"
       echo "BLOCKED: $cmd_label is about to run under active account '$ACTIVE_GH_USER' (the AUTHOR identity)." >&2
       echo "" >&2
-      echo "  Reviewer-byline commands (pr comment / pr review / issue comment) must attribute to the" >&2
-      echo "  agent's REVIEWER identity ('$EXPECTED_REVIEWER' by default), not the author identity." >&2
-      echo "  Posting as '$EXPECTED_AUTHOR_FOR_BLOCK' breaks the audit-trail convention" >&2
-      echo "  REVIEW_POLICY.md depends on." >&2
+      echo "  Reviewer-byline commands (pr comment / pr review / issue comment / issue create)" >&2
+      echo "  must attribute to the agent's REVIEWER identity ('$EXPECTED_REVIEWER' by default)," >&2
+      echo "  not the author identity. Posting as '$EXPECTED_AUTHOR_FOR_BLOCK' breaks the audit-" >&2
+      echo "  trail convention REVIEW_POLICY.md depends on." >&2
+      if [ "$IS_ISSUE_CREATE" -eq 1 ]; then
+        echo "" >&2
+        echo "  Concrete instance: mergepath#315 landed under nathanpayne-codex despite being" >&2
+        echo "  filed by a nathanpayne-claude agent session, because the keyring had drifted" >&2
+        echo "  from a prior Phase 4b CLI run. This hook closes that gap (#317)." >&2
+      fi
       echo "" >&2
       echo "  Fix once: gh auth switch -u $EXPECTED_REVIEWER" >&2
       echo "  Or wrap the single call: scripts/gh-as-reviewer.sh -- $cmd_label ..." >&2
@@ -648,6 +684,17 @@ if [ "$PR_SUBCOMMAND" = "comment" ] || [ "$PR_SUBCOMMAND" = "review" ] || [ "$IS
       exit 2
     fi
   fi
+fi
+
+# --- gh issue create: exit cleanly after the byline check ------------
+#
+# `gh issue create` shares PR_SUBCOMMAND=="create" with `gh pr create`,
+# so without this short-circuit it would fall through into the pr-create
+# branch below (which expects the AUTHOR identity, not the REVIEWER
+# identity — opposite of what `gh issue create` wants). Exit 0 here so
+# downstream pr-create logic doesn't fire.
+if [ "$IS_ISSUE_CREATE" -eq 1 ]; then
+  exit 0
 fi
 
 # --- gh pr review --approve self-approve sub-guard --------------------
