@@ -96,27 +96,45 @@ consumers:
   - name: matchline
     repo: nathanjohnpayne/matchline
     visibility: private
+    facts:
+      frameworks: [react, typescript]
   - name: nathanpaynedotcom
     repo: nathanjohnpayne/nathanpaynedotcom
     visibility: private
+    facts:
+      frameworks: [astro, typescript]
+  # overridebroadway has zero lintable JS/TS surface area today; it's
+  # excluded from the ESLint templated entry's consumers list rather
+  # than carrying empty facts. No facts block needed.
   - name: overridebroadway
     repo: nathanjohnpayne/overridebroadway
     visibility: private
+  # Same exclusion rationale as overridebroadway above.
   - name: device-source-of-truth
     repo: nathanjohnpayne/device-source-of-truth
     visibility: public
   - name: friends-and-family-billing
     repo: nathanjohnpayne/friends-and-family-billing
     visibility: public
+    facts:
+      frameworks: [react]
   - name: device-platform-reporting
     repo: nathanjohnpayne/device-platform-reporting
     visibility: public
+    facts:
+      frameworks: [react]
+  # swipewatch has minimal Node + vitest code, no frameworks. The
+  # empty `frameworks: []` list opts it into the JS baseline only.
   - name: swipewatch
     repo: nathanjohnpayne/swipewatch
     visibility: public
+    facts:
+      frameworks: []
   - name: tadlockpsychiatry
     repo: nathanjohnpayne/tadlockpsychiatry
     visibility: private
+    facts:
+      frameworks: [react, typescript]
 
 # Path types:
 #   canonical  — byte-for-byte mirror. Any difference is drift.
@@ -482,6 +500,41 @@ paths:
   - path: scripts/workflow/
     type: kit
     consumers: all
+
+  # Templated entries — rendered per consumer via scripts/lib/
+  # template-substitution.sh using the consumer's facts.* from the
+  # consumers: block above. See § Path types above for the full
+  # contract, and docs/agents/templated-propagation.md for syntax.
+
+  # ESLint flat-config per the Mergepath ESLint standard floor
+  # (mergepath#250). Source is the conditional-block template at
+  # examples/eslint.config.js; dest lands at the consumer repo's
+  # root as eslint.config.js. The render keeps the JS baseline
+  # always-on and stacks framework blocks (typescript / astro /
+  # react) per the consumer's declared `facts.frameworks`.
+  #
+  # Consumers excluded: device-source-of-truth and overridebroadway
+  # have zero lintable JS/TS surface area; the ESLint policy floor
+  # doesn't apply to them (rules/repo_rules.md § ESLint policy).
+  #
+  # Per-consumer rendered shapes:
+  #   matchline          → JS + TS + React + react-hooks
+  #   nathanpaynedotcom  → JS + TS + Astro
+  #   friends-and-family-billing → JS + React + react-hooks
+  #   device-platform-reporting  → JS + React + react-hooks
+  #   tadlockpsychiatry  → JS + TS + React + react-hooks
+  #   swipewatch         → JS baseline only (frameworks: [])
+  - path: examples/eslint.config.js
+    source: examples/eslint.config.js
+    dest: eslint.config.js
+    type: templated
+    consumers:
+      - matchline
+      - nathanpaynedotcom
+      - friends-and-family-billing
+      - device-platform-reporting
+      - tadlockpsychiatry
+      - swipewatch
 
 # Per-consumer exclusions. Use sparingly — drift exceptions become
 # audit noise over time. Each entry must list a `reason:` so future
