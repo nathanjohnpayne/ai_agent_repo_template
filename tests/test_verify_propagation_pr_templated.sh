@@ -90,8 +90,8 @@ build_consumer() {
 }
 
 run_verify() {  # $1=mp $2=consumer; sets RC, STDOUT_FILE, STDERR_FILE
-  STDOUT_FILE=$(mktemp -t "verify-out.XXXXXX")
-  STDERR_FILE=$(mktemp -t "verify-err.XXXXXX")
+  STDOUT_FILE=$(mktemp "${TMPDIR:-/tmp}/verify-out.XXXXXX")
+  STDERR_FILE=$(mktemp "${TMPDIR:-/tmp}/verify-err.XXXXXX")
   set +e
   MERGEPATH_CONSUMER=alpha "$VERIFY" "$1" "$2" "$BASE_SHA" "$HEAD_SHA" \
     > "$STDOUT_FILE" 2> "$STDERR_FILE"
@@ -214,8 +214,8 @@ build_consumer "$C4" "doesnt matter
 "
 # Run with strict mode on. MERGEPATH_TEMPLATE_STRICT is honored by the
 # template lib at render time.
-STDOUT_FILE=$(mktemp -t "verify-out.XXXXXX")
-STDERR_FILE=$(mktemp -t "verify-err.XXXXXX")
+STDOUT_FILE=$(mktemp "${TMPDIR:-/tmp}/verify-out.XXXXXX")
+STDERR_FILE=$(mktemp "${TMPDIR:-/tmp}/verify-err.XXXXXX")
 set +e
 MERGEPATH_CONSUMER=alpha MERGEPATH_TEMPLATE_STRICT=1 \
   "$VERIFY" "$MP4" "$C4" "$BASE_SHA" "$HEAD_SHA" \

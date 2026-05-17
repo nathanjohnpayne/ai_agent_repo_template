@@ -294,8 +294,8 @@ if [ "$TEMPLATED_SURFACE_ACTIVE" = "1" ] && [ -n "$CONSUMER_NAME" ]; then
 
       # Render in a subshell so the facts export + lib sourcing don't
       # leak between iterations.
-      rendered=$(mktemp -t "verify-prop-rendered.XXXXXX")
-      render_err=$(mktemp -t "verify-prop-render-err.XXXXXX")
+      rendered=$(mktemp "${TMPDIR:-/tmp}/verify-prop-rendered.XXXXXX")
+      render_err=$(mktemp "${TMPDIR:-/tmp}/verify-prop-render-err.XXXXXX")
       render_rc=0
       (
         export_consumer_facts "$CONSUMER_NAME" "$MANIFEST"
@@ -317,7 +317,7 @@ if [ "$TEMPLATED_SURFACE_ACTIVE" = "1" ] && [ -n "$CONSUMER_NAME" ]; then
       rm -f "$render_err"
 
       # Pull the PR's dest content at HEAD via `git show`.
-      pr_content=$(mktemp -t "verify-prop-pr.XXXXXX")
+      pr_content=$(mktemp "${TMPDIR:-/tmp}/verify-prop-pr.XXXXXX")
       if ! git -C "$CONSUMER_DIR" show "${HEAD_SHA}:${tpl_dest}" > "$pr_content" 2>/dev/null; then
         fail_templated_error "$tpl_dest — templated dest not present at PR HEAD (consumer=$CONSUMER_NAME)"
         rm -f "$rendered" "$pr_content"
