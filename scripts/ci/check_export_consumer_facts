@@ -12,6 +12,27 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_export_consumer_facts.sh"
+SYNC_SCRIPT="$REPO_ROOT/scripts/sync-to-downstream.sh"
+
+# Disambiguate consumer-side vs mergepath-side misconfig via the
+# .mergepath-sync.yml marker (intentionally not propagated to
+# consumers). Same pattern as check_template_substitution.
+#
+# - sync script missing AND .mergepath-sync.yml missing →
+#   consumer checkout that received the kit-propagated wrapper →
+#   SKIP exit 0
+# - sync script missing AND .mergepath-sync.yml present →
+#   mergepath misconfig (sync script accidentally deleted/renamed)
+#   → FAIL exit 1. Codex P2 round 2 on PR #321 caught the fail-
+#   open risk on the blanket SKIP.
+if [ ! -f "$SYNC_SCRIPT" ]; then
+  if [ ! -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
+    echo "check_export_consumer_facts: SKIP (consumer checkout: scripts/sync-to-downstream.sh + .mergepath-sync.yml both absent)"
+    exit 0
+  fi
+  echo "FAIL: scripts/sync-to-downstream.sh is missing but .mergepath-sync.yml IS present — mergepath misconfig (sync script accidentally deleted/renamed?)" >&2
+  exit 1
+fi
 
 if [ ! -f "$TEST_SCRIPT" ]; then
   echo "check_export_consumer_facts: ERROR (missing $TEST_SCRIPT)" >&2
