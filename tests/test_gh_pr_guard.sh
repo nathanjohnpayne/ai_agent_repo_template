@@ -77,17 +77,22 @@ case "$1 $2" in
       *body*)
         # Self-approve sub-guard fetch: emits a single JSON-ish blob.
         # The hook's --jq filter projects it into {body, additions,
-        # deletions, files} but our stub returns the same shape the
-        # hook then greps. Just emit raw fields the hook looks for.
+        # deletions, files, head, author} but our stub returns the
+        # same shape the hook then greps. Emit each field the hook
+        # looks for.
         body_safe="${STUB_PR_BODY:-}"
         additions="${STUB_PR_ADDITIONS:-0}"
         deletions="${STUB_PR_DELETIONS:-0}"
-        # The hook parses additions/deletions via regex on the
-        # "additions": NUM pattern, and reads PR_AUTHORING_AGENT from
-        # a body grep. Emit both in a single buffer.
+        # head + author drive the propagation-lane bypass (#334).
+        # Default head ref is a non-lane branch name; tests that
+        # exercise the lane override these explicitly via STUB_*.
+        head_ref="${STUB_PR_HEAD:-feature/some-branch}"
+        author="${STUB_PR_AUTHOR:-nathanjohnpayne}"
         printf '%s\n' "$body_safe"
         printf '"additions": %s\n' "$additions"
         printf '"deletions": %s\n' "$deletions"
+        printf '"head": "%s"\n' "$head_ref"
+        printf '"author": "%s"\n' "$author"
         exit 0
         ;;
       *)
@@ -138,6 +143,8 @@ run_hook_review() {
   local pr_body="${4:-}"
   local additions="${5:-0}"
   local deletions="${6:-0}"
+  local pr_head="${7:-feature/some-branch}"
+  local pr_author="${8:-nathanjohnpayne}"
   local payload
   payload=$(jq -n --arg c "$cmd" '{tool_input: {command: $c}}')
   PATH="$STUB_DIR:$PATH" \
@@ -145,6 +152,8 @@ run_hook_review() {
   STUB_PR_BODY="$pr_body" \
   STUB_PR_ADDITIONS="$additions" \
   STUB_PR_DELETIONS="$deletions" \
+  STUB_PR_HEAD="$pr_head" \
+  STUB_PR_AUTHOR="$pr_author" \
   BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK="$skip_id" \
     bash "$HOOK" <<<"$payload"
 }
@@ -693,6 +702,100 @@ if [ "$rc" -eq 0 ]; then
   pass "byline guard: BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK=1 bypasses pr comment block"
 else
   fail "byline guard bypass: exit $rc, expected 0; output: $out"
+fi
+
+# ===========================================================================
+# Propagation-lane bypass (#334) — `gh pr review --approve` on a sync PR
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Test 29: propagation-lane PR (branch starts with mergepath-sync/,
+# author = nathanjohnpayne) MUST be approvable by the same agent that's
+# named in the body's Authoring-Agent line, EVEN when over-threshold.
+# REVIEW_POLICY.md § Propagation PR review lane explicitly allows internal
+# reviewer-identity APPROVED on these because the content is a verbatim
+# mirror that was already reviewed in the upstream mergepath PR. Closes #334.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook_review 'gh pr review 236 --approve --body "Propagation-lane approval."' \
+  "nathanpayne-claude" "0" \
+  "Sync to mergepath@b12e7d7. Authoring-Agent: claude" \
+  "5000" "0" \
+  "mergepath-sync/sync-all-b12e7d7" "nathanjohnpayne" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "propagation-lane: branch=mergepath-sync/* + author=nathanjohnpayne allows same-agent approve despite size + Authoring-Agent match"
+else
+  fail "propagation-lane bypass: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 30: lane bypass keys on BOTH criteria. Branch matches but author is
+# a different identity (e.g., a hijacked branch name) → bypass MUST NOT
+# fire; the self-approve guard still blocks. Defensive: a third-party
+# pushing to mergepath-sync/* shouldn't get free self-approve.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook_review 'gh pr review 99 --approve --body "Authoring-Agent: claude"' \
+  "nathanpayne-claude" "0" \
+  "Authoring-Agent: claude" \
+  "5000" "0" \
+  "mergepath-sync/sync-all-deadbeef" "some-other-author" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "lane bypass requires author match: exit $rc, expected 2 (block); output: $out"
+elif ! echo "$out" | grep -qi "self-approve detected"; then
+  fail "lane bypass requires author match: diagnostic missing 'self-approve detected'; output: $out"
+else
+  pass "propagation-lane: bypass requires BOTH branch_prefix AND author match (blocks when author wrong)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 31: lane bypass keys on BOTH criteria the other way. Author matches
+# but branch is a normal feature branch → bypass MUST NOT fire. Defensive:
+# a same-author feature branch is NOT a sync PR.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook_review 'gh pr review 99 --approve --body "Authoring-Agent: claude"' \
+  "nathanpayne-claude" "0" \
+  "Authoring-Agent: claude" \
+  "5000" "0" \
+  "feature/some-real-work" "nathanjohnpayne" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "lane bypass requires branch_prefix match: exit $rc, expected 2 (block); output: $out"
+elif ! echo "$out" | grep -qi "self-approve detected"; then
+  fail "lane bypass requires branch_prefix match: diagnostic missing 'self-approve detected'; output: $out"
+else
+  pass "propagation-lane: bypass requires BOTH branch_prefix AND author match (blocks when branch wrong)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 32: GH_PR_GUARD_PROPAGATION_BRANCH_PREFIX override. Customizing
+# the branch prefix to a non-default value (e.g., `sync/` for a fork that
+# uses a different convention) should make THAT prefix the lane signal.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_DIR_BAK="$STUB_DIR"; \
+      PATH="$STUB_DIR:$PATH" \
+      STUB_ACTIVE_USER="nathanpayne-claude" \
+      STUB_PR_BODY="Authoring-Agent: claude" \
+      STUB_PR_ADDITIONS="5000" \
+      STUB_PR_DELETIONS="0" \
+      STUB_PR_HEAD="sync/all-abc123" \
+      STUB_PR_AUTHOR="nathanjohnpayne" \
+      GH_PR_GUARD_PROPAGATION_BRANCH_PREFIX="sync/" \
+      BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK="0" \
+        bash "$HOOK" <<<"$(jq -n --arg c 'gh pr review 99 --approve --body "ok"' '{tool_input: {command: $c}}')" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "propagation-lane: GH_PR_GUARD_PROPAGATION_BRANCH_PREFIX override recognizes alternate prefix"
+else
+  fail "propagation-lane prefix override: exit $rc, expected 0; output: $out"
 fi
 
 # ---------------------------------------------------------------------------
