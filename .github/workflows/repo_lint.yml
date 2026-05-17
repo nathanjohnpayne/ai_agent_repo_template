@@ -189,6 +189,17 @@ jobs:
         # mirror lane silently re-overwriting them.
         run: ./scripts/ci/check_sync_overrides
 
+      - name: check_template_substitution
+        # Exercises tests/test_template_substitution.sh — verifies the
+        # Layer 5 template-substitution lib's v1 syntax (variable
+        # substitution, conditional blocks, comment-prefix flexibility,
+        # malformed-template error paths, strict-mode fact-miss, atomic
+        # render_to). The lib is the substitution engine for the
+        # `type: templated` manifest entries (activated in a follow-up
+        # PR); the check is wired now so the lib's contract is guarded
+        # independently of integration.
+        run: ./scripts/ci/check_template_substitution
+
       - name: check_coderabbit_config
         # Validates the template-level .coderabbit.yml stays on the
         # nit-suppressing profile (chill). Shares the yq install with
