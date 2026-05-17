@@ -325,6 +325,23 @@ if [ "$TEMPLATED_SURFACE_ACTIVE" = "1" ] && [ -n "$CONSUMER_NAME" ]; then
       fi
 
       if diff -q "$rendered" "$pr_content" >/dev/null 2>&1; then
+        # Byte-compare cleared. Now check the tree entry's mode + type
+        # match the expected `100644 blob` shape — otherwise metadata-
+        # only tampering (chmod +x flip, regular-file ↔ symlink swap)
+        # passes lane verification while changing the consumer's
+        # on-disk file behavior. Codex P1 #329 round 2 caught this:
+        # the templated arm was byte-only while the canonical loop's
+        # tree-entry compare (mode + type + oid via `git ls-tree`)
+        # was being skipped via the VERIFIED_TEMPLATED_DESTS exempt.
+        tpl_consumer_entry=$(git -C "$CONSUMER_DIR" ls-tree "$HEAD_SHA" -- "$tpl_dest" 2>/dev/null | awk '{print $1, $2}')
+        if [ "$tpl_consumer_entry" != "100644 blob" ]; then
+          {
+            echo "verify-propagation-pr.sh: templated dest $tpl_dest has unexpected tree entry [$tpl_consumer_entry], expected [100644 blob] (mode/type tampering — chmod +x flip or symlink swap, not a faithful render)"
+          } >&2
+          fail_templated_drift "$tpl_dest — templated dest tree entry [$tpl_consumer_entry] differs from expected [100644 blob] (source=$tpl_source, consumer=$CONSUMER_NAME)"
+          rm -f "$rendered" "$pr_content"
+          continue
+        fi
         echo "verify-propagation-pr.sh: templated re-render matches PR content for $tpl_dest (consumer=$CONSUMER_NAME, source=$tpl_source)"
         # Emit structured tag-reply line for the calling workflow.
         # Format MUST stay parseable; see CLAUDE.md § resolve-pr-threads

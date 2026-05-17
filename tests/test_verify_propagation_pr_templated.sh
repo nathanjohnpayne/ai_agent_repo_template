@@ -232,6 +232,49 @@ else
   pass "Case 4: strict-mode unset fact → exit 1, render-failure diagnostic"
 fi
 
+# ---------------------------------------------------------------------------
+# Case 5 — mode tampering (chmod +x): PR dest matches rendered bytes but
+# has tree entry mode 100755 instead of 100644. Without the tree-entry
+# check (codex P1 #329 round 2), the byte-only verifier let metadata
+# tampering pass; the new check should reject it.
+# ---------------------------------------------------------------------------
+TEMPLATE5='greeting={{name}}, frameworks={{frameworks}}
+'
+MP5="$WORKDIR/mp5"; build_mergepath "$MP5" "$TEMPLATE5" "react"
+C5="$WORKDIR/c5"
+RENDERED5='greeting=, frameworks=react
+'
+mkdir -p "$C5"
+git_quiet -C "$C5" init -q
+printf 'app code\n' >"$C5/app.ts"
+git_quiet -C "$C5" add -A
+git_quiet -C "$C5" commit -q -m base
+BASE_SHA=$(git -C "$C5" rev-parse HEAD)
+printf '%s' "$RENDERED5" >"$C5/rendered.txt"
+chmod +x "$C5/rendered.txt"
+git_quiet -C "$C5" add -A
+git_quiet -C "$C5" commit -q -m head
+HEAD_SHA=$(git -C "$C5" rev-parse HEAD)
+# Confirm fixture set the executable bit correctly before invoking
+# the verifier — `git update-index --chmod=+x` would also work but
+# `chmod +x` + `add -A` is the path most agents would use.
+fixture_entry=$(git -C "$C5" ls-tree HEAD -- rendered.txt | awk '{print $1, $2}')
+if [ "$fixture_entry" != "100755 blob" ]; then
+  fail "Case 5 fixture setup: expected 100755 blob, got [$fixture_entry] — chmod didn't take in the test repo"
+else
+  run_verify "$MP5" "$C5"
+  if [ "$RC" -ne 1 ]; then
+    fail "Case 5 mode-tampering: expected exit 1, got $RC"
+    echo "stdout:" >&2; sed 's/^/    /' "$STDOUT_FILE" >&2
+    echo "stderr:" >&2; sed 's/^/    /' "$STDERR_FILE" >&2
+  elif ! grep -q 'tree entry.*100755\|mode/type tampering' "$STDERR_FILE"; then
+    fail "Case 5 mode-tampering: stderr missing tree-entry diagnostic"
+    echo "stderr was:" >&2; sed 's/^/    /' "$STDERR_FILE" >&2
+  else
+    pass "Case 5: mode tampering (chmod +x) → exit 1, tree-entry diagnostic"
+  fi
+fi
+
 echo ""
 echo "test_verify_propagation_pr_templated: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
