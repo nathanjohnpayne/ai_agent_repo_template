@@ -48,22 +48,22 @@
 //   && jsx_in_js`), which is why the gate is jsx_in_js alone — the
 //   constraint lives in the manifest review, not the template.
 //
-// Per-consumer facts.react_compiler vocabulary (default unset / false):
-//   unset/false → React Compiler advisory rules
-//                 (react-hooks/set-state-in-effect,
-//                 preserve-manual-memoization, refs, immutability)
-//                 are disabled, because they only fire usefully
-//                 once the codebase has adopted the React
-//                 Compiler. Until then they're noise on idiomatic
-//                 React (set-state in effect for init, ref-during-
-//                 render in TipTap-style editors).
-//   true        → leave the recommended advisories enabled.
-//   Same v1-templating constraint as jsx_in_js: gate is on the fact
-//   alone, not compound with `frameworks contains react`. The
-//   disable block references react-hooks/* keys which ESLint
-//   silently ignores when the plugin isn't loaded, so the no-op
-//   cost on a non-React consumer is the four disabled-rule entries
-//   in the rendered config.
+// Per-consumer facts.react_compiler vocabulary — RESERVED for v2.
+//   Currently has NO effect on rendering. The disable block for the
+//   React Compiler advisories (react-hooks/set-state-in-effect,
+//   preserve-manual-memoization, refs, immutability) renders for
+//   ALL React consumers, because the v1 template lib can't combine
+//   `frameworks contains react` with `react_compiler != true` into
+//   a compound gate (no nested conditionals, no `&&` operator).
+//   Codex P1 on PR #327 round 2 caught the prior `react_compiler
+//   != true` standalone gate emitting react-hooks/* rule IDs into
+//   non-React configs, breaking ESLint load with "Definition for
+//   rule X was not found".
+//   React Compiler adopters MUST re-enable these rules in their
+//   local config override (set each to "error" after the rendered
+//   config). When the template lib gains compound expressions, the
+//   gate will become `frameworks contains react && react_compiler
+//   != true` and this knob will work as documented.
 //
 // A consumer with no frameworks (e.g., swipewatch — pure Node +
 // vitest) gets the JS baseline only. Multiple frameworks stack in
@@ -270,26 +270,25 @@ export default [
   },
 // <<<
 
-// >>> if react_compiler != true
-  // React Compiler advisories — these rules ship in
-  // eslint-plugin-react-hooks but are only meaningful once the
-  // React Compiler is adopted. Until then, disable them to silence
-  // noise on idiomatic React (set-state-in-effect for init,
-  // ref-during-render in TipTap-style editors). Flip
-  // `facts.react_compiler: true` to suppress this block.
+// >>> if frameworks contains react
+  // React Compiler advisories — disabled by default for React
+  // consumers. These rules ship in eslint-plugin-react-hooks but
+  // are only meaningful once the React Compiler is adopted; until
+  // then they fire noisily on idiomatic React (set-state-in-effect
+  // for init, ref-during-render in TipTap-style editors).
   //
-  // Gated on `react_compiler != true` (NOT `!react_compiler`) so
-  // that an explicit `facts.react_compiler: false` correctly
-  // renders the disable block. `!<key>` treats the fact as truthy
-  // when set to the string "false" because eval_expr only checks
-  // non-emptiness; the explicit `!= true` comparison reads as the
-  // documented "unset or anything other than true" semantics
-  // (caught by codex/CodeRabbit on PR #327). For non-React
-  // consumers the block still renders, but the react-hooks/* rule
-  // keys reference a plugin that ESLint hasn't loaded; ESLint
-  // silently ignores unknown rule keys, so the no-op cost is the
-  // four disabled-rule entries in the rendered config, not a
-  // failed load.
+  // Gated on `frameworks contains react` ONLY because the v1
+  // template lib doesn't support compound expressions or nested
+  // conditionals — codex P1 on PR #327 round 2 flagged the earlier
+  // `react_compiler != true` form for emitting react-hooks/* rule
+  // IDs into non-React configs (where the plugin isn't loaded and
+  // ESLint fails with "Definition for rule X was not found").
+  //
+  // The trade-off: React consumers who have adopted the React
+  // Compiler need to re-enable these rules in their local config
+  // override (set each rule to "error" after the rendered config).
+  // The `facts.react_compiler` knob is reserved for v2 when
+  // compound expressions land — until then it has no effect.
   {
     rules: {
       "react-hooks/set-state-in-effect": "off",

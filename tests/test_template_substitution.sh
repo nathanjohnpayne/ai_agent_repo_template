@@ -661,67 +661,36 @@ files: js+jsx+tsx
 ")
 expect_output "12e jsx_in_js unset → jsx-in-js block omitted" "$r" ""
 
-# 12f: react_compiler != true when unset → disable block renders (default).
-# This is the load-bearing case: the React Compiler advisory disables
-# must fire by DEFAULT (when the fact is unset) so consumers that
-# haven't adopted the Compiler don't get noisy lint failures.
-r=$(render_case "// >>> if react_compiler != true
+# 12f: React Compiler disable block gated on `frameworks contains
+# react` ONLY (codex P1 #327 round 2). For non-React consumers, the
+# block must NOT render — otherwise it'd inject react-hooks/* rule
+# IDs whose plugin isn't loaded, breaking ESLint config load with
+# "Definition for rule X was not found".
+r=$(render_case "// >>> if frameworks contains react
 react-hooks/set-state-in-effect: off
 // <<<
-")
-expect_output "12f react_compiler != true when unset → disable block renders (default)" "$r" "react-hooks/set-state-in-effect: off"
+" "MERGEPATH_FACT_FRAMEWORKS=react")
+expect_output "12f React Compiler block renders for React consumers" "$r" "react-hooks/set-state-in-effect: off"
 
-# 12g: react_compiler == true → disable block does NOT render.
-r=$(render_case "// >>> if react_compiler != true
+# 12g: For non-React consumers, the React Compiler disable block must
+# NOT render. Codex P1 round 2 caught this concretely on JS/TS-only
+# consumers — the rendered config previously emitted react-hooks/*
+# rules even when the plugin wasn't loaded.
+r=$(render_case "// >>> if frameworks contains react
 react-hooks/set-state-in-effect: off
 // <<<
-" "MERGEPATH_FACT_REACT_COMPILER=true")
-expect_output "12g react_compiler=true → disable block omitted" "$r" ""
+" "MERGEPATH_FACT_FRAMEWORKS=typescript")
+expect_output "12g React Compiler block omitted for non-React consumers" "$r" ""
 
-# 12h: explicit `false` MUST also render the disable block (regression
-# guard for the bug codex/CodeRabbit caught on PR #327). The original
-# gating used `>>> if !react_compiler`, which evaluates as "fact is
-# unset or empty" — i.e., the string "false" was treated as truthy
-# (non-empty) and the disable block was SUPPRESSED when a consumer
-# explicitly opted out. Switching to `react_compiler != true` makes
-# unset, "false", and any other non-"true" value all render the block.
-r=$(render_case "// >>> if react_compiler != true
+# 12h: facts.react_compiler is reserved for v2 (when the template lib
+# adds compound expressions or nested conditionals). It currently has
+# no effect on rendering — regression guard for accidental re-use of
+# the fact in template logic.
+r=$(render_case "// >>> if frameworks contains react
 react-hooks/set-state-in-effect: off
 // <<<
-" "MERGEPATH_FACT_REACT_COMPILER=false")
-expect_output "12h react_compiler=false → disable block renders" "$r" "react-hooks/set-state-in-effect: off"
-
-# 12i: explicit regression for the `<key> != <value>` operator. Drives
-# eval_expr directly across the four states the boolean-style fact can
-# take: unset, empty, "false", "true". The first three must all evaluate
-# to TRUE (rc 0 — render the disable block); only the explicit "true"
-# must evaluate to FALSE (rc 1 — suppress).
-(
-  reset_facts
-  # shellcheck disable=SC1090
-  source "$LIB"
-  set +e
-  # Unset: react_compiler != true should be TRUE (rc 0).
-  template_substitution::eval_expr "react_compiler != true"; r1=$?
-  # Empty: react_compiler != true should be TRUE (rc 0).
-  export MERGEPATH_FACT_REACT_COMPILER=""
-  template_substitution::eval_expr "react_compiler != true"; r2=$?
-  # Explicit false: react_compiler != true should be TRUE (rc 0).
-  # This is the regression: with `!react_compiler`, "false" was truthy
-  # → negation made the expression false → disable block suppressed.
-  export MERGEPATH_FACT_REACT_COMPILER="false"
-  template_substitution::eval_expr "react_compiler != true"; r3=$?
-  # Explicit true: react_compiler != true should be FALSE (rc 1).
-  export MERGEPATH_FACT_REACT_COMPILER="true"
-  template_substitution::eval_expr "react_compiler != true"; r4=$?
-  set -e
-  if [ "$r1" = "0" ] && [ "$r2" = "0" ] && [ "$r3" = "0" ] && [ "$r4" = "1" ]; then
-    echo "PASS: 12i react_compiler != true operator (unset=0, empty=0, false=0, true=1)"
-  else
-    echo "FAIL: 12i react_compiler != true operator: got $r1/$r2/$r3/$r4 (expected 0/0/0/1)" >&2
-    exit 1
-  fi
-) && PASS=$((PASS + 1)) || FAIL=$((FAIL + 1))
+" "MERGEPATH_FACT_FRAMEWORKS=react MERGEPATH_FACT_REACT_COMPILER=true")
+expect_output "12h react_compiler=true does NOT suppress disable block (v1 limitation)" "$r" "react-hooks/set-state-in-effect: off"
 
 # ---------------------------------------------------------------------------
 # Summary
