@@ -53,8 +53,13 @@
 #
 # Bash 3.2 portable (no associative arrays, no ${var^^}). Matches
 # scripts/bootstrap/substitute.sh's portability bar.
-
-set -euo pipefail
+#
+# This file is a SOURCED library and intentionally does NOT set
+# `set -euo pipefail` at file scope — that would mutate the caller's
+# shell options unexpectedly (CodeRabbit Major / Codex P1 on PR #313).
+# Internal functions use the `|| rc=$?` pattern to capture exit codes
+# without depending on errexit. The executed-directly guard block at
+# the bottom does enable strict mode for the noop-script path.
 
 # Convert a lowercase-with-hyphens fact name to its env var form:
 # "frameworks" → "MERGEPATH_FACT_FRAMEWORKS"
@@ -69,8 +74,30 @@ template_substitution::_fact_var() {
 # Look up a fact value. Echoes the value (empty string if unset).
 # In strict mode, prints a diagnostic to stderr and returns 3 if the
 # fact is referenced but unset.
+#
+# Validates the key against [a-z0-9-] before passing to _fact_var
+# because _fact_var feeds into eval below. Without this guard, a key
+# containing shell metacharacters (e.g. `foo$(id)`) survives the `tr`
+# transformation and is interpreted at eval time as a command
+# substitution — RCE via a malicious manifest fact key (CodeRabbit
+# Critical on PR #313). Keys come from the manifest in practice, but
+# defense-in-depth catches a bad manifest entry or a future code
+# path that synthesizes keys from less-trusted input.
 template_substitution::_fact_value() {
   local key=$1
+  case "$key" in
+    ''|*[!a-z0-9_-]*)
+      # Reject anything outside [a-z0-9_-]. Underscores stay allowed
+      # because env-var-style fact keys (e.g. `node_version`) are
+      # natural in templates and underscores are not eval metachars.
+      # Shell metacharacters ($, (, ), backtick, ;, &, |, \) and
+      # uppercase letters are blocked: the former are the injection
+      # surface, the latter are reserved for the env-var form
+      # (_fact_var uppercases keys to derive MERGEPATH_FACT_<KEY>).
+      printf 'template: malformed fact key (must match [a-z0-9_-]+): %s\n' "$key" >&2
+      return 2
+      ;;
+  esac
   local var
   var=$(template_substitution::_fact_var "$key")
   # bash 3.2 indirect expansion via eval.
@@ -104,7 +131,7 @@ template_substitution::eval_expr() {
       local inner=${expr#!}
       inner=$(printf '%s' "$inner" | sed -e 's/^[[:space:]]*//')
       local v
-      v=$(template_substitution::_fact_value "$inner") || return 3
+      v=$(template_substitution::_fact_value "$inner") || return $?
       if [ -z "$v" ]; then return 0; else return 1; fi
       ;;
     *" contains "*)
@@ -113,7 +140,7 @@ template_substitution::eval_expr() {
       key=$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
       needle=$(printf '%s' "$needle" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
       local haystack
-      haystack=$(template_substitution::_fact_value "$key") || return 3
+      haystack=$(template_substitution::_fact_value "$key") || return $?
       # Space-padded match so "react" doesn't match "react-native".
       case " $haystack " in
         *" $needle "*) return 0 ;;
@@ -126,7 +153,7 @@ template_substitution::eval_expr() {
       key=$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
       want=$(printf '%s' "$want" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
       local have
-      have=$(template_substitution::_fact_value "$key") || return 3
+      have=$(template_substitution::_fact_value "$key") || return $?
       if [ "$have" = "$want" ]; then return 0; else return 1; fi
       ;;
     *" != "*)
@@ -135,7 +162,7 @@ template_substitution::eval_expr() {
       key=$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
       want=$(printf '%s' "$want" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
       local have
-      have=$(template_substitution::_fact_value "$key") || return 3
+      have=$(template_substitution::_fact_value "$key") || return $?
       if [ "$have" != "$want" ]; then return 0; else return 1; fi
       ;;
     *" "*)
@@ -146,7 +173,7 @@ template_substitution::eval_expr() {
     *)
       # Bare key — truthy iff non-empty.
       local v
-      v=$(template_substitution::_fact_value "$expr") || return 3
+      v=$(template_substitution::_fact_value "$expr") || return $?
       if [ -n "$v" ]; then return 0; else return 1; fi
       ;;
   esac
@@ -176,7 +203,7 @@ template_substitution::_substitute_vars() {
             local key=${rest%%\}\}*}
             local after=${rest#*\}\}}
             local value
-            value=$(template_substitution::_fact_value "$key") || return 3
+            value=$(template_substitution::_fact_value "$key") || return $?
             out="$out$before$value"
             remaining=$after
             ;;
@@ -278,9 +305,12 @@ template_substitution::render() {
     local rendered
     local rc=0
     rendered=$(template_substitution::_substitute_vars "$line") || rc=$?
-    if [ "$rc" != "0" ]; then
-      return $rc
-    fi
+    case "$rc" in
+      0) ;;
+      2) return 1 ;;  # malformed fact key in template body → malformed template
+      3) return 3 ;;  # strict-mode unset fact
+      *) return $rc ;;
+    esac
     printf '%s\n' "$rendered"
   done < "$source"
 
@@ -292,24 +322,50 @@ template_substitution::render() {
 }
 
 # Render to a destination file atomically.
+#
+# Atomicity contract: the destination either contains the fully-
+# rendered output OR is unchanged from its prior state — never a
+# partial write. Implemented by rendering into a sibling temp file
+# and `mv`-renaming it over the destination. The temp file lives in
+# `$(dirname "$dest")` (NOT $TMPDIR) so the rename is guaranteed to
+# stay on the same filesystem; a cross-filesystem mv would degrade
+# to copy+unlink, breaking atomicity under interrupt (CodeRabbit
+# Major / Codex P2 on PR #313).
+#
+# mv failure (permission, ENOSPC, racing process) is checked
+# explicitly — without that, render_to could return 0 with no
+# destination write, silently losing the rendered output.
 template_substitution::render_to() {
   local source=$1
   local dest=$2
+  local dest_dir
+  dest_dir=$(dirname "$dest")
+  if [ ! -d "$dest_dir" ]; then
+    printf 'template: destination directory not found: %s\n' "$dest_dir" >&2
+    return 2
+  fi
   local tmp
-  tmp=$(mktemp "${TMPDIR:-/tmp}/template-render.XXXXXX")
+  tmp=$(mktemp "$dest_dir/.template-render.XXXXXX")
   local rc=0
   template_substitution::render "$source" >"$tmp" || rc=$?
   if [ "$rc" != "0" ]; then
     rm -f "$tmp"
     return $rc
   fi
-  mv "$tmp" "$dest"
+  if ! mv -f "$tmp" "$dest"; then
+    rm -f "$tmp"
+    printf 'template: mv failed writing %s\n' "$dest" >&2
+    return 1
+  fi
 }
 
 # Inline self-check: if invoked directly as a script (not sourced),
+# enable strict mode (safe because nothing else is sourcing us) and
 # emit a usage hint. Matches the convention used by other lib files
-# under scripts/lib/.
+# under scripts/lib/. Strict mode is intentionally NOT enabled at
+# file scope; see the comment near the top of this file.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  set -euo pipefail
   cat >&2 <<EOF
 $(basename "$0") is a library. Source it from another bash script:
 

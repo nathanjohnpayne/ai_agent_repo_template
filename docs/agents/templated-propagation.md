@@ -9,7 +9,7 @@ This doc covers `scripts/lib/template-substitution.sh` — the rendering engine 
 Renders a source template to per-consumer output using two surfaces:
 
 1. **Variable substitution** — anywhere in the file, `{{key}}` is replaced by the value of `MERGEPATH_FACT_KEY` (uppercased, hyphens → underscores).
-2. **Conditional blocks** — `>>> if <expr> ... <<<` markers gate body lines on per-consumer facts. The block (markers included) is kept iff `<expr>` evaluates true; otherwise the whole block is dropped.
+2. **Conditional blocks** — `>>> if <expr> ... <<<` markers gate body lines on per-consumer facts. Marker lines are **always stripped** from output regardless of the expression; only the body lines between them are conditional. If `<expr>` is true, body lines are emitted verbatim; if false, body lines are dropped.
 
 Sync-side integration (follow-up PR) is responsible for exporting per-consumer facts from the manifest before invoking the lib. The lib itself reads facts only from the environment.
 
@@ -17,7 +17,7 @@ Sync-side integration (follow-up PR) is responsible for exporting per-consumer f
 
 ### Variables
 
-```
+```text
 hello {{name}}!
 ts version {{node_version}}
 ```
@@ -28,7 +28,7 @@ ts version {{node_version}}
 
 ### Conditional blocks
 
-```
+```js
 // >>> if frameworks contains react
 import react from "eslint-plugin-react";
 // <<<

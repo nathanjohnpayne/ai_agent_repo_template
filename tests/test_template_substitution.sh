@@ -134,6 +134,29 @@ r=$(render_case "hyphen key: {{node-version}}
 " "MERGEPATH_FACT_NODE_VERSION=20")
 expect_output "1g hyphenated fact key → underscored env var" "$r" "hyphen key: 20"
 
+# 1h: injection attempt — key contains shell metacharacters. Without
+# input validation in _fact_value (CodeRabbit Critical on PR #313),
+# this key would be interpreted at eval time as a command
+# substitution. With validation, the renderer rejects with rc 2.
+r=$(render_case "compromised: {{foo\$(id)}}
+")
+expect_rc "1h injection attempt key -> rc 1 (rejected as malformed template)" "$r" 1
+
+# 1i: another injection vector — backticks.
+r=$(render_case "compromised: {{foo\`id\`}}
+")
+expect_rc "1i backtick key -> rc 1 (rejected as malformed template)" "$r" 1
+
+# 1j: uppercase keys rejected (reserved for env-var form).
+r=$(render_case "{{FOO}}
+" "MERGEPATH_FACT_FOO=bar")
+expect_rc "1j uppercase key -> rc 1 (rejected as malformed template)" "$r" 1
+
+# 1k: underscored keys allowed (natural shell var style).
+r=$(render_case "ts: {{has_ts}}
+" "MERGEPATH_FACT_HAS_TS=yes")
+expect_output "1k underscored key allowed" "$r" "ts: yes"
+
 # ---------------------------------------------------------------------------
 # 2. Bare conditional: >>> if <key>
 # ---------------------------------------------------------------------------
