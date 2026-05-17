@@ -193,7 +193,6 @@ a yellow "Partial Verified" badge.
 account (titled `mergepath-mac signing key` on this Mac):
 
 ```bash
-eval "$(/opt/homebrew/bin/brew shellenv)"
 for acct in nathanpayne-claude nathanpayne-cursor nathanpayne-codex nathanjohnpayne; do
   echo "=== $acct ==="
   GH_TOKEN="$(gh auth token --user "$acct")" \
@@ -204,7 +203,6 @@ done
 **Re-upload (missing key, revoked, or new machine bootstrap):**
 
 ```bash
-eval "$(/opt/homebrew/bin/brew shellenv)"
 acct="nathanpayne-<bot>"          # claude | cursor | codex
 pub="$HOME/.ssh/keys/github_<bot>.pub"
 GH_TOKEN="$(gh auth token --user "$acct")" gh api -X POST /user/ssh_signing_keys \
