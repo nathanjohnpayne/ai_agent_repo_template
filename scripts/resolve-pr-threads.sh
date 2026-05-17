@@ -674,18 +674,40 @@ fetch_manifest_templated_dests() {
   else
     # awk fallback — mirrors the canonical-paths fallback above. Pair
     # `type:` and `dest:` (or fall back to `path:`) within a `paths:`
-    # block entry. Less precise than yq: the consumer-scope filter is
-    # SKIPPED because cross-referencing consumer names to repo slugs
-    # in awk is brittle. In the no-yq case we fall back to the
-    # pre-fix loose-match behavior (over-classify rather than
-    # under-classify); the rollup is advisory and over-classification
-    # is the more recoverable failure mode. Cache lines have empty
-    # consumer-list (tab + empty), interpreted as "match any repo".
+    # block entry. Less precise than yq in two ways, both addressed
+    # below per CR Major #329 round 2:
+    #
+    # 1. Order-independent emission. The prior version emitted on the
+    #    `type: templated` line, which broke when `dest:` appeared
+    #    AFTER `type:` (legal YAML, common in manifest practice). Now
+    #    we emit at entry boundaries (start of next entry / end of
+    #    paths block / EOF) so `dest:` and `type:` can appear in any
+    #    order within an entry.
+    #
+    # 2. Strict no-match instead of loose-match. The prior version
+    #    emitted the dest with an empty consumers field, which
+    #    path_matches_templated_dest interpreted as "match any repo"
+    #    — reintroducing the exact cross-repo misclassification this
+    #    fix is trying to close. Now the awk path emits a sentinel
+    #    `__AWK_NO_CONSUMER_SCOPE__` token in the consumers field,
+    #    which path_matches_templated_dest treats as "no match" (the
+    #    cautious failure mode: under-classify rather than over-
+    #    classify; templated-render is a skip-class, and a missed
+    #    skip just falls back to the rollup's general heuristics).
     MANIFEST_TEMPLATED_DESTS_CACHE=$(awk '
+      function emit() {
+        if (cur_type == "templated") {
+          out = (cur_dest != "" ? cur_dest : cur_path)
+          if (out != "") {
+            printf "%s\t__AWK_NO_CONSUMER_SCOPE__\n", out
+          }
+        }
+      }
       /^paths:/ { in_p = 1; next }
-      in_p && /^[^[:space:]#]/ { in_p = 0 }
+      in_p && /^[^[:space:]#]/ { emit(); in_p = 0 }
       !in_p { next }
       /^[[:space:]]*-[[:space:]]*path:/ {
+        emit()
         cur_path = $0
         sub(/^[[:space:]]*-[[:space:]]*path:[[:space:]]*/, "", cur_path)
         sub(/[[:space:]]*#.*$/, "", cur_path)
@@ -700,8 +722,8 @@ fetch_manifest_templated_dests() {
       }
       /^[[:space:]]*type:[[:space:]]*templated/ {
         cur_type = "templated"
-        printf "%s\t\n", (cur_dest != "" ? cur_dest : cur_path)
       }
+      END { emit() }
     ' "$manifest")
   fi
 }
@@ -724,11 +746,22 @@ path_matches_templated_dest() {
     dest="${line%%$'\t'*}"
     consumers="${line#*$'\t'}"
     [ "$file_path" = "$dest" ] || continue
-    # Empty consumers field (yq query returned no matches OR awk
-    # fallback emitted no scoping) — fall back to loose match. See
-    # awk fallback comment above for the trade-off.
+    # The awk fallback emits this sentinel when it can't resolve
+    # consumer-name → repo-slug (cross-references in awk are
+    # brittle). Treat sentinel as "no scope information available"
+    # and DO NOT match — better to miss the templated-render skip
+    # tag (falling through to other heuristics in the rollup) than
+    # to over-classify and silently suppress substantive feedback
+    # on unrelated files. (CR Major #329 round 2.)
+    if [ "$consumers" = "__AWK_NO_CONSUMER_SCOPE__" ]; then
+      continue
+    fi
+    # Empty consumers field — yq returned no consumer matches for
+    # this entry (entry has no `consumers:` list, or none of the
+    # named consumers resolve to a repo). Treat as no-scope
+    # information, same as the awk sentinel: don't match.
     if [ -z "$consumers" ]; then
-      return 0
+      continue
     fi
     # The current repo ($REPO, populated from --repo arg or origin
     # remote at module-load) MUST appear in the comma-separated
