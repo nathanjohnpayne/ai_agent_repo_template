@@ -38,11 +38,21 @@ on:
   # Periodic sweep — catches the 👍-after-last-push case (codex
   # reacts on the PR issue but no synchronize / review / workflow_run
   # event fires, so the event-driven path stays inert). Runs every
-  # 15 minutes against any open PR carrying needs-external-review.
+  # 5 minutes against any open PR carrying needs-external-review.
   # Idempotent (no-op when label absent or gate not yet met). Sub-C
   # of #191. See scheduled-sweep job below for the cadence knob.
+  #
+  # Tightened from 15→5 min in mergepath#324 to close the
+  # 👍-after-last-push gap observed across the mergepath#250 Phase D
+  # propagation fanout (3 of 6 consumer PRs needed manual
+  # request-label-removal.sh because no event-driven trigger
+  # fired and the prior 15-min sweep stranded them for up to 15 min
+  # after Codex cleared). 3× the API quota cost, but a meaningfully
+  # shorter blocker window. The PAT-driven label removal added in
+  # #324 also helps — but the sweep is still the only backstop for
+  # the no-event path.
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'
 
 permissions:
   pull-requests: write
@@ -57,6 +67,14 @@ permissions:
   # nathanjohnpayne/matchline#233 (#306 propagation canary); see
   # #310 for the full repro + permission scope rationale.
   actions: read
+  # `checks: write` is required so the "Surface infra failure as
+  # check-run" step (#324) can POST a failed check-run to the PR's
+  # checks tab when this workflow hits an infrastructure error
+  # (failed label read, failed label removal, codex-review-check.sh
+  # rc=3, contract-drift rc). Without a visible check-run, flake
+  # recurrences are invisible unless someone happens to look at the
+  # workflow run log.
+  checks: write
 
 jobs:
   evaluate-and-clear:
@@ -140,11 +158,27 @@ jobs:
       - name: Re-evaluate gate per PR + remove label on pass
         if: steps.pr.outputs.numbers != ''
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT-driven label removal (#315/#324). GITHUB_TOKEN-driven
+          # events do NOT trigger downstream workflows (recursion
+          # prevention) — pr-review-policy.yml's Label Gate would
+          # stay stuck on the pre-clear failure state until the next
+          # push or label toggle. A PAT-driven event triggers
+          # downstream workflows normally, so Label Gate re-fires and
+          # mergeStateStatus flips to CLEAN within seconds rather
+          # than stalling until something else fires the policy
+          # workflow. Closes mergepath#315. Token is the same
+          # REVIEWER_ASSIGNMENT_TOKEN used by
+          # .github/workflows/daily-feedback-rollup.yml.
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # Source the gh-retry helper (#324). with_gh_retry wraps gh
+          # calls in 3×30s retry on transient failures (HTTP 5xx,
+          # rate-limit, "Resource not accessible by integration") so a
+          # flaky read or write doesn't silently leave the label stuck.
+          source scripts/lib/gh-retry-helpers.sh
           # codex-review-check.sh exits:
           #   0 = gate passes
           #   1 = gate fails (one or more of CI/reviewer/codex not met)
@@ -164,7 +198,7 @@ jobs:
 
             # Skip if label not present (no-op, common case on
             # synchronize/workflow_run for under-threshold PRs).
-            if ! HAS_LABEL=$(gh pr view "$PR" --repo "$REPO" --json labels \
+            if ! HAS_LABEL=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels \
               --jq '[.labels[].name] | contains(["needs-external-review"])'); then
               # Infra error — NOT a warning-only skip. This workflow
               # exists to clear a merge-blocking label; if it can't even
@@ -191,7 +225,7 @@ jobs:
             case "$rc" in
               0)
                 echo "Gate passes — removing needs-external-review label."
-                if ! gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review; then
+                if ! with_gh_retry gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review; then
                   # The gate passed but the removal API call failed —
                   # the label is still stuck. That is an infra error,
                   # not a warning: the job must not report success
@@ -206,7 +240,7 @@ jobs:
                 # delimiter must be column-0 unless using `<<-` with
                 # tabs; YAML run blocks make that brittle).
                 comment_body='**Automated label removal.** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD (CI green + reviewer-identity APPROVED + Codex cleared). Removed `needs-external-review` so Label Gate passes and the PR can merge. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#195) for the trigger doctrine.'
-                gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
+                with_gh_retry gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
                   || echo "::warning::Failed to post attribution comment for PR #$PR"
                 ;;
               1)
@@ -229,7 +263,32 @@ jobs:
             esac
             echo "::endgroup::"
           done <<<"$PR_NUMBERS"
+          # Surface the infra-error sentinel to the next step (#324)
+          # so the check-run can be posted without re-deriving state.
+          echo "HAD_INFRA_ERROR=$had_infra_error" >> "$GITHUB_ENV"
           exit "$had_infra_error"
+
+      - name: Surface infra failure as check-run
+        # Run even when the prior step failed — `if: always()` + the
+        # HAD_INFRA_ERROR sentinel so we only post a failed check-run
+        # when the prior step actually hit an infra error (not when
+        # everything was clean or only gate-evaluation said "not yet
+        # met").
+        if: always() && env.HAD_INFRA_ERROR == '1'
+        env:
+          # check-run POST works with GITHUB_TOKEN + `checks: write`
+          # (added above). No PAT needed for this annotation surface.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/check-runs" \
+            -X POST \
+            -f name='auto-clear-blocking-labels' \
+            -f head_sha='${{ github.sha }}' \
+            -f status='completed' \
+            -f conclusion='failure' \
+            -F 'output[title]=Auto-clear hit an infrastructure error' \
+            -F 'output[summary]=See workflow run logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
 
   scheduled-sweep:
     name: Periodic sweep for stale needs-external-review labels
@@ -254,10 +313,14 @@ jobs:
       - name: Find PRs carrying needs-external-review
         id: find
         env:
+          # Read-only list query. GITHUB_TOKEN is sufficient here —
+          # the PAT-switch in the next step is what triggers downstream
+          # workflows when the label is actually removed.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          source scripts/lib/gh-retry-helpers.sh
           # Read the per-repo cadence/enable knob from review-policy.yml.
           # Defaults: enabled=true. Operators can opt out by setting
           #   auto_clear_labels:
@@ -301,7 +364,7 @@ jobs:
           # gh failure (auth, rate limit, network) silently became
           # "0 PRs found" and the sweep no-op'd instead of failing
           # loudly.
-          if ! prs_raw=$(gh pr list --repo "$REPO" --state open \
+          if ! prs_raw=$(with_gh_retry gh pr list --repo "$REPO" --state open \
             --label needs-external-review --limit 500 \
             --json number --jq '.[].number'); then
             echo "::error::Failed to list open PRs with needs-external-review on $REPO"
@@ -325,11 +388,20 @@ jobs:
       - name: Re-evaluate gate per PR
         if: steps.find.outputs.prs != ''
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT-driven label removal (#315/#324). See
+          # evaluate-and-clear job above for the rationale; same
+          # secret, same recursion-prevention bypass. Without the
+          # PAT, the scheduled sweep would remove the label but
+          # downstream workflows (pr-review-policy.yml Label Gate)
+          # would not re-fire — so mergeStateStatus would stay
+          # BLOCKED until the next push or manual nudge, defeating
+          # the sweep's purpose.
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PRS: ${{ steps.find.outputs.prs }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          source scripts/lib/gh-retry-helpers.sh
           had_infra_error=0
           while IFS= read -r PR; do
             [ -z "$PR" ] && continue
@@ -341,9 +413,9 @@ jobs:
             case "$rc" in
               0)
                 echo "Gate passes — removing needs-external-review label."
-                if gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review; then
+                if with_gh_retry gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review; then
                   comment_body='**Automated label removal (scheduled sweep).** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD between event triggers (typical: Codex 👍 after the last push, with no synchronize / review / workflow_run event to fire the event-driven path). Removed `needs-external-review`. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#197) for the sweep doctrine.'
-                  gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
+                  with_gh_retry gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
                     || echo "::warning::Failed to post attribution comment for PR #$PR"
                 else
                   # Gate passed but the removal failed — infra error,
@@ -359,4 +431,26 @@ jobs:
             esac
             echo "::endgroup::"
           done <<<"$PRS"
+          # Surface the infra-error sentinel to the next step (#324)
+          # so the check-run can be posted without re-deriving state.
+          echo "HAD_INFRA_ERROR=$had_infra_error" >> "$GITHUB_ENV"
           exit "$had_infra_error"
+
+      - name: Surface infra failure as check-run
+        # Run even when the prior step failed — `if: always()` + the
+        # HAD_INFRA_ERROR sentinel so we only post a failed check-run
+        # when the prior step actually hit an infra error.
+        if: always() && env.HAD_INFRA_ERROR == '1'
+        env:
+          # check-run POST works with GITHUB_TOKEN + `checks: write`.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/check-runs" \
+            -X POST \
+            -f name='auto-clear-blocking-labels' \
+            -f head_sha='${{ github.sha }}' \
+            -f status='completed' \
+            -f conclusion='failure' \
+            -F 'output[title]=Auto-clear hit an infrastructure error (scheduled sweep)' \
+            -F 'output[summary]=See workflow run logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'

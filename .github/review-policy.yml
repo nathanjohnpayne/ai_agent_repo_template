@@ -396,6 +396,11 @@ auto_clear_labels:
   # Periodic sweep catches the 👍-after-last-push case: Codex reacts
   # on the PR issue with no synchronize / pull_request_review /
   # workflow_run event to fire the event-driven path. Defaults to
-  # true; set false if the every-15-minute cron is too noisy for a
+  # true; set false if the every-5-minute cron is too noisy for a
   # given repo's PR volume.
   scheduled_sweep_enabled: true
+  # Documentary only — the actual cron lives in
+  # .github/workflows/auto-clear-blocking-labels.yml. Tightened from
+  # 15→5 minutes in mergepath#324 to close the 👍-after-last-push
+  # gap (observed on 3 of 6 mergepath#250 Phase D consumer PRs).
+  scheduled_sweep_interval_minutes: 5

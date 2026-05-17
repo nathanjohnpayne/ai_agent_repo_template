@@ -219,6 +219,15 @@ paths:
   - path: scripts/lib/preflight-helpers.sh
     type: canonical
     consumers: all
+  # Sourced by codex-review-check.sh (the statusCheckRollup read) and
+  # by the inline bash in .github/workflows/auto-clear-blocking-labels.yml
+  # (label-list reads, label-removal writes, attribution-comment posts).
+  # Provides `with_gh_retry` — 3×30s retry on transient gh failures
+  # (HTTP 5xx, rate-limit, "Resource not accessible by integration").
+  # See mergepath#324 for the propagation closure rationale.
+  - path: scripts/lib/gh-retry-helpers.sh
+    type: canonical
+    consumers: all
   - path: scripts/coderabbit-wait.sh
     type: canonical
     consumers: all
@@ -228,6 +237,14 @@ paths:
   - path: scripts/codex-review-check.sh
     type: canonical
     consumers: all
+    # Sources scripts/lib/gh-retry-helpers.sh on startup to wrap the
+    # statusCheckRollup read in 3×30s retry on transient gh failures
+    # (#324). Without the helper present in the consumer, the
+    # `source` line is silently skipped (existence-guarded), but the
+    # retry semantics are lost — every transient failure becomes a
+    # hard rc=3 and the auto-clear stalls.
+    requires:
+      - "scripts/lib/gh-retry-helpers.sh"
   - path: scripts/phase-4b-classifier.sh
     type: canonical
     consumers: all
@@ -427,6 +444,14 @@ paths:
   - path: .github/workflows/auto-clear-blocking-labels.yml
     type: canonical
     consumers: all
+    # The workflow's inline bash steps `source
+    # scripts/lib/gh-retry-helpers.sh` to wrap gh reads/writes in
+    # retry (#324). Without the helper in the consumer, the source
+    # line aborts the run block under `set -euo pipefail` and the
+    # auto-clear is dead. Same closure logic as codex-review-check.sh
+    # above.
+    requires:
+      - "scripts/lib/gh-retry-helpers.sh"
   - path: .github/workflows/pr-audit.yml
     type: canonical
     consumers: all

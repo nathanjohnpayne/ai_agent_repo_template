@@ -75,12 +75,12 @@ fi
 # any `schedule:` / `cron:` text anywhere) so a comment couldn't
 # satisfy the assertion.
 if grep -qE "^[[:space:]]+schedule:" "$WORKFLOW" && \
-   grep -qF -- "- cron: '*/15 * * * *'" "$WORKFLOW"; then
+   grep -qF -- "- cron: '*/5 * * * *'" "$WORKFLOW"; then
   pass=$((pass + 1))
-  echo "  PASS: schedule trigger configured with 15-min cron (#197)"
+  echo "  PASS: schedule trigger configured with 5-min cron (#197/#324)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: missing schedule trigger or expected cron entry (#197 sub-C of #191)" >&2
+  echo "  FAIL: missing schedule trigger or expected cron entry (5-min cron per #324)" >&2
 fi
 
 # scheduled-sweep job exists and is gated to schedule-only events.
@@ -137,8 +137,9 @@ fi
 # CR Major on PR #213 r2: sweep must capture `gh pr list` exit
 # status separately, not via process substitution into mapfile (which
 # swallows the producer's exit code, silently turning a gh failure
-# into "0 PRs found").
-if grep -qE -- 'if ! prs_raw=\$\(gh pr list' "$WORKFLOW" && \
+# into "0 PRs found"). #324 wrapped the gh call in
+# `with_gh_retry`; tolerate either form.
+if grep -qE -- 'if ! prs_raw=\$\((with_gh_retry )?gh pr list' "$WORKFLOW" && \
    grep -qE -- 'echo "::error::Failed to list open PRs' "$WORKFLOW"; then
   pass=$((pass + 1))
   echo "  PASS: sweep captures gh pr list exit status (no silent failure on gh error)"
@@ -194,7 +195,11 @@ perm_block=$(
 # drill into statusCheckRollup.checkSuite.workflowRun requires it
 # in addition to `checks: read`. See the inline rationale comment
 # next to the new permission in auto-clear-blocking-labels.yml.
-expected_perms=$'actions: read\nchecks: read\ncontents: read\npull-requests: write'
+# `checks: write` added in #324 — the "Surface infra failure as
+# check-run" step posts a failed check-run when this workflow hits
+# an infrastructure error, so flake recurrences are visible on the
+# PR's checks tab without grepping workflow logs.
+expected_perms=$'actions: read\nchecks: read\nchecks: write\ncontents: read\npull-requests: write'
 if [ "$perm_block" = "$expected_perms" ]; then
   pass=$((pass + 1))
   echo "  PASS: workflow permissions exactly match the least-privilege set"
