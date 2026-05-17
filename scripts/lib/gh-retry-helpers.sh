@@ -68,12 +68,33 @@ with_gh_retry() {
     fi
 
     # Classify the failure. Permanent failures break out immediately.
-    # The 4xx matcher covers the full 400-499 range (CR Minor #328
-    # round 2): the prior `4(0[0-9]|1[0-9])` form only matched
-    # 400-419 and silently retried 4xx like 422 / 451 as transient.
-    if printf '%s' "$output" | grep -qE 'HTTP 4[0-9]{2}' \
-       && ! printf '%s' "$output" | grep -qE 'HTTP (403|429)' \
-       && ! printf '%s' "$output" | grep -q 'Resource not accessible by integration'; then
+    #
+    # Retry only:
+    #   - HTTP 5xx (server-side, transient)
+    #   - HTTP 429 (rate-limit, always)
+    #   - HTTP 403 with "rate limit" in the body (GitHub rate-limit
+    #     can surface as 403 in some flows)
+    # Fail-fast on:
+    #   - HTTP 4xx other than 429 or rate-limited 403 (auth, perms,
+    #     validation — retrying is futile and costs sweep budget)
+    #   - "Resource not accessible by integration" (token permission
+    #     issue, fixed by adding the perm to the workflow — codex P2
+    #     #328 round 3 caught the prior pattern wasting 2×30s sleeps
+    #     on this surface, missing the auto-clear window)
+    is_permanent=false
+    if printf '%s' "$output" | grep -q 'Resource not accessible by integration'; then
+      is_permanent=true
+    elif printf '%s' "$output" | grep -qE 'HTTP 4[0-9]{2}'; then
+      if printf '%s' "$output" | grep -qE 'HTTP 429'; then
+        : # transient rate-limit
+      elif printf '%s' "$output" | grep -qE 'HTTP 403' \
+           && printf '%s' "$output" | grep -qiE 'rate.?limit'; then
+        : # transient rate-limit surfaced as 403
+      else
+        is_permanent=true
+      fi
+    fi
+    if $is_permanent; then
       printf '%s' "$output" >&2
       return "$rc"
     fi
