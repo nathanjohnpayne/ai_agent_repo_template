@@ -507,23 +507,29 @@ paths:
   # contract, and docs/agents/templated-propagation.md for syntax.
 
   # ESLint flat-config per the Mergepath ESLint standard floor
-  # (mergepath#250). Source is the conditional-block template at
-  # examples/eslint.config.js; dest lands at the consumer repo's
-  # root as eslint.config.js. The render keeps the JS baseline
-  # always-on and stacks framework blocks (typescript / astro /
-  # react) per the consumer's declared `facts.frameworks`.
+  # (mergepath#250). Two manifest entries because ESLint
+  # `eslint.config.js` resolution honors `package.json "type"`:
+  # ESM consumers need ESM syntax (import/export default), CJS
+  # consumers need CJS syntax (require/module.exports). Mixing
+  # would fail to load (Codex P1 on PR #318). The template-author
+  # maintains both source files in parallel; the body inside the
+  # export is byte-identical, only the import/export syntax differs.
   #
-  # Consumers excluded: device-source-of-truth and overridebroadway
-  # have zero lintable JS/TS surface area; the ESLint policy floor
-  # doesn't apply to them (rules/repo_rules.md § ESLint policy).
+  # Consumers excluded from both entries: device-source-of-truth
+  # and overridebroadway have zero lintable JS/TS surface area;
+  # the ESLint policy floor doesn't apply (rules/repo_rules.md §
+  # ESLint policy).
   #
-  # Per-consumer rendered shapes:
-  #   matchline          → JS + TS + React + react-hooks
-  #   nathanpaynedotcom  → JS + TS + Astro
-  #   friends-and-family-billing → JS + React + react-hooks
-  #   device-platform-reporting  → JS + React + react-hooks
-  #   tadlockpsychiatry  → JS + TS + React + react-hooks
-  #   swipewatch         → JS baseline only (frameworks: [])
+  # Per-consumer rendered shapes (driven by facts.frameworks; module
+  # syntax driven by which entry the consumer is in below):
+  #   matchline (ESM)                  → JS + TS + React + react-hooks
+  #   nathanpaynedotcom (ESM)          → JS + TS + Astro
+  #   tadlockpsychiatry (ESM)          → JS + TS + React + react-hooks
+  #   friends-and-family-billing (CJS) → JS + React + react-hooks
+  #   device-platform-reporting (CJS)  → JS + React + react-hooks
+  #   swipewatch (CJS)                 → JS baseline only
+
+  # ESM variant — consumers with `"type": "module"` in package.json
   - path: examples/eslint.config.js
     source: examples/eslint.config.js
     dest: eslint.config.js
@@ -531,9 +537,18 @@ paths:
     consumers:
       - matchline
       - nathanpaynedotcom
+      - tadlockpsychiatry
+
+  # CJS variant — consumers without `"type": "module"` (default
+  # CJS resolution). Same body as the ESM variant; only the
+  # imports and module.exports differ.
+  - path: examples/eslint.config.cjs.js
+    source: examples/eslint.config.cjs.js
+    dest: eslint.config.js
+    type: templated
+    consumers:
       - friends-and-family-billing
       - device-platform-reporting
-      - tadlockpsychiatry
       - swipewatch
 
 # Per-consumer exclusions. Use sparingly — drift exceptions become
