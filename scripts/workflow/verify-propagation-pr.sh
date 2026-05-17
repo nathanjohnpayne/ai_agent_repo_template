@@ -3,7 +3,7 @@ set -euo pipefail
 
 # verify-propagation-pr.sh — authoritative faithful-mirror check for
 # the propagation-PR review lane (REVIEW_POLICY.md § Propagation PR
-# review lane, mergepath#264 / #268).
+# review lane, mergepath#264 / #268 / #323).
 #
 # The lane exempts a sync PR from Phase 4 external review. That is
 # only safe if the PR is PROVABLY a verbatim mirror of mergepath's
@@ -17,6 +17,36 @@ set -euo pipefail
 # mergepath checkout (the immutable, public commit the PR's branch
 # name points at) — never from the PR's own checkout, which the PR
 # could have tampered with.
+#
+# Two verification surfaces:
+#
+#   A. Canonical / kit entries — byte-for-byte equality against
+#      mergepath@<sha>. Implemented as a `git ls-tree` mode+oid
+#      compare so an exec-bit flip is also caught.
+#
+#   B. Templated entries (#323) — render the source template at
+#      mergepath@<sha> with the consumer's facts (loaded from the
+#      mergepath-side manifest via export_consumer_facts) and
+#      byte-compare the rendered output against the PR's dest
+#      content. Drift, template syntax errors, and missing facts in
+#      strict mode all fail the verification with a typed
+#      diagnostic. On pass, a structured line of the form
+#      "[mergepath-verify: templated-render] <dest> <consumer> <source>"
+#      is emitted on stdout so a calling workflow can post it as a
+#      thread tag-reply. This script intentionally stays read-only —
+#      it does NOT post to GitHub.
+#
+# Consumer inference (templated surface only):
+#   1. $MERGEPATH_CONSUMER env override (test/CI escape hatch).
+#   2. consumer_dir's `origin` remote URL → matched against the
+#      manifest's .consumers[].repo field.
+#   3. If neither resolves, the templated surface is SKIPPED with a
+#      stderr note (the canonical/kit surface still runs). This is
+#      conservative: a templated entry whose consumer can't be
+#      identified is just left to the existing path-confinement
+#      check, which will fail because the templated dest doesn't
+#      equal the templated .path — the PR then routes to normal
+#      Phase 4 review, same as the pre-#323 status quo.
 #
 # Usage:
 #   verify-propagation-pr.sh <mergepath_dir> <consumer_dir> <base_sha> <head_sha>
@@ -34,11 +64,12 @@ set -euo pipefail
 # Exit codes:
 #   0  faithful mirror — every changed file is under a manifest path
 #      AND its end-state byte-matches mergepath@<sha> (both-present-
-#      equal, or both-absent). The PR is lane-eligible.
+#      equal, or both-absent), with templated dests matching their
+#      re-rendered output. The PR is lane-eligible.
 #   1  NOT a faithful mirror — at least one changed file is off-
-#      manifest or deviates from mergepath@<sha>. The PR must go
-#      through normal Phase 3/4 review. Deviations are listed on
-#      stderr.
+#      manifest, deviates from mergepath@<sha>, or its templated
+#      re-render diverges. The PR must go through normal Phase 3/4
+#      review. Deviations are listed on stderr.
 #   2  usage / environment error (bad args, missing manifest, etc.).
 #
 # Bash 3.2 portable: no `mapfile`, no associative arrays.
@@ -89,11 +120,241 @@ if [ -z "$CHANGED_FILES" ]; then
   exit 1
 fi
 
+# Failure aggregation. Three typed categories so the summary at exit
+# can distinguish the failure mode for diagnostics:
+#   CANONICAL_FAILURES  — off-manifest / mode-or-blob drift on
+#                         canonical or kit entries.
+#   TEMPLATED_FAILURES  — re-rendered output diverges from PR dest
+#                         content.
+#   TEMPLATED_ERRORS    — render itself failed (malformed template,
+#                         strict-mode unset fact, source missing
+#                         from mergepath@<sha>).
 FAILURES=""
-fail() { FAILURES="${FAILURES}  - $1"$'\n'; }
+CANONICAL_FAILURES=""
+TEMPLATED_FAILURES=""
+TEMPLATED_ERRORS=""
+fail() { FAILURES="${FAILURES}  - $1"$'\n'; CANONICAL_FAILURES="${CANONICAL_FAILURES}  - $1"$'\n'; }
+fail_templated_drift() { FAILURES="${FAILURES}  - $1"$'\n'; TEMPLATED_FAILURES="${TEMPLATED_FAILURES}  - $1"$'\n'; }
+fail_templated_error() { FAILURES="${FAILURES}  - $1"$'\n'; TEMPLATED_ERRORS="${TEMPLATED_ERRORS}  - $1"$'\n'; }
+
+# -------------------------------------------------------------------
+# Templated surface (#323) — handled BEFORE the canonical loop so
+# verified templated dests are exempted from the path-confinement
+# check (the dest doesn't equal any .path and would otherwise fail).
+# -------------------------------------------------------------------
+
+# VERIFIED_TEMPLATED_DESTS — list (newline-separated, sentinel-padded)
+# of consumer-side dest paths whose re-render matched. Checked in the
+# canonical loop below so we don't double-fail-them as off-manifest.
+VERIFIED_TEMPLATED_DESTS=""
+
+# infer_consumer_from_pr_context — determine which consumer this PR
+# belongs to, for templated render. Strategies, in order:
+#   1. $MERGEPATH_CONSUMER env override (test/CI escape hatch).
+#   2. consumer_dir's `origin` remote URL → matched against the
+#      manifest's .consumers[].repo field.
+# Echoes the consumer name on success (sets RC=0), empty on failure
+# (RC=1). The caller treats RC=1 as "skip templated verification" —
+# canonical/kit verification still runs.
+infer_consumer_from_pr_context() {
+  if [ -n "${MERGEPATH_CONSUMER:-}" ]; then
+    printf '%s' "$MERGEPATH_CONSUMER"
+    return 0
+  fi
+  # Read origin URL. `git remote get-url origin` is the modern form;
+  # older gits used `git config remote.origin.url` — both work here.
+  local remote_url
+  remote_url=$(git -C "$CONSUMER_DIR" remote get-url origin 2>/dev/null || \
+               git -C "$CONSUMER_DIR" config remote.origin.url 2>/dev/null || \
+               printf '')
+  [ -z "$remote_url" ] && return 1
+  # Normalize the URL to an "owner/repo" slug so we can string-match
+  # against the manifest's .consumers[].repo field. Handles:
+  #   https://github.com/owner/repo.git → owner/repo
+  #   git@github.com:owner/repo.git     → owner/repo
+  #   ssh://git@github.com/owner/repo   → owner/repo
+  local slug
+  # Strip scheme + host (https://, git@host:, ssh://git@host/).
+  slug=$(printf '%s' "$remote_url" | sed -E '
+    s|^https?://[^/]+/||
+    s|^ssh://git@[^/]+/||
+    s|^git@[^:]+:||
+    s|\.git$||
+  ')
+  # Lookup in the manifest. We don't have yq guaranteed at this
+  # surface (the canonical loop above uses an awk parser), so fall
+  # back to a simple awk-based lookup over the consumers block.
+  if command -v yq >/dev/null 2>&1; then
+    local name
+    name=$(yq -r ".consumers[] | select(.repo == \"$slug\") | .name" "$MANIFEST" 2>/dev/null | head -n1)
+    if [ -n "$name" ]; then
+      printf '%s' "$name"
+      return 0
+    fi
+  fi
+  # awk fallback — pairs `- name:` and `repo:` inside the
+  # `consumers:` block, prints the name when repo matches.
+  local name
+  name=$(awk -v target="$slug" '
+    /^consumers:/ { in_c = 1; next }
+    in_c && /^[^[:space:]#]/ { in_c = 0 }
+    !in_c { next }
+    /^[[:space:]]*-[[:space:]]*name:/ {
+      cur_name = $0
+      sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", cur_name)
+      sub(/[[:space:]]*#.*$/, "", cur_name)
+      gsub(/^[[:space:]]+|[[:space:]]+$|^"|"$/, "", cur_name)
+    }
+    /^[[:space:]]*repo:/ {
+      cur_repo = $0
+      sub(/^[[:space:]]*repo:[[:space:]]*/, "", cur_repo)
+      sub(/[[:space:]]*#.*$/, "", cur_repo)
+      gsub(/^[[:space:]]+|[[:space:]]+$|^"|"$/, "", cur_repo)
+      if (cur_repo == target) { print cur_name; exit }
+    }
+  ' "$MANIFEST")
+  if [ -n "$name" ]; then
+    printf '%s' "$name"
+    return 0
+  fi
+  return 1
+}
+
+# Source the template lib and facts helper from the TRUSTED mergepath
+# checkout. Same provenance rule as the parser helpers above — never
+# from the PR's working tree.
+TEMPLATE_LIB="$MERGEPATH_DIR/scripts/lib/template-substitution.sh"
+FACTS_HELPER="$MERGEPATH_DIR/scripts/lib/manifest-fact-helpers.sh"
+
+# Only attempt the templated surface if both trusted helpers are
+# present in mergepath@<sha>. Missing helpers → fall through to the
+# canonical loop (which will fail-closed on the templated dest path).
+TEMPLATED_SURFACE_ACTIVE=0
+if [ -f "$TEMPLATE_LIB" ] && [ -f "$FACTS_HELPER" ] && command -v yq >/dev/null 2>&1; then
+  TEMPLATED_SURFACE_ACTIVE=1
+fi
+
+if [ "$TEMPLATED_SURFACE_ACTIVE" = "1" ]; then
+  # Resolve consumer. RC=1 → skip templated surface with a log line.
+  CONSUMER_NAME=""
+  if CONSUMER_NAME=$(infer_consumer_from_pr_context) && [ -n "$CONSUMER_NAME" ]; then
+    :
+  else
+    echo "verify-propagation-pr.sh: cannot infer consumer from PR context (no MERGEPATH_CONSUMER env, no origin remote match in manifest) — skipping templated re-render surface" >&2
+    CONSUMER_NAME=""
+  fi
+fi
+
+if [ "$TEMPLATED_SURFACE_ACTIVE" = "1" ] && [ -n "$CONSUMER_NAME" ]; then
+  # shellcheck disable=SC1090
+  source "$FACTS_HELPER"
+  # shellcheck disable=SC1090
+  source "$TEMPLATE_LIB"
+
+  # Pull templated entries (source, dest, consumers) as TSV.
+  TEMPLATED_TSV=$(yq -r '
+    .paths[]
+    | select(.type == "templated")
+    | [(.source // .path), (.dest // .path), ((.consumers // [] | type == "!!str") | tostring), (.consumers // [] | (select(type == "!!str") // (join(","))) | tostring)]
+    | @tsv
+  ' "$MANIFEST" 2>/dev/null || printf '')
+
+  if [ -n "$TEMPLATED_TSV" ]; then
+    while IFS=$'\t' read -r tpl_source tpl_dest is_str_consumers consumers_csv; do
+      [ -z "$tpl_source" ] && continue
+      [ -z "$tpl_dest" ] && continue
+      # consumers field can be the literal "all" or a CSV of names.
+      # is_str_consumers is "true" when the manifest used a scalar
+      # `consumers: all`, else "false" (i.e. it was a sequence).
+      consumer_matches=0
+      if [ "$is_str_consumers" = "true" ] && [ "$consumers_csv" = "all" ]; then
+        consumer_matches=1
+      elif [ "$is_str_consumers" = "false" ]; then
+        case ",$consumers_csv," in
+          *",$CONSUMER_NAME,"*) consumer_matches=1 ;;
+        esac
+      fi
+      [ "$consumer_matches" -eq 0 ] && continue
+
+      # Templated dest must actually be in the PR's changed files —
+      # otherwise there's nothing to verify for this entry.
+      dest_in_diff=0
+      while IFS= read -r cf; do
+        [ -z "$cf" ] && continue
+        if [ "$cf" = "$tpl_dest" ]; then dest_in_diff=1; break; fi
+      done <<< "$CHANGED_FILES"
+      [ "$dest_in_diff" -eq 0 ] && continue
+
+      # Source must exist in the trusted mergepath checkout.
+      mp_source_abs="$MERGEPATH_DIR/$tpl_source"
+      if [ ! -f "$mp_source_abs" ]; then
+        fail_templated_error "$tpl_dest — templated source '$tpl_source' missing from mergepath@<sha> (consumer=$CONSUMER_NAME)"
+        continue
+      fi
+
+      # Render in a subshell so the facts export + lib sourcing don't
+      # leak between iterations.
+      rendered=$(mktemp -t "verify-prop-rendered.XXXXXX")
+      render_err=$(mktemp -t "verify-prop-render-err.XXXXXX")
+      render_rc=0
+      (
+        export_consumer_facts "$CONSUMER_NAME" "$MANIFEST"
+        template_substitution::render "$mp_source_abs"
+      ) > "$rendered" 2> "$render_err" || render_rc=$?
+
+      if [ "$render_rc" != "0" ]; then
+        # Surface the renderer's stderr for diagnostics, then fail.
+        if [ -s "$render_err" ]; then
+          {
+            echo "verify-propagation-pr.sh: template render error for $tpl_source (consumer=$CONSUMER_NAME, rc=$render_rc):"
+            sed 's/^/    /' "$render_err"
+          } >&2
+        fi
+        fail_templated_error "$tpl_dest — templated render failed (source=$tpl_source, consumer=$CONSUMER_NAME, rc=$render_rc)"
+        rm -f "$rendered" "$render_err"
+        continue
+      fi
+      rm -f "$render_err"
+
+      # Pull the PR's dest content at HEAD via `git show`.
+      pr_content=$(mktemp -t "verify-prop-pr.XXXXXX")
+      if ! git -C "$CONSUMER_DIR" show "${HEAD_SHA}:${tpl_dest}" > "$pr_content" 2>/dev/null; then
+        fail_templated_error "$tpl_dest — templated dest not present at PR HEAD (consumer=$CONSUMER_NAME)"
+        rm -f "$rendered" "$pr_content"
+        continue
+      fi
+
+      if diff -q "$rendered" "$pr_content" >/dev/null 2>&1; then
+        echo "verify-propagation-pr.sh: templated re-render matches PR content for $tpl_dest (consumer=$CONSUMER_NAME, source=$tpl_source)"
+        # Emit structured tag-reply line for the calling workflow.
+        # Format MUST stay parseable; see CLAUDE.md § resolve-pr-threads
+        # tag class and #323 for the consumer of these lines.
+        printf '[mergepath-verify: templated-render] %s %s %s\n' "$tpl_dest" "$CONSUMER_NAME" "$tpl_source"
+        VERIFIED_TEMPLATED_DESTS="${VERIFIED_TEMPLATED_DESTS}${tpl_dest}"$'\n'
+      else
+        {
+          echo "verify-propagation-pr.sh: templated re-render diverges from PR content for $tpl_dest (consumer=$CONSUMER_NAME, source=$tpl_source). Diff (expected → PR):"
+          diff "$rendered" "$pr_content" | sed 's/^/    /' || true
+        } >&2
+        fail_templated_drift "$tpl_dest — templated re-render diverges from PR content (source=$tpl_source, consumer=$CONSUMER_NAME)"
+      fi
+      rm -f "$rendered" "$pr_content"
+    done <<< "$TEMPLATED_TSV"
+  fi
+fi
 
 while IFS= read -r f; do
   [ -z "$f" ] && continue
+
+  # #323: skip files already verified by the templated re-render
+  # surface above. Their dest path doesn't match any .path glob
+  # (which is the whole point of source ≠ dest), so the canonical
+  # path-confinement check below would false-fail them.
+  if [ -n "$VERIFIED_TEMPLATED_DESTS" ]; then
+    case $'\n'"$VERIFIED_TEMPLATED_DESTS" in
+      *$'\n'"$f"$'\n'*) continue ;;
+    esac
+  fi
 
   # 1. Path confinement: f must be under a manifest-declared path.
   if ! printf '%s\n' "$f" | bash "$MATCH_PATHS" "${MAN_PATTERNS[@]}" | grep -qxF "$f"; then
@@ -155,7 +416,22 @@ done <<< "$CHANGED_FILES"
 
 if [ -n "$FAILURES" ]; then
   echo "verify-propagation-pr.sh: NOT a faithful mirror — the PR is not lane-eligible:" >&2
-  printf '%s' "$FAILURES" >&2
+  # Typed sub-summaries so the reader can tell at a glance whether a
+  # failure is canonical-mismatch, templated-drift, or templated-error
+  # (#323). Categories are mutually exclusive — a given failure lands
+  # in exactly one bucket.
+  if [ -n "$CANONICAL_FAILURES" ]; then
+    echo "  Canonical / kit drift (path confinement + tree-entry compare):" >&2
+    printf '%s' "$CANONICAL_FAILURES" >&2
+  fi
+  if [ -n "$TEMPLATED_FAILURES" ]; then
+    echo "  Templated re-render mismatch (rendered output differs from PR dest):" >&2
+    printf '%s' "$TEMPLATED_FAILURES" >&2
+  fi
+  if [ -n "$TEMPLATED_ERRORS" ]; then
+    echo "  Templated re-render error (malformed template / missing source / strict-mode unset fact):" >&2
+    printf '%s' "$TEMPLATED_ERRORS" >&2
+  fi
   echo "  → this PR must go through normal Phase 3/4 review." >&2
   exit 1
 fi

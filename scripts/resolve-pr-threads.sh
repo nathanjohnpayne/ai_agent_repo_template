@@ -634,6 +634,67 @@ path_matches_manifest() {
   return 1
 }
 
+# fetch_manifest_templated_dests — extract the dest paths of every
+# templated entry in the manifest (#323). Templated entries decouple
+# source from dest (the whole point), so a thread anchored on a
+# templated dest path doesn't match path_matches_manifest above (which
+# reads only .path). Cached.
+MANIFEST_TEMPLATED_DESTS_CACHE=""
+MANIFEST_TEMPLATED_FETCHED=false
+fetch_manifest_templated_dests() {
+  $MANIFEST_TEMPLATED_FETCHED && return 0
+  MANIFEST_TEMPLATED_FETCHED=true
+  local manifest="$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
+  [ -f "$manifest" ] || return 0
+  if command -v yq >/dev/null 2>&1; then
+    MANIFEST_TEMPLATED_DESTS_CACHE=$(yq -r '
+      .paths[] | select(.type == "templated") | (.dest // .path)
+    ' "$manifest" 2>/dev/null || true)
+  else
+    # awk fallback — mirrors the canonical-paths fallback above. Pair
+    # `type:` and `dest:` (or fall back to `path:`) within a `paths:`
+    # block entry. Less precise than yq but enough for the no-yq case.
+    MANIFEST_TEMPLATED_DESTS_CACHE=$(awk '
+      /^paths:/ { in_p = 1; next }
+      in_p && /^[^[:space:]#]/ { in_p = 0 }
+      !in_p { next }
+      /^[[:space:]]*-[[:space:]]*path:/ {
+        cur_path = $0
+        sub(/^[[:space:]]*-[[:space:]]*path:[[:space:]]*/, "", cur_path)
+        sub(/[[:space:]]*#.*$/, "", cur_path)
+        gsub(/^[[:space:]]+|[[:space:]]+$|^"|"$/, "", cur_path)
+        cur_dest = ""; cur_type = ""
+      }
+      /^[[:space:]]*dest:/ {
+        cur_dest = $0
+        sub(/^[[:space:]]*dest:[[:space:]]*/, "", cur_dest)
+        sub(/[[:space:]]*#.*$/, "", cur_dest)
+        gsub(/^[[:space:]]+|[[:space:]]+$|^"|"$/, "", cur_dest)
+      }
+      /^[[:space:]]*type:[[:space:]]*templated/ {
+        cur_type = "templated"
+        print (cur_dest != "" ? cur_dest : cur_path)
+      }
+    ' "$manifest")
+  fi
+}
+
+# path_matches_templated_dest <file-path> → exit 0 if it matches a
+# templated entry's dest path, 1 otherwise. Used by derive_tag_class
+# to emit the `templated-render` class (#323).
+path_matches_templated_dest() {
+  local file_path="$1"
+  [ -z "$file_path" ] && return 1
+  [ "$file_path" = "(no path)" ] && return 1
+  fetch_manifest_templated_dests
+  [ -z "$MANIFEST_TEMPLATED_DESTS_CACHE" ] && return 1
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    [ "$file_path" = "$d" ] && return 0
+  done <<< "$MANIFEST_TEMPLATED_DESTS_CACHE"
+  return 1
+}
+
 # Module-load-time: pin the manifest base. We resolve REPO_ROOT_FOR_MANIFEST
 # from the script's on-disk location, NOT $REPO (which is the gh repo
 # slug). This intentionally reads the LOCAL working-tree manifest —
@@ -648,6 +709,15 @@ REPO_ROOT_FOR_MANIFEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Decision ladder (highest-confidence first; matches the
 # spec § Class taxonomy from issue #305):
 #   1. canonical-coverage     anchored path is in the manifest
+#   1b. templated-render      anchored path is a templated dest
+#                             (#323) — same "mergepath concern" class
+#                             as canonical-coverage but on the
+#                             templated surface; emitted only when the
+#                             path is NOT also matched by 1 (the dests
+#                             never appear as .path entries by
+#                             construction — source ≠ dest is the
+#                             point — so the two branches don't
+#                             overlap in practice).
 #   2. addressed-elsewhere    agent-author commit after createdAt
 #                             touching the anchored file
 #   3. rebuttal-recorded      ≥30-char agent-author reply on thread
@@ -672,6 +742,19 @@ derive_tag_class() {
   # 1. canonical-coverage
   if path_matches_manifest "$thread_path"; then
     echo "canonical-coverage"
+    return
+  fi
+
+  # 1b. templated-render (#323) — path matches a templated entry's
+  # dest. Same "mergepath concern" routing as canonical-coverage; the
+  # rendered output came from a template in mergepath, so the fix
+  # should land in mergepath too. We don't (and can't, from here)
+  # re-run verify-propagation-pr.sh to confirm the bytes match — but
+  # the path predicate alone is the right signal: if a thread is
+  # anchored on the templated dest, the durable fix is either in
+  # mergepath's template or in the consumer's facts:* block.
+  if path_matches_templated_dest "$thread_path"; then
+    echo "templated-render"
     return
   fi
 
@@ -796,6 +879,18 @@ synth_rationale() {
         echo "path $thread_path is propagated canonical content (.mergepath-sync.yml)."
       else
         echo "thread is on propagated canonical content (.mergepath-sync.yml)."
+      fi
+      ;;
+    templated-render)
+      # #323 — the dest is rendered from a mergepath template with
+      # consumer facts. verify-propagation-pr.sh re-renders and
+      # byte-compares as part of the propagation-lane gate; if a
+      # thread persists on a templated dest, the durable fix lives in
+      # mergepath's template or the consumer's facts:* block.
+      if [ -n "$thread_path" ] && [ "$thread_path" != "(no path)" ]; then
+        echo "$thread_path is a templated dest rendered from mergepath; fix belongs in the template or consumer facts."
+      else
+        echo "thread is on a templated dest rendered from mergepath; fix belongs in the template or consumer facts."
       fi
       ;;
     nitpick-noted)

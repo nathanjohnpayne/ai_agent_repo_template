@@ -27,8 +27,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/scripts/sync-to-downstream.sh"
+# The yq filter moved to scripts/lib/manifest-fact-helpers.sh in
+# mergepath#323 so both sync-to-downstream.sh and
+# scripts/workflow/verify-propagation-pr.sh can load consumer facts
+# from a shared helper without duplicating the filter. The regression-
+# guard greps the lib file now; we still confirm sync-to-downstream.sh
+# sources the lib so the wiring can't silently drift.
+LIB="$ROOT/scripts/lib/manifest-fact-helpers.sh"
 
 [[ -r "$SCRIPT" ]] || { echo "missing $SCRIPT" >&2; exit 1; }
+[[ -r "$LIB" ]] || { echo "missing $LIB" >&2; exit 1; }
 command -v yq >/dev/null 2>&1 || { echo "SKIP: yq not available" >&2; exit 0; }
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/export-facts-test.XXXXXX")"
@@ -117,23 +125,34 @@ else
   fail "Case 4: expected empty output, got:\n$out"
 fi
 
-# Case 5: the lib script's source MUST contain the documented
-# select-fallback idiom. If a future contributor reverts to the
-# `if then else end` form (which mikefarah/yq rejects), this
-# assertion catches it before the broken syntax ships.
-if grep -q 'select(tag == "!!seq") | join(" ")' "$SCRIPT"; then
-  pass "Case 5: lib script uses the select+// idiom (not the broken if/then/else form)"
+# Case 5: the lib MUST contain the documented select-fallback idiom.
+# If a future contributor reverts to the `if then else end` form
+# (which mikefarah/yq rejects), this assertion catches it before the
+# broken syntax ships. The filter moved to manifest-fact-helpers.sh
+# in #323; grep the lib, not the sync script.
+if grep -q 'select(tag == "!!seq") | join(" ")' "$LIB"; then
+  pass "Case 5: lib helper uses the select+// idiom (not the broken if/then/else form)"
 else
-  fail "Case 5: scripts/sync-to-downstream.sh no longer uses the select+// idiom — this regression-guard expects 'select(tag == \"!!seq\") | join(\" \")' in the script"
+  fail "Case 5: scripts/lib/manifest-fact-helpers.sh no longer uses the select+// idiom — this regression-guard expects 'select(tag == \"!!seq\") | join(\" \")' in the helper"
 fi
 
-# Case 6: explicit no-regression check — the script must NOT contain
+# Case 6: explicit no-regression check — the lib must NOT contain
 # the broken form `if (tag == "!!seq") then`. This is the literal
 # substring that caused the bug.
-if ! grep -qF 'if (tag == "!!seq") then' "$SCRIPT"; then
-  pass "Case 6: lib script does not contain the broken yq if/then/else form"
+if ! grep -qF 'if (tag == "!!seq") then' "$LIB"; then
+  pass "Case 6: lib helper does not contain the broken yq if/then/else form"
 else
-  fail "Case 6: lib script contains the broken 'if (tag == \"!!seq\") then ... else ... end' form — mikefarah/yq rejects this at the lexer"
+  fail "Case 6: lib helper contains the broken 'if (tag == \"!!seq\") then ... else ... end' form — mikefarah/yq rejects this at the lexer"
+fi
+
+# Case 7 (#323): sync-to-downstream.sh MUST source the lib so the
+# wiring is not silently lost in a future refactor. A missing source
+# would re-introduce the duplication this extraction was meant to
+# eliminate.
+if grep -q 'source "$MERGEPATH_ROOT/scripts/lib/manifest-fact-helpers.sh"' "$SCRIPT"; then
+  pass "Case 7: sync-to-downstream.sh sources the manifest-fact-helpers lib"
+else
+  fail "Case 7: sync-to-downstream.sh no longer sources scripts/lib/manifest-fact-helpers.sh — wiring lost"
 fi
 
 echo

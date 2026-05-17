@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# tests/test_verify_propagation_pr_templated.sh
+#
+# Fixture-driven tests for the templated-surface arm of
+# scripts/workflow/verify-propagation-pr.sh (#323). The templated
+# arm renders each templated entry's source against mergepath@<sha>
+# with the consumer's facts (loaded via export_consumer_facts) and
+# byte-compares against the PR's dest content.
+#
+# Each case builds a throwaway "mergepath" checkout containing the
+# template lib, facts helper, and parse/match helpers, plus a manifest
+# with one templated entry. A throwaway "consumer" git repo carries
+# the PR's dest content at HEAD. The script under test is invoked
+# with $MERGEPATH_CONSUMER set so the consumer-inference step
+# doesn't depend on a git remote configuration.
+#
+# Exit-code contract for the templated surface:
+#   0  — re-render matches PR dest content
+#   1  — re-render diverges OR render errors (malformed template,
+#        strict-mode unset fact, source missing)
+#   2  — usage / environment error (covered in the parent test)
+#
+# Bash 3.2 portable. Runs from
+# scripts/ci/check_workflow_verify_propagation_templated.
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VERIFY="$ROOT/scripts/workflow/verify-propagation-pr.sh"
+[ -x "$VERIFY" ] || { echo "missing or non-executable $VERIFY" >&2; exit 1; }
+command -v yq >/dev/null 2>&1 || { echo "SKIP: yq not available" >&2; exit 0; }
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-prop-templated-test.XXXXXX")"
+trap 'rm -rf "$WORKDIR"' EXIT
+
+PASS=0
+FAIL=0
+pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+
+git_quiet() { git -c init.defaultBranch=main -c user.email=t@t -c user.name=t -c commit.gpgsign=false "$@"; }
+
+# Build a throwaway "mergepath" checkout. Carries:
+#   - the trusted helpers (parse_manifest_paths, match_protected_paths,
+#     template-substitution, manifest-fact-helpers)
+#   - a manifest with one templated entry + one canonical entry
+#   - the templated source template
+# The manifest is rebuilt per case (different facts produce different
+# expected renders).
+build_mergepath() {
+  local mp="$1" template_body="$2" frameworks="$3"
+  mkdir -p "$mp/scripts/workflow" "$mp/scripts/lib" "$mp/examples"
+  cp "$ROOT/scripts/workflow/parse_manifest_paths.sh" "$mp/scripts/workflow/"
+  cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$mp/scripts/workflow/"
+  cp "$ROOT/scripts/lib/template-substitution.sh" "$mp/scripts/lib/"
+  cp "$ROOT/scripts/lib/manifest-fact-helpers.sh" "$mp/scripts/lib/"
+  printf '%s' "$template_body" >"$mp/examples/source.tpl"
+  cat >"$mp/.mergepath-sync.yml" <<YAML
+version: 1
+consumers:
+  - name: alpha
+    repo: example/alpha
+    facts:
+      frameworks: [$frameworks]
+paths:
+  - path: examples/source.tpl
+    source: examples/source.tpl
+    dest: rendered.txt
+    type: templated
+    consumers:
+      - alpha
+YAML
+}
+
+# Build a consumer git repo with a base (no rendered.txt) → head
+# (rendered.txt added with the supplied content). Sets globals
+# BASE_SHA / HEAD_SHA.
+build_consumer() {
+  local cdir="$1" pr_content="$2"
+  mkdir -p "$cdir"
+  git_quiet -C "$cdir" init -q
+  printf 'app code\n' >"$cdir/app.ts"
+  git_quiet -C "$cdir" add -A
+  git_quiet -C "$cdir" commit -q -m base
+  BASE_SHA=$(git -C "$cdir" rev-parse HEAD)
+  printf '%s' "$pr_content" >"$cdir/rendered.txt"
+  git_quiet -C "$cdir" add -A
+  git_quiet -C "$cdir" commit -q -m head
+  HEAD_SHA=$(git -C "$cdir" rev-parse HEAD)
+}
+
+run_verify() {  # $1=mp $2=consumer; sets RC, STDOUT_FILE, STDERR_FILE
+  STDOUT_FILE=$(mktemp -t "verify-out.XXXXXX")
+  STDERR_FILE=$(mktemp -t "verify-err.XXXXXX")
+  set +e
+  MERGEPATH_CONSUMER=alpha "$VERIFY" "$1" "$2" "$BASE_SHA" "$HEAD_SHA" \
+    > "$STDOUT_FILE" 2> "$STDERR_FILE"
+  RC=$?
+  set -e
+}
+
+# ---------------------------------------------------------------------------
+# Case 1 — pass: PR dest matches re-render.
+#
+# Template has a `>>> if frameworks contains react` block; consumer
+# carries `frameworks: [react]`, so the block is included. The PR's
+# dest carries the exact rendered output. Expect:
+#   - exit 0
+#   - "[mergepath-verify: templated-render] rendered.txt alpha examples/source.tpl"
+#     on stdout
+# ---------------------------------------------------------------------------
+TEMPLATE_BODY='hello {{name}}
+// >>> if frameworks contains react
+react block
+// <<<
+trailing line
+'
+# What the template renders to with name=mergepath, frameworks=[react]:
+EXPECTED_RENDER='hello mergepath
+react block
+trailing line
+'
+MP1="$WORKDIR/mp1"; build_mergepath "$MP1" "$TEMPLATE_BODY" "react"
+# Append a `facts.name` so {{name}} resolves.
+# We rebuild the manifest carefully with both facts.
+cat >"$MP1/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - name: alpha
+    repo: example/alpha
+    facts:
+      frameworks: [react]
+      name: mergepath
+paths:
+  - path: examples/source.tpl
+    source: examples/source.tpl
+    dest: rendered.txt
+    type: templated
+    consumers:
+      - alpha
+YAML
+C1="$WORKDIR/c1"
+build_consumer "$C1" "$EXPECTED_RENDER"
+run_verify "$MP1" "$C1"
+if [ "$RC" -ne 0 ]; then
+  fail "Case 1 pass: expected exit 0, got $RC"
+  echo "stdout:" >&2; sed 's/^/    /' "$STDOUT_FILE" >&2
+  echo "stderr:" >&2; sed 's/^/    /' "$STDERR_FILE" >&2
+elif ! grep -qF '[mergepath-verify: templated-render] rendered.txt alpha examples/source.tpl' "$STDOUT_FILE"; then
+  fail "Case 1 pass: missing structured tag-reply line on stdout"
+  echo "stdout was:" >&2; sed 's/^/    /' "$STDOUT_FILE" >&2
+else
+  pass "Case 1: PR dest matches re-render → exit 0, structured tag line emitted"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 2 — drift: PR dest content differs from re-render.
+# Same fixtures as Case 1 but the PR dest carries an extra line.
+# Expect exit 1 + a divergence diagnostic in stderr.
+# ---------------------------------------------------------------------------
+C2="$WORKDIR/c2"
+build_consumer "$C2" "${EXPECTED_RENDER}HAND EDITED EXTRA LINE
+"
+run_verify "$MP1" "$C2"
+if [ "$RC" -ne 1 ]; then
+  fail "Case 2 drift: expected exit 1, got $RC"
+  echo "stdout:" >&2; sed 's/^/    /' "$STDOUT_FILE" >&2
+  echo "stderr:" >&2; sed 's/^/    /' "$STDERR_FILE" >&2
+elif ! grep -q 'diverges from PR content' "$STDERR_FILE"; then
+  fail "Case 2 drift: stderr missing 'diverges from PR content' diagnostic"
+  echo "stderr was:" >&2; sed 's/^/    /' "$STDERR_FILE" >&2
+elif ! grep -q 'Templated re-render mismatch' "$STDERR_FILE"; then
+  fail "Case 2 drift: stderr missing typed-summary header 'Templated re-render mismatch'"
+  echo "stderr was:" >&2; sed 's/^/    /' "$STDERR_FILE" >&2
+else
+  pass "Case 2: PR dest diverges from re-render → exit 1, typed diagnostic"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 3 — template syntax error: malformed `>>> if` (no closing `<<<`).
+# Expect exit 1 + a template-error diagnostic in stderr.
+# ---------------------------------------------------------------------------
+BAD_TEMPLATE='line one
+// >>> if frameworks contains react
+unclosed block
+'
+MP3="$WORKDIR/mp3"; build_mergepath "$MP3" "$BAD_TEMPLATE" "react"
+C3="$WORKDIR/c3"
+# PR has SOMETHING for dest; content is irrelevant — render errors
+# before the byte-compare.
+build_consumer "$C3" "doesnt matter
+"
+run_verify "$MP3" "$C3"
+if [ "$RC" -ne 1 ]; then
+  fail "Case 3 template error: expected exit 1, got $RC"
+  echo "stderr:" >&2; sed 's/^/    /' "$STDERR_FILE" >&2
+elif ! grep -q 'template render error\|Templated re-render error' "$STDERR_FILE"; then
+  fail "Case 3 template error: stderr missing template-render error diagnostic"
+  echo "stderr was:" >&2; sed 's/^/    /' "$STDERR_FILE" >&2
+else
+  pass "Case 3: malformed template (unclosed >>> if) → exit 1, template error"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 4 — strict-mode unset fact: template references {{undeclared}};
+# MERGEPATH_TEMPLATE_STRICT=1 makes the render fail with rc=3, which the
+# verifier surfaces as exit 1 with a render-error diagnostic.
+# ---------------------------------------------------------------------------
+STRICT_TEMPLATE='value: <{{undeclared}}>
+'
+MP4="$WORKDIR/mp4"; build_mergepath "$MP4" "$STRICT_TEMPLATE" "react"
+C4="$WORKDIR/c4"
+build_consumer "$C4" "doesnt matter
+"
+# Run with strict mode on. MERGEPATH_TEMPLATE_STRICT is honored by the
+# template lib at render time.
+STDOUT_FILE=$(mktemp -t "verify-out.XXXXXX")
+STDERR_FILE=$(mktemp -t "verify-err.XXXXXX")
+set +e
+MERGEPATH_CONSUMER=alpha MERGEPATH_TEMPLATE_STRICT=1 \
+  "$VERIFY" "$MP4" "$C4" "$BASE_SHA" "$HEAD_SHA" \
+  > "$STDOUT_FILE" 2> "$STDERR_FILE"
+RC=$?
+set -e
+if [ "$RC" -ne 1 ]; then
+  fail "Case 4 strict-mode: expected exit 1, got $RC"
+  echo "stderr:" >&2; sed 's/^/    /' "$STDERR_FILE" >&2
+elif ! grep -q 'render failed\|template render error\|Templated re-render error' "$STDERR_FILE"; then
+  fail "Case 4 strict-mode: stderr missing render-failure diagnostic"
+  echo "stderr was:" >&2; sed 's/^/    /' "$STDERR_FILE" >&2
+else
+  pass "Case 4: strict-mode unset fact → exit 1, render-failure diagnostic"
+fi
+
+echo ""
+echo "test_verify_propagation_pr_templated: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ] || exit 1
+exit 0

@@ -92,7 +92,14 @@ extract_tag_class() {
 # (err on surface — future class additions are additive).
 tag_class_action() {
   case "$1" in
-    addressed-elsewhere|canonical-coverage|rebuttal-recorded) echo "skip" ;;
+    # templated-render — verify-propagation-pr.sh re-rendered the
+    # source against mergepath@<sha> with the consumer's facts and
+    # confirmed byte-equality with the PR dest (mergepath#323). Same
+    # "mergepath concern" class as canonical-coverage: a finding on a
+    # templated dest is structurally a mergepath concern (the template
+    # lives in mergepath), so route it to mergepath rather than
+    # surfacing on each consumer's daily rollup.
+    addressed-elsewhere|canonical-coverage|rebuttal-recorded|templated-render) echo "skip" ;;
     nitpick-noted|deferred-to-followup) echo "surface" ;;
     "") echo "" ;;  # no tag → caller falls through to heuristics
     *)  echo "surface" ;;  # unknown → surface
