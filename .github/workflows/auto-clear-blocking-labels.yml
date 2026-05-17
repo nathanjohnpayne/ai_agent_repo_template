@@ -192,6 +192,7 @@ jobs:
           # PR hit it, so the workflow doesn't go green when gate
           # evaluation was actually impossible.
           had_infra_error=0
+          failing_prs=""
           while IFS= read -r PR; do
             [ -z "$PR" ] && continue
             echo "::group::Evaluating PR #$PR"
@@ -208,6 +209,7 @@ jobs:
               # Major, #271.)
               echo "::error::Failed to query labels for PR #$PR — cannot evaluate."
               had_infra_error=1
+              failing_prs="$failing_prs $PR"
               echo "::endgroup::"
               continue
             fi
@@ -233,6 +235,7 @@ jobs:
                   # Major, #271.)
                   echo "::error::Failed to remove needs-external-review on PR #$PR — label still stuck."
                   had_infra_error=1
+                  failing_prs="$failing_prs $PR"
                   echo "::endgroup::"
                   continue
                 fi
@@ -252,6 +255,7 @@ jobs:
                 # PRs on a multi-PR workflow_run trigger. But set
                 # the sentinel so the job exits non-zero at the end.
                 had_infra_error=1
+                failing_prs="$failing_prs $PR"
                 ;;
               *)
                 echo "::error::codex-review-check.sh unexpected rc=$rc on PR #$PR (contract drift — failing job)"
@@ -259,21 +263,36 @@ jobs:
                 # Better to fail loudly than leave the label stuck
                 # behind a silently-broken gate. CR Major on PR #202 r3.
                 had_infra_error=1
+                failing_prs="$failing_prs $PR"
                 ;;
             esac
             echo "::endgroup::"
           done <<<"$PR_NUMBERS"
-          # Surface the infra-error sentinel to the next step (#324)
-          # so the check-run can be posted without re-deriving state.
+          # Surface the infra-error sentinel + per-PR list to the next
+          # step (#324 round 2 codex P2) so the check-run can be posted
+          # with the correct head SHA per PR. failing_prs is space-
+          # separated, may have a leading space — `echo` collapses it.
           echo "HAD_INFRA_ERROR=$had_infra_error" >> "$GITHUB_ENV"
+          # shellcheck disable=SC2086  # intentional word-splitting to trim
+          echo "HAD_INFRA_ERROR_PRS=$(echo $failing_prs)" >> "$GITHUB_ENV"
           exit "$had_infra_error"
 
-      - name: Surface infra failure as check-run
+      - name: Surface infra failure as per-PR check-runs
         # Run even when the prior step failed — `if: always()` + the
-        # HAD_INFRA_ERROR sentinel so we only post a failed check-run
+        # HAD_INFRA_ERROR sentinel so we only post failed check-runs
         # when the prior step actually hit an infra error (not when
         # everything was clean or only gate-evaluation said "not yet
         # met").
+        #
+        # Per-PR check-runs (#324 round 2 codex P2): the prior version
+        # used `head_sha: ${{ github.sha }}`, but on workflow_run /
+        # pull_request_target / schedule, github.sha resolves to a
+        # default-branch commit, not the affected PR's head, so the
+        # annotation landed on the wrong commit and missed the target
+        # PR's Checks tab. Posting one check-run per failing PR fixes
+        # both the wrong-commit problem and the lost-visibility
+        # problem, at the cost of one extra `gh pr view` per failure
+        # (cheap, only on the error path).
         if: always() && env.HAD_INFRA_ERROR == '1'
         env:
           # check-run POST works with GITHUB_TOKEN + `checks: write`
@@ -281,14 +300,36 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh api "repos/${{ github.repository }}/check-runs" \
-            -X POST \
-            -f name='auto-clear-blocking-labels' \
-            -f head_sha='${{ github.sha }}' \
-            -f status='completed' \
-            -f conclusion='failure' \
-            -F 'output[title]=Auto-clear hit an infrastructure error' \
-            -F 'output[summary]=See workflow run logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          # shellcheck disable=SC1091
+          source scripts/lib/gh-retry-helpers.sh
+          REPO='${{ github.repository }}'
+          RUN_URL='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          # HAD_INFRA_ERROR_PRS is a space-separated list set by the
+          # prior step at each had_infra_error=1 site. Empty list →
+          # nothing to surface (defensive: should not happen given
+          # HAD_INFRA_ERROR is set).
+          if [ -z "${HAD_INFRA_ERROR_PRS:-}" ]; then
+            echo "::warning::HAD_INFRA_ERROR=1 but HAD_INFRA_ERROR_PRS is empty — skipping check-run emission."
+            exit 0
+          fi
+          for PR in $HAD_INFRA_ERROR_PRS; do
+            echo "::group::Posting infra-failure check-run for PR #$PR"
+            if ! HEAD_SHA=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
+              echo "::warning::Failed to resolve head SHA for PR #$PR — skipping check-run."
+              echo "::endgroup::"
+              continue
+            fi
+            with_gh_retry gh api "repos/$REPO/check-runs" \
+              -X POST \
+              -f name='auto-clear-blocking-labels' \
+              -f "head_sha=$HEAD_SHA" \
+              -f status='completed' \
+              -f conclusion='failure' \
+              -F "output[title]=Auto-clear hit an infrastructure error" \
+              -F "output[summary]=PR #$PR — see workflow run logs: $RUN_URL" \
+              || echo "::warning::Failed to post check-run for PR #$PR (annotation lost; workflow log still surfaces the failure)."
+            echo "::endgroup::"
+          done
 
   scheduled-sweep:
     name: Periodic sweep for stale needs-external-review labels
@@ -403,6 +444,7 @@ jobs:
           set -euo pipefail
           source scripts/lib/gh-retry-helpers.sh
           had_infra_error=0
+          failing_prs=""
           while IFS= read -r PR; do
             [ -z "$PR" ] && continue
             echo "::group::Sweep PR #$PR"
@@ -423,34 +465,55 @@ jobs:
                   # sweep must not report success. (CodeRabbit Major, #271.)
                   echo "::error::Failed to remove needs-external-review on PR #$PR — label still stuck."
                   had_infra_error=1
+                  failing_prs="$failing_prs $PR"
                 fi
                 ;;
               1) echo "Gate not yet met — leaving label in place." ;;
-              3) echo "::error::codex-review-check.sh rc=3 on PR #$PR"; had_infra_error=1 ;;
-              *) echo "::error::unexpected rc=$rc on PR #$PR"; had_infra_error=1 ;;
+              3) echo "::error::codex-review-check.sh rc=3 on PR #$PR"; had_infra_error=1; failing_prs="$failing_prs $PR" ;;
+              *) echo "::error::unexpected rc=$rc on PR #$PR"; had_infra_error=1; failing_prs="$failing_prs $PR" ;;
             esac
             echo "::endgroup::"
           done <<<"$PRS"
-          # Surface the infra-error sentinel to the next step (#324)
-          # so the check-run can be posted without re-deriving state.
+          # Surface the infra-error sentinel + per-PR list to the next
+          # step (#324 round 2 codex P2). See evaluate-and-clear job
+          # for the rationale (correct head SHA per failing PR).
           echo "HAD_INFRA_ERROR=$had_infra_error" >> "$GITHUB_ENV"
+          # shellcheck disable=SC2086  # intentional word-splitting to trim
+          echo "HAD_INFRA_ERROR_PRS=$(echo $failing_prs)" >> "$GITHUB_ENV"
           exit "$had_infra_error"
 
-      - name: Surface infra failure as check-run
-        # Run even when the prior step failed — `if: always()` + the
-        # HAD_INFRA_ERROR sentinel so we only post a failed check-run
-        # when the prior step actually hit an infra error.
+      - name: Surface infra failure as per-PR check-runs
+        # Mirrors evaluate-and-clear's surfacing step. See that step's
+        # comments for the per-PR check-run rationale (#324 round 2 P2).
         if: always() && env.HAD_INFRA_ERROR == '1'
         env:
           # check-run POST works with GITHUB_TOKEN + `checks: write`.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh api "repos/${{ github.repository }}/check-runs" \
-            -X POST \
-            -f name='auto-clear-blocking-labels' \
-            -f head_sha='${{ github.sha }}' \
-            -f status='completed' \
-            -f conclusion='failure' \
-            -F 'output[title]=Auto-clear hit an infrastructure error (scheduled sweep)' \
-            -F 'output[summary]=See workflow run logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          # shellcheck disable=SC1091
+          source scripts/lib/gh-retry-helpers.sh
+          REPO='${{ github.repository }}'
+          RUN_URL='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          if [ -z "${HAD_INFRA_ERROR_PRS:-}" ]; then
+            echo "::warning::HAD_INFRA_ERROR=1 but HAD_INFRA_ERROR_PRS is empty — skipping check-run emission."
+            exit 0
+          fi
+          for PR in $HAD_INFRA_ERROR_PRS; do
+            echo "::group::Posting infra-failure check-run for PR #$PR (sweep)"
+            if ! HEAD_SHA=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
+              echo "::warning::Failed to resolve head SHA for PR #$PR — skipping check-run."
+              echo "::endgroup::"
+              continue
+            fi
+            with_gh_retry gh api "repos/$REPO/check-runs" \
+              -X POST \
+              -f name='auto-clear-blocking-labels' \
+              -f "head_sha=$HEAD_SHA" \
+              -f status='completed' \
+              -f conclusion='failure' \
+              -F "output[title]=Auto-clear hit an infrastructure error (scheduled sweep)" \
+              -F "output[summary]=PR #$PR — see workflow run logs: $RUN_URL" \
+              || echo "::warning::Failed to post check-run for PR #$PR (annotation lost; workflow log still surfaces the failure)."
+            echo "::endgroup::"
+          done
