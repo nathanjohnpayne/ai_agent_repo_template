@@ -100,10 +100,16 @@ template_substitution::_fact_value() {
   esac
   local var
   var=$(template_substitution::_fact_var "$key")
-  # bash 3.2 indirect expansion via eval.
-  local value
-  eval "value=\${$var-__MERGEPATH_FACT_UNSET__}"
-  if [ "$value" = "__MERGEPATH_FACT_UNSET__" ]; then
+  # bash 3.2 indirect expansion via eval. Detect set-or-unset with
+  # the `${var+x}` form (echoes "x" if var is set to ANY value
+  # including empty; echoes empty if unset). Earlier versions used
+  # a literal sentinel string compared via `=`, which mis-classified
+  # a fact legitimately set to that exact sentinel as unset
+  # (Codex P3 on PR #313). The +x form has no collision surface —
+  # the test is on the existence of the variable, not its value.
+  local is_set
+  eval "is_set=\${$var+x}"
+  if [ -z "$is_set" ]; then
     if [ "${MERGEPATH_TEMPLATE_STRICT:-0}" = "1" ]; then
       printf 'template: strict mode: fact %s (env %s) is not set\n' \
         "$key" "$var" >&2
@@ -112,6 +118,8 @@ template_substitution::_fact_value() {
     printf ''
     return 0
   fi
+  local value
+  eval "value=\${$var}"
   printf '%s' "$value"
 }
 
@@ -335,6 +343,14 @@ template_substitution::render() {
 # mv failure (permission, ENOSPC, racing process) is checked
 # explicitly — without that, render_to could return 0 with no
 # destination write, silently losing the rendered output.
+#
+# Mode preservation: if the destination already exists, its file
+# mode is captured before the rename and re-applied after, so a
+# pre-existing executable or world-readable file keeps its bits
+# rather than inheriting mktemp's 0600 (Codex P2 round 2 on PR
+# #313). When dest doesn't yet exist, the temp file's 0600 mode
+# stands — callers that need a specific mode on a new file set it
+# explicitly after rendering.
 template_substitution::render_to() {
   local source=$1
   local dest=$2
@@ -343,6 +359,15 @@ template_substitution::render_to() {
   if [ ! -d "$dest_dir" ]; then
     printf 'template: destination directory not found: %s\n' "$dest_dir" >&2
     return 2
+  fi
+  # Capture existing dest mode (if any) before render — we need it
+  # before the rename clobbers the dest inode. `stat -f` is BSD/
+  # macOS; `stat -c` is GNU/Linux. Try both, fall back to empty.
+  local dest_mode=""
+  if [ -e "$dest" ]; then
+    dest_mode=$(stat -f '%Mp%Lp' "$dest" 2>/dev/null \
+                || stat -c '%a' "$dest" 2>/dev/null \
+                || printf '')
   fi
   local tmp
   tmp=$(mktemp "$dest_dir/.template-render.XXXXXX")
@@ -356,6 +381,15 @@ template_substitution::render_to() {
     rm -f "$tmp"
     printf 'template: mv failed writing %s\n' "$dest" >&2
     return 1
+  fi
+  # Re-apply captured mode. chmod failure is non-fatal — the content
+  # is already correctly written, and a mode-preservation failure is
+  # less bad than reporting a render failure when the render itself
+  # succeeded. Surfaced via stderr only.
+  if [ -n "$dest_mode" ]; then
+    chmod "$dest_mode" "$dest" 2>/dev/null \
+      || printf 'template: warning: failed to restore mode %s on %s\n' \
+           "$dest_mode" "$dest" >&2
   fi
 }
 

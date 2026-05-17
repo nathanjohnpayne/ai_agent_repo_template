@@ -126,6 +126,25 @@ r=$(render_case "missing: <{{nope}}>
 " "MERGEPATH_TEMPLATE_STRICT=1")
 expect_rc "1e strict mode: missing fact = rc 3" "$r" 3
 
+# 1e2: regression guard for sentinel collision (Codex P3 round 2 on PR #313).
+# A fact legitimately set to the OLD sentinel string must NOT be
+# misclassified as unset. With the +x detection this is just an
+# ordinary set-to-value case.
+r=$(render_case "value: <{{collides}}>
+" "MERGEPATH_FACT_COLLIDES=__MERGEPATH_FACT_UNSET__")
+expect_output "1e2 sentinel-collision regression: literal sentinel as value treated as set" "$r" "value: <__MERGEPATH_FACT_UNSET__>"
+
+# 1e3: fact set to empty string is treated as SET (distinct from unset).
+# Lenient mode: empty value → empty substitution (same as before).
+# Strict mode: empty value → NOT a strict-mode failure (the var IS set).
+# This is the new behavior under +x detection; previously a value of
+# "" round-tripped through the sentinel test as "set", but the
+# documentation of strict-mode said only an "unknown fact" (set/unset
+# distinction) triggers rc 3.
+r=$(render_case "empty: <{{empty_fact}}>
+" "MERGEPATH_FACT_EMPTY_FACT=" "MERGEPATH_TEMPLATE_STRICT=1")
+expect_output "1e3 strict mode: empty-string fact is set (not a strict failure)" "$r" "empty: <>"
+
 r=$(render_case "unclosed: {{key
 ")
 expect_output "1f unclosed {{ left verbatim" "$r" "unclosed: {{key"
@@ -383,6 +402,58 @@ if [ -f "$dest" ] && [ "$(cat "$dest")" = "rendered: value" ]; then
   pass "10a render_to writes destination file"
 else
   fail "10a render_to: expected 'rendered: value', got: $(cat "$dest" 2>/dev/null || echo MISSING)"
+fi
+
+# 10c: render_to preserves existing dest mode (Codex P2 round 2 on PR #313).
+# Pre-create dest with mode 0644 and verify mv doesn't strip to 0600.
+src="$WORKDIR/mode-src.tpl"
+dest="$WORKDIR/mode-dest.txt"
+echo "original content" > "$dest"
+chmod 644 "$dest"
+echo "new: {{key}}" > "$src"
+(
+  reset_facts
+  export MERGEPATH_FACT_KEY=after
+  # shellcheck disable=SC1090
+  source "$LIB"
+  template_substitution::render_to "$src" "$dest"
+)
+# Read mode in a portable way (same logic as the lib).
+actual_mode=$(stat -f '%Mp%Lp' "$dest" 2>/dev/null \
+              || stat -c '%a' "$dest" 2>/dev/null \
+              || echo "??")
+# BSD stat returns "0644", GNU returns "644". Accept both.
+case "$actual_mode" in
+  0644|644)
+    if [ "$(cat "$dest")" = "new: after" ]; then
+      pass "10c render_to preserves existing dest mode (0644, not 0600)"
+    else
+      fail "10c render_to: content wrong after mode-preservation render: $(cat "$dest")"
+    fi
+    ;;
+  *)
+    fail "10c render_to: expected mode 0644/644, got '$actual_mode'"
+    ;;
+esac
+
+# 10d: render_to writing a new file (no pre-existing dest) — verify
+# render still succeeds (mode preservation skips the chmod, but the
+# write must work).
+src="$WORKDIR/newfile-src.tpl"
+dest="$WORKDIR/newfile-dest.txt"
+echo "fresh: {{key}}" > "$src"
+[ -e "$dest" ] && rm "$dest"
+(
+  reset_facts
+  export MERGEPATH_FACT_KEY=new
+  # shellcheck disable=SC1090
+  source "$LIB"
+  template_substitution::render_to "$src" "$dest"
+)
+if [ -f "$dest" ] && [ "$(cat "$dest")" = "fresh: new" ]; then
+  pass "10d render_to writes new file (no pre-existing dest)"
+else
+  fail "10d render_to: expected fresh write, got: $(cat "$dest" 2>/dev/null || echo MISSING)"
 fi
 
 # render_to failure: malformed template → no partial write of dest.
