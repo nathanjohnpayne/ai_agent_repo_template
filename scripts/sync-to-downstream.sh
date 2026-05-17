@@ -457,6 +457,104 @@ compare_templated() {
   rm -f "$tmp_rendered"
 }
 
+# Materialize templated targets into a consumer workspace. For each
+# path in $templated_list (comma-joined manifest .path values),
+# fetch source/dest from the manifest, read the source from
+# mergepath@$sha, render via the substitution lib with the
+# consumer's facts, and write to the consumer's dest (atomically
+# via template_substitution::render_to). Honors the consumer's
+# .sync-overrides.yml skip_paths on the DEST path — the consumer
+# cares about the path landing in their tree, not the mergepath-
+# side source path.
+#
+# Args:
+#   $1 consumer_name        — for fact lookup + log lines
+#   $2 sha                  — mergepath commit to read source from
+#   $3 workspace            — consumer workspace root (writes land
+#                             at $workspace/repo/<dest>)
+#   $4 templated_list       — comma-joined manifest .path values
+#                             (caller-supplied, typically from
+#                             sync_consumer_skipped_targets in the
+#                             per-commit path or
+#                             sync_all_consumer_templated_targets in
+#                             the sync-all path)
+#   $5 consumer_overrides   — absolute path to the consumer's
+#                             .sync-overrides.yml (or empty string
+#                             if the consumer has no overrides file)
+#
+# Returns 0 on success (no targets is a clean no-op), non-zero if
+# any render failed. Materializes files into the workspace;
+# committing/pushing is the caller's concern.
+materialize_templated_targets() {
+  local consumer_name=$1
+  local sha=$2
+  local workspace=$3
+  local templated_list=$4
+  local consumer_overrides=$5
+
+  [ -z "$templated_list" ] && return 0
+
+  local manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
+  local short_sha=${sha:0:7}
+  local tpl_path tpl_source tpl_dest tpl_meta tpl_tmp tpl_consumer_target
+  local _tpl_paths
+  IFS=',' read -ra _tpl_paths <<< "$templated_list"
+  for tpl_path in "${_tpl_paths[@]}"; do
+    [ -z "$tpl_path" ] && continue
+
+    # Per-entry source + dest from the manifest. Default to .path when
+    # omitted (canonical/kit's symmetric model); templated entries
+    # typically declare both explicitly.
+    tpl_meta=$(MERGEPATH_TPL_PATH="$tpl_path" yq -r '
+      env(MERGEPATH_TPL_PATH) as $p
+      | .paths[] | select(.path == $p) | (.source // .path) + "\t" + (.dest // .path)
+    ' "$manifest")
+    tpl_source=$(echo "$tpl_meta" | cut -f1)
+    tpl_dest=$(echo "$tpl_meta" | cut -f2)
+    if [ -z "$tpl_source" ] || [ -z "$tpl_dest" ]; then
+      err "$consumer_name: could not resolve source/dest for templated entry '$tpl_path' (yq returned empty)"
+      return 1
+    fi
+
+    # Consumer-side override filter — applied to DEST because that's
+    # what lands in the consumer tree.
+    if [ -n "$consumer_overrides" ] && override_should_skip_path "$consumer_overrides" "$tpl_dest"; then
+      printf "  · %s skip %s (templated, per .sync-overrides.yml: %s)\n" \
+        "$consumer_name" "$tpl_dest" "$OVERRIDE_SKIP_REASON"
+      continue
+    fi
+
+    # Read source from mergepath@$sha into a tmp file, then render
+    # via the lib in a subshell so the MERGEPATH_FACT_* exports
+    # don't leak to other materializations in the same consumer
+    # (multiple templated entries) or the next consumer iteration.
+    tpl_tmp=$(mktemp "${TMPDIR:-/tmp}/mergepath-template-src.XXXXXX") || {
+      err "$consumer_name: mktemp failed for templated source"
+      return 1
+    }
+    if ! git -C "$MERGEPATH_ROOT" show "$sha:$tpl_source" >"$tpl_tmp" 2>/dev/null; then
+      rm -f "$tpl_tmp"
+      err "$consumer_name: could not read templated source $tpl_source from mergepath@$short_sha"
+      return 1
+    fi
+
+    tpl_consumer_target="$workspace/repo/$tpl_dest"
+    mkdir -p "$(dirname "$tpl_consumer_target")"
+    if ! (
+      export_consumer_facts "$consumer_name" "$manifest"
+      # shellcheck disable=SC1091
+      source "$MERGEPATH_ROOT/scripts/lib/template-substitution.sh"
+      template_substitution::render_to "$tpl_tmp" "$tpl_consumer_target"
+    ); then
+      rm -f "$tpl_tmp"
+      err "$consumer_name: render failed for templated $tpl_source → $tpl_dest"
+      return 1
+    fi
+    rm -f "$tpl_tmp"
+    printf "  ✎ %s rendered %s → %s\n" "$consumer_name" "$tpl_source" "$tpl_dest"
+  done
+}
+
 # Export a consumer's facts:* from the manifest as MERGEPATH_FACT_*
 # env vars in the current (sub)shell. Unsets any prior
 # MERGEPATH_FACT_* exports first so successive callers don't see
@@ -827,8 +925,17 @@ sync_all_consumer_templated_targets() {
   done
 }
 
-# Count manifest paths skipped (kit + templated) so the summary can name
-# them. Echoes "kit_count\ttemplated_count\tkit_paths\ttemplated_paths".
+# Enumerate manifest paths the per-commit sync needs to know about
+# beyond the canonical slice: kit paths that changed at the commit
+# (still deferred to slice 2, included in the commit-body
+# deferred-note) AND templated paths that changed (now materialized
+# in slice 5 / #313+follow-up — the function name predates the
+# templated activation, kept for back-compat).
+#
+# Echoes "kit_count\ttemplated_count\tkit_paths\ttemplated_paths".
+# Caller splits the templated CSV and passes it through to
+# materialize_templated_targets via sync_open_pr's 8th positional
+# arg; the kit CSV is still display-only in the deferred-note.
 sync_consumer_skipped_targets() {
   local consumer_name=$1
   local changed_files=$2
@@ -1156,9 +1263,15 @@ sync_open_pr() {
   done <<< "$targets"
   targets="$filtered_targets"
 
-  if [ -z "$targets" ]; then
+  # Early-exit gate. Pre-templated-activation this checked $targets
+  # only (canonical-after-override-filter); now also gate on
+  # $templated_list so a commit that touches ONLY a templated source
+  # (no canonical changes) still materializes. Templated override
+  # filtering happens inside materialize_templated_targets — its
+  # skip path counters are separate from canonical's.
+  if [ -z "$targets" ] && [ -z "$templated_list" ]; then
     if [ "$override_skip_count" -gt 0 ]; then
-      printf "  ⊘ %s — all canonical targets skipped per .sync-overrides.yml (%d entries)\n" \
+      printf "  ⊘ %s — all canonical targets skipped per .sync-overrides.yml (%d entries); no templated targets either\n" \
         "$consumer_name" "$override_skip_count"
       SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
       SYNC_PR_OPENED=$((SYNC_PR_OPENED - 1))  # pre-decrement to offset the caller's post-success increment
@@ -1218,6 +1331,17 @@ sync_open_pr() {
     esac
   done <<< "$targets"
 
+  # Templated materialize — render mergepath@$sha's source templates
+  # with the consumer's facts (per scripts/lib/template-substitution.sh,
+  # #313) and write to consumer dest paths. The helper handles
+  # source/dest resolution from the manifest, per-entry override
+  # filtering on dest, and atomic render_to. Failures abort the
+  # whole consumer (same all-or-nothing semantics as canonical).
+  if ! materialize_templated_targets "$consumer_name" "$sha" "$workspace" \
+                                      "$templated_list" "$consumer_overrides"; then
+    return 1
+  fi
+
   # Sanity: did the copy actually change anything? If the consumer was
   # already in sync (someone hand-propagated it before us, or a prior
   # sync ran but the PR was never opened), don't push an empty commit.
@@ -1246,13 +1370,29 @@ sync_open_pr() {
   git -C "$workspace/repo" add -A
   local target_lines
   target_lines=$(while IFS= read -r p; do [ -z "$p" ] && continue; echo "  - $p"; done <<< "$targets")
+  # Append templated dest paths to the commit-body file list. Use the
+  # `.dest` value (where the file lands in the consumer), not `.path`
+  # (the manifest identifier in mergepath), so a reader sees the same
+  # paths that show up in `git status`.
+  if [ -n "$templated_list" ]; then
+    local _tpls _tpl _tpl_dest
+    IFS=',' read -ra _tpls <<< "$templated_list"
+    for _tpl in "${_tpls[@]}"; do
+      [ -z "$_tpl" ] && continue
+      _tpl_dest=$(MERGEPATH_TPL_PATH="$_tpl" yq -r '
+        env(MERGEPATH_TPL_PATH) as $p
+        | .paths[] | select(.path == $p) | (.dest // .path)
+      ' "$MERGEPATH_ROOT/$MANIFEST_PATH")
+      target_lines+=$'\n'"  - ${_tpl_dest} (templated, rendered from ${_tpl})"
+    done
+  fi
   local deferred_note=""
-  if [ -n "$kit_list" ] || [ -n "$templated_list" ]; then
+  if [ -n "$kit_list" ]; then
     deferred_note="
 Deferred this propagation (sync-to-downstream.sh ${SCRIPT_VERSION}
-only handles canonical paths; kit + templated land in slices 2 and 5):
-  kit:       ${kit_list:-none}
-  templated: ${templated_list:-none}
+handles canonical + templated paths in this slice; kit lands in
+slice 2):
+  kit: ${kit_list:-none}
 "
   fi
   if ! git -C "$workspace/repo" commit -q -m "$(cat <<EOF
@@ -1528,9 +1668,12 @@ sync_all_open_pr() {
   done <<< "$kit_targets"
   kit_targets="$filtered_kit"
 
-  if [ -z "$canonical_targets" ] && [ -z "$kit_targets" ]; then
+  # Early-exit gate. Pre-templated-activation this checked canonical
+  # and kit only; now also gate on $templated_list so a consumer
+  # whose only opt-ins are templated entries still materializes.
+  if [ -z "$canonical_targets" ] && [ -z "$kit_targets" ] && [ -z "$templated_list" ]; then
     if [ "$override_skip_count" -gt 0 ]; then
-      printf "  ⊘ %s — all canonical+kit targets skipped per .sync-overrides.yml (%d entries)\n" \
+      printf "  ⊘ %s — all canonical+kit targets skipped per .sync-overrides.yml (%d entries); no templated targets either\n" \
         "$consumer_name" "$override_skip_count"
       SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
       SYNC_PR_OPENED=$((SYNC_PR_OPENED - 1))  # offset caller's eager increment
@@ -1616,6 +1759,17 @@ sync_all_open_pr() {
     done <<< "$kit_files"
   done <<< "$kit_targets"
 
+  # Templated materialize — render mergepath@$sha's source templates
+  # with each consumer's facts (per scripts/lib/template-substitution.sh,
+  # #313) and write to consumer dest paths. The helper handles
+  # source/dest resolution from the manifest, per-entry override
+  # filtering on dest, and atomic render_to. Failures abort the
+  # whole consumer (same all-or-nothing semantics as canonical/kit).
+  if ! materialize_templated_targets "$consumer_name" "$sha" "$workspace" \
+                                      "$templated_list" "$consumer_overrides"; then
+    return 1
+  fi
+
   # Sanity: did the copy actually change anything? A consumer already
   # at HEAD state (hand-propagated, or a prior --sync-all PR merged)
   # should not get an empty commit / PR.
@@ -1641,11 +1795,25 @@ sync_all_open_pr() {
   git -C "$workspace/repo" add -A
 
   # Build the path lists for the commit / PR body.
-  local canonical_lines kit_lines
+  local canonical_lines kit_lines templated_lines
   canonical_lines=$(while IFS= read -r p; do [ -z "$p" ] && continue; echo "  - $p"; done <<< "$canonical_targets")
   kit_lines=$(while IFS= read -r p; do [ -z "$p" ] && continue; echo "  - $p (kit, allow-extras)"; done <<< "$kit_targets")
+  templated_lines=""
+  if [ -n "$templated_list" ]; then
+    local _tpls_a _tpl_a _tpl_a_dest
+    IFS=',' read -ra _tpls_a <<< "$templated_list"
+    for _tpl_a in "${_tpls_a[@]}"; do
+      [ -z "$_tpl_a" ] && continue
+      _tpl_a_dest=$(MERGEPATH_TPL_PATH="$_tpl_a" yq -r '
+        env(MERGEPATH_TPL_PATH) as $p
+        | .paths[] | select(.path == $p) | (.dest // .path)
+      ' "$MERGEPATH_ROOT/$MANIFEST_PATH")
+      templated_lines+="  - ${_tpl_a_dest} (templated, rendered from ${_tpl_a})"$'\n'
+    done
+  fi
   [ -z "$canonical_lines" ] && canonical_lines="  (none)"
   [ -z "$kit_lines" ] && kit_lines="  (none)"
+  [ -z "$templated_lines" ] && templated_lines="  (none)"
 
   local override_note=""
   if [ -n "$override_skipped_list" ]; then
@@ -1655,23 +1823,18 @@ divergences left untouched):
   ${override_skipped_list}
 "
   fi
-  local templated_note=""
-  if [ -n "$templated_list" ]; then
-    templated_note="
-Deferred (templated paths land in Layer 5, #168):
-  ${templated_list}
-"
-  fi
 
   if ! git -C "$workspace/repo" commit -q -m "$(cat <<EOF
-bulk sync to mergepath@${short_sha} — verbatim canonical/kit mirror per .mergepath-sync.yml
+bulk sync to mergepath@${short_sha} — verbatim canonical/kit mirror + per-consumer templated render per .mergepath-sync.yml
 
 Source: https://github.com/nathanjohnpayne/mergepath/commit/${sha}
 Canonical paths synced:
 ${canonical_lines}
 Kit paths synced:
 ${kit_lines}
-${override_note}${templated_note}
+Templated paths rendered (per-consumer facts applied):
+${templated_lines}
+${override_note}
 Authoring-Agent: claude
 
 ## Self-Review
@@ -1753,7 +1916,10 @@ ${canonical_lines}
 
 ## Kit paths synced
 ${kit_lines}
-${override_note}${templated_note}
+
+## Templated paths rendered (per-consumer facts applied)
+${templated_lines}
+${override_note}
 Authoring-Agent: claude
 
 ## Self-Review
@@ -1794,8 +1960,8 @@ sync_all_one_consumer() {
   local templated_list
   templated_list=$(echo "$templated_targets" | grep -v '^$' | paste -sd, - 2>/dev/null || true)
 
-  if [ -z "$canonical_targets" ] && [ -z "$kit_targets" ]; then
-    printf "  · %s (no canonical/kit manifest paths opted in)\n" "$consumer_name"
+  if [ -z "$canonical_targets" ] && [ -z "$kit_targets" ] && [ -z "$templated_targets" ]; then
+    printf "  · %s (no canonical/kit/templated manifest paths opted in)\n" "$consumer_name"
     SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
     return 0
   fi
@@ -1923,7 +2089,7 @@ sync_all_one_consumer() {
       printf '%s' "$plan_skipped"
     fi
     if [ -n "$templated_list" ]; then
-      printf "      (deferred — templated, Layer 5: %s)\n" "$templated_list"
+      printf "      (templated, rendered per consumer facts: %s)\n" "$templated_list"
     fi
     SYNC_PR_OPENED=$((SYNC_PR_OPENED + 1))
     return 0
