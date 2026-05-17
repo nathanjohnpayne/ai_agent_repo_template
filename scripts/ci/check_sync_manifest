@@ -210,7 +210,8 @@ if ! path_rows=$(yq -r '
   | ((.path // "") + "|" + (.type // "") + "|"
      + (.consumers | (select(tag == "!!str") // (join(","))) | tostring)
      + "|" + (.dest // "") + "|" + (.source // "")
-     + "|" + (has("dest") | tostring) + "|" + (has("source") | tostring))
+     + "|" + (has("dest") | tostring) + "|" + (has("source") | tostring)
+     + "|" + (has("path") | tostring))
 ' "$MANIFEST" 2>&1); then
   echo "FAIL: could not extract .paths from the manifest (yq error):"
   printf '%s\n' "$path_rows"
@@ -226,8 +227,34 @@ fi
 # names so the choice is unambiguous. Codex Phase 4b
 # CHANGES_REQUESTED on PR #316 by nathanpayne-codex surfaced the
 # empty-dest gap that made this field-stability issue visible.
-while IFS='|' read -r path type consumers dest source has_dest has_source; do
-  [ -z "$path" ] && continue
+#
+# Why the outer `[ -n "$path_rows" ]` guard: an empty `.paths: []`
+# (yq emits no lines) combined with `<<< "$path_rows"` (here-string
+# always appends a newline) yields one blank `read` iteration, which
+# the new `has_path != "true"` fail-closed check below would treat
+# as a malformed entry. Same guard pattern as the consumer_rows
+# loop above. Codex Phase 4b P2 on PR #320 by nathanpayne-codex
+# caught this regression from PR #320's own fail-closed addition.
+if [ -n "$path_rows" ]; then
+while IFS='|' read -r path type consumers dest source has_dest has_source has_path; do
+  # An entry without a `path` field (or with `path: ""`) is a
+  # malformed manifest entry. Previously coerced to empty + silently
+  # `continue`d, letting malformed entries hide in the manifest with
+  # only an empty-line side effect. CodeRabbit Major + Codex Phase 4b
+  # CHANGES_REQUESTED on Phase D consumer PRs both flagged the
+  # silent-skip — fail-closed instead. has_path distinguishes
+  # "absent" from "explicit empty" (parallel to the dest/source
+  # has_* probes added in #316).
+  if [ "$has_path" != "true" ]; then
+    echo "FAIL: a .paths[] entry has no 'path' field (omitted entirely; manifest entries must declare 'path')"
+    FAILED=1
+    continue
+  fi
+  if [ -z "$path" ]; then
+    echo "FAIL: a .paths[] entry has explicit path: \"\" (empty); path must be non-empty"
+    FAILED=1
+    continue
+  fi
 
   # 4a-ter: empty-string `dest:` or `source:` is a misconfiguration —
   # the yq `(.dest // "")` extraction collapses "absent" and
@@ -383,6 +410,7 @@ while IFS='|' read -r path type consumers dest source has_dest has_source; do
     done
   fi
 done <<< "$path_rows"
+fi  # end: if [ -n "$path_rows" ]
 
 # 7. requires: closure invariant (#264).
 #
