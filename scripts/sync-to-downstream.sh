@@ -390,6 +390,107 @@ compare_canonical() {
   REPLY="drift:$lines"
 }
 
+# Compare a single templated entry: render mergepath@HEAD's source
+# template using the consumer's facts (via scripts/lib/template-
+# substitution.sh) and byte-compare against the consumer's on-disk
+# destination. Outputs the same status tag scheme as compare_canonical:
+#   "ok" / "drift:<lines>" / "missing"
+#
+# Args: mp_path (manifest identifier), source_path (where the source
+# template lives in mergepath — defaults to mp_path upstream when
+# omitted), dest_path (where the rendered output lives in the
+# consumer), consumer_name (for facts lookup), consumer_root.
+#
+# Why a function-scoped subshell for the render: export_consumer_facts
+# mutates MERGEPATH_FACT_* env vars; running the render inside a
+# subshell scopes those exports so a subsequent consumer iteration
+# doesn't see stale facts from this one. The subshell's stdout is
+# captured to the tmp file via the `(...) > "$tmp"` redirection.
+compare_templated() {
+  local mp_path=$1
+  local source_path=$2
+  local dest_path=$3
+  local consumer_name=$4
+  local consumer_root=$5
+
+  local mp_source="$MERGEPATH_ROOT/$source_path"
+  local consumer_dest="$consumer_root/$dest_path"
+
+  if [ ! -e "$mp_source" ]; then
+    err "compare_templated: source $source_path not found in mergepath"
+    REPLY="drift:0"
+    return 0
+  fi
+  if [ ! -e "$consumer_dest" ]; then
+    REPLY="missing"
+    return 0
+  fi
+
+  local manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
+  local tmp_rendered
+  tmp_rendered=$(mktemp "${TMPDIR:-/tmp}/compare-templated.XXXXXX") || {
+    err "compare_templated: mktemp failed"
+    REPLY="drift:0"
+    return 0
+  }
+  local render_rc=0
+  (
+    export_consumer_facts "$consumer_name" "$manifest"
+    # shellcheck disable=SC1091
+    source "$MERGEPATH_ROOT/scripts/lib/template-substitution.sh"
+    template_substitution::render "$mp_source"
+  ) > "$tmp_rendered" 2>/dev/null || render_rc=$?
+  if [ "$render_rc" != "0" ]; then
+    rm -f "$tmp_rendered"
+    err "compare_templated: render failed (rc=$render_rc) for $source_path with $consumer_name's facts"
+    REPLY="drift:0"
+    return 0
+  fi
+
+  if cmp -s "$tmp_rendered" "$consumer_dest"; then
+    REPLY="ok"
+  else
+    local lines
+    lines=$( { diff "$tmp_rendered" "$consumer_dest" || true; } | wc -l | tr -d ' ')
+    REPLY="drift:$lines"
+  fi
+  rm -f "$tmp_rendered"
+}
+
+# Export a consumer's facts:* from the manifest as MERGEPATH_FACT_*
+# env vars in the current (sub)shell. Unsets any prior
+# MERGEPATH_FACT_* exports first so successive callers don't see
+# stale facts from a different consumer. List-valued facts (yaml
+# `[a, b]`) are serialized as space-separated, matching the lib's
+# `<key> contains <value>` expectations.
+#
+# Uses the `env(VAR)` mikefarah/yq form for consumer-name injection
+# (the `--arg` jq-compat flag works too but env-var is the
+# documented mikefarah idiom).
+export_consumer_facts() {
+  local consumer_name=$1
+  local manifest=$2
+
+  # Clean slate — prior consumer's facts must not leak in.
+  local var
+  for var in $(env | awk -F= '/^MERGEPATH_FACT_/ {print $1}'); do
+    unset "$var"
+  done
+
+  while IFS=$'\t' read -r key value; do
+    [ -z "$key" ] && continue
+    local upper
+    upper=$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+    export "MERGEPATH_FACT_$upper=$value"
+  done < <(MERGEPATH_CONSUMER_NAME="$consumer_name" yq -r '
+    env(MERGEPATH_CONSUMER_NAME) as $cn
+    | .consumers[] | select(.name == $cn) | .facts // {} | to_entries[]
+    | .key + "\t" + (
+        .value | if (tag == "!!seq") then join(" ") else tostring end
+      )
+  ' "$manifest")
+}
+
 # Compare a kit directory: every file under Mergepath's path must
 # exist (byte-identical) in the consumer; consumer-only files are
 # allowed and ignored. Outputs a status tag in $REPLY:
@@ -538,14 +639,20 @@ run_audit() {
     # we get the same effect via `select(tag == "!!str") // <fallback>`,
     # which yields the original scalar when consumers is a string and
     # the join'd list otherwise.
+    # Extended yq tuple: include source + dest so templated entries can
+    # be audited with source-template / dest-rendered remapping. For
+    # canonical/kit, source and dest default to .path; the audit code
+    # below ignores those fields for those types.
     local paths
     paths=$(yq -r '
       .paths[]
       | (.path + "\t" + .type + "\t"
-         + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
+         + (.consumers | (select(tag == "!!str") // (join(","))) | tostring)
+         + "\t" + (.source // .path)
+         + "\t" + (.dest // .path))
     ' "$manifest")
 
-    while IFS=$'\t' read -r mp_path mp_type mp_consumers; do
+    while IFS=$'\t' read -r mp_path mp_type mp_consumers mp_source mp_dest; do
       [ -z "$mp_path" ] && continue
       if ! in_path_filter "$mp_path"; then
         continue
@@ -570,10 +677,13 @@ run_audit() {
           [ "$REPLY" != "ok" ] && AUDIT_DRIFT_FOUND=1
           ;;
         templated)
-          # Layer 5 territory. Skip with a clear marker so the human
-          # sees these entries are intentionally deferred, not silently
-          # in-sync.
-          printf "  %s %-50s %s\n" "·" "$mp_path" "templated (deferred — Layer 5, #168)"
+          # Layer 5 activated (#313 lib + this PR). Render the source
+          # template with the consumer's facts and byte-diff against
+          # the on-disk destination.
+          compare_templated "$mp_path" "$mp_source" "$mp_dest" \
+                            "$consumer_name" "$consumer_root"
+          emit_status_line "$mp_dest" "$REPLY"
+          [ "$REPLY" != "ok" ] && AUDIT_DRIFT_FOUND=1
           ;;
         *)
           err "unknown path type '$mp_type' for $mp_path"
