@@ -397,10 +397,31 @@ PATHS_SRC_MISSING="eslint.config.js"
 set +e
 out=$(run_with_fixture "$MANIFEST_SRC_MISSING" "$PATHS_SRC_MISSING"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "source 'examples/missing.js' does not exist"; then
-  pass "Case 13: source ≠ path with missing source rejected"
+if [ "$rc" = "1" ] && echo "$out" | grep -q "source 'examples/missing.js' must be a regular file for templated entries"; then
+  pass "Case 13: source ≠ path with missing source rejected (templated: requires regular file)"
 else
   fail "Case 13 unexpected (rc=$rc): $out"
+fi
+
+# Case 13b: templated source pointing at a DIRECTORY is rejected (a
+# directory can't be a template). CodeRabbit Major on PR #316 caught
+# this gap — the previous `-e` check would have accepted a directory.
+MANIFEST_SRC_ISDIR="$MIN_HEADER
+  - path: eslint.config.js
+    type: templated
+    source: examples/somedir
+    dest: eslint.config.js
+    consumers: all
+"
+PATHS_SRC_ISDIR="eslint.config.js
+examples/somedir/"
+set +e
+out=$(run_with_fixture "$MANIFEST_SRC_ISDIR" "$PATHS_SRC_ISDIR"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "must be a regular file for templated entries"; then
+  pass "Case 13b: templated source pointing at a directory rejected"
+else
+  fail "Case 13b unexpected (rc=$rc): $out"
 fi
 
 # Case 14: valid consumer facts (scalar + list) pass.

@@ -134,9 +134,20 @@ consumers:
 #                the rendering. Audit re-renders per consumer and
 #                byte-diffs against the on-disk destination. Sync
 #                materializes the rendered output into the destination
-#                path. The propagation-PR verification (#264 lane)
-#                re-renders against mergepath@<sha> with the consumer's
-#                facts and byte-verifies the PR content.
+#                path.
+#
+#                v1 NOTE: the propagation-PR review lane (#264) does
+#                NOT YET re-render-and-verify templated entries. The
+#                lane's parse_manifest_paths.sh emits only source
+#                paths, so a PR touching a templated `dest` reads as
+#                "off propagation surface" and the lane gate denies
+#                exemption — templated propagation PRs route to
+#                normal Phase 4 review. A follow-up PR will extend
+#                verify-propagation-pr.sh to re-render against
+#                mergepath@<sha> with the consumer's facts and
+#                byte-verify the PR content. See docs/agents/
+#                templated-propagation.md § Propagation-lane
+#                verification — v1 limitation.
 #
 #                Templated entries require explicit `source:` and
 #                `dest:` fields (the source path in Mergepath does

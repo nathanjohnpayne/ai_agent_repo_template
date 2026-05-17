@@ -11,7 +11,7 @@ Renders a source template to per-consumer output using two surfaces:
 1. **Variable substitution** — anywhere in the file, `{{key}}` is replaced by the value of `MERGEPATH_FACT_KEY` (uppercased, hyphens → underscores). Keys must match `[a-z0-9_-]+` (lowercase letters, digits, underscore, hyphen); a malformed key — e.g. one containing shell metacharacters — is rejected as malformed template (render exit code 1), distinct from a syntactically valid but unset fact (which is empty in lenient mode or exit code 3 in strict mode).
 2. **Conditional blocks** — `>>> if <expr> ... <<<` markers gate body lines on per-consumer facts. Marker lines are **always stripped** from output regardless of the expression; only the body lines between them are conditional. If `<expr>` is true, body lines are emitted verbatim; if false, body lines are dropped.
 
-Sync-side integration (follow-up PR) is responsible for exporting per-consumer facts from the manifest before invoking the lib. The lib itself reads facts only from the environment.
+Sync-side integration (landed; see § Sync integration below) is responsible for exporting per-consumer facts from the manifest before invoking the lib. The lib itself reads facts only from the environment.
 
 ## Syntax reference
 
@@ -116,9 +116,9 @@ Real templates will accumulate optional-fact references over time (`{{node_versi
 
 ## Limits and known gaps
 
-- **The lib alone produces no output anywhere yet.** It's wired into `repo_lint.yml` via `scripts/ci/check_template_substitution` so its tests run on every PR, but no manifest entry uses `type: templated` yet. The follow-up integration PR adds that.
+- **No live templated entry in the manifest yet.** The lib + sync integration are wired (audit, materialize for per-commit + sync-all), but `.mergepath-sync.yml` has zero entries of `type: templated` today. Phase C adds the first one (`examples/eslint.config.js` → `eslint.config.js`) to unblock the [mergepath#250](https://github.com/nathanjohnpayne/mergepath/issues/250) ESLint rollout.
 - **The lib doesn't know about consumer name or repo.** Facts must be uniform across consumers (e.g., `frameworks`, `node_version`); per-consumer name substitution (`mergepath` → `<consumer>`) still goes through `scripts/bootstrap/substitute.sh`'s allow-list-driven path. Long-term, both should share a single substitution lib (per [#168 Layer 5's original sketch](https://github.com/nathanjohnpayne/mergepath/issues/168) — "factor the substitution logic into `scripts/lib/template-substitution.sh` so bootstrap and sync share the lib"), but that consolidation is non-trivial because the two callers have different semantics (literal name allow-list vs. fact-driven substitution). Tracked as future work.
-- **No `--audit`-side rendering yet.** Until the integration PR lands, `--audit` will continue to print "templated (deferred — Layer 5, #168)" for `type: templated` entries.
+- **Propagation-lane verification not yet implemented for templated.** See § Propagation-lane verification — v1 limitation below. Templated propagation PRs route to normal Phase 4 review until `verify-propagation-pr.sh` learns to re-render + byte-verify.
 
 ## Sync integration — what's wired up
 

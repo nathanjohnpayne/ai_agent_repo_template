@@ -286,7 +286,17 @@ while IFS=$'\t' read -r path type consumers dest source; do
   # different path.
   if [ -n "$source" ] && [ "$source" != "$path" ]; then
     src_target="$REPO_ROOT/$source"
-    if [ ! -e "$src_target" ]; then
+    # Templated sources must be regular files (a directory can't be a
+    # template). Canonical/kit also accept the explicit source
+    # override for future flexibility; use `-f` (regular file) for
+    # templated and `-e` (any FS entry, since kit could point at a
+    # directory) for the others. CodeRabbit Major on PR #316.
+    if [ "$type" = "templated" ]; then
+      if [ ! -f "$src_target" ]; then
+        echo "FAIL: path '$path' source '$source' must be a regular file for templated entries"
+        FAILED=1
+      fi
+    elif [ ! -e "$src_target" ]; then
       echo "FAIL: path '$path' source '$source' does not exist on disk"
       FAILED=1
     fi
