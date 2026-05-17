@@ -583,10 +583,23 @@ export_consumer_facts() {
   done < <(MERGEPATH_CONSUMER_NAME="$consumer_name" yq -r '
     env(MERGEPATH_CONSUMER_NAME) as $cn
     | .consumers[] | select(.name == $cn) | .facts // {} | to_entries[]
-    | .key + "\t" + (
-        .value | if (tag == "!!seq") then join(" ") else tostring end
-      )
+    | .key + "\t"
+      + ((.value | select(tag == "!!seq") | join(" "))
+         // (.value | tostring))
   ' "$manifest")
+  # NOTE on the value-typed serialization: mikefarah/yq v4 does NOT
+  # accept `if (tag == "!!X") then ... else ... end` in this filter
+  # position (the lexer rejects `if` at column-after-pipe). The
+  # earlier draft of this query used that form, which silently
+  # produced empty output for every fact, which caused
+  # MERGEPATH_FACT_* to never get exported, which made every templated
+  # render fall through to the "no frameworks" baseline. swipewatch
+  # was the only consumer that didn't notice (its declared frameworks
+  # are []), so the swipewatch canary in Phase D fell-positive on
+  # the bug. The select+// fallback above is the documented
+  # mikefarah idiom for branching on a value's YAML tag.
+  #
+  # Regression-guarded by tests/test_export_consumer_facts.sh.
 }
 
 # Compare a kit directory: every file under Mergepath's path must

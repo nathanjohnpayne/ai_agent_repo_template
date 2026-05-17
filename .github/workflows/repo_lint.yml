@@ -200,6 +200,16 @@ jobs:
         # independently of integration.
         run: ./scripts/ci/check_template_substitution
 
+      - name: check_export_consumer_facts
+        # Exercises tests/test_export_consumer_facts.sh — regression-
+        # guards the yq filter inside scripts/sync-to-downstream.sh's
+        # export_consumer_facts() against the mikefarah-yq-incompatible
+        # `if (tag == "!!X") then ... else ... end` form that silently
+        # broke Phase D's first real-frameworks consumer (every
+        # templated render fell through to the "no frameworks"
+        # baseline because MERGEPATH_FACT_* was never exported).
+        run: ./scripts/ci/check_export_consumer_facts
+
       - name: check_coderabbit_config
         # Validates the template-level .coderabbit.yml stays on the
         # nit-suppressing profile (chill). Shares the yq install with
