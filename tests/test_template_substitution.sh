@@ -693,6 +693,78 @@ react-hooks/set-state-in-effect: off
 expect_output "12h react_compiler=true does NOT suppress disable block (v1 limitation)" "$r" "react-hooks/set-state-in-effect: off"
 
 # ---------------------------------------------------------------------------
+# 13. ESM/CJS template parity: render the real examples/eslint.config.{js,
+#     cjs.js} files against every meaningful facts combination. The render
+#     itself must succeed (parse-level marker balance is the load-bearing
+#     check) AND the ESM and CJS rendered bodies must match modulo the
+#     import/export shape. Without these guards, an edit that drifts the
+#     CJS template's `>>> if` / `<<<` structure away from the ESM (e.g.
+#     deletes the opener but leaves an orphan closer — observed during
+#     the #327 round-3 cleanup, caught only when sync-to-downstream.sh
+#     --sync-all hit ffb/swipewatch in prod) passes the existing fixture-
+#     based tests but breaks every templated propagation.
+# ---------------------------------------------------------------------------
+TEMPLATE_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ESM_TEMPLATE="$TEMPLATE_REPO_ROOT/examples/eslint.config.js"
+CJS_TEMPLATE="$TEMPLATE_REPO_ROOT/examples/eslint.config.cjs.js"
+
+# Quick parse-level guard: marker counts must match within each file AND
+# between the two files. This is the cheapest check that catches the
+# orphan-`<<<` bug class without needing a renderer.
+ESM_OPEN=$(grep -cE '^// >>> if' "$ESM_TEMPLATE")
+ESM_CLOSE=$(grep -cE '^// <<<' "$ESM_TEMPLATE")
+CJS_OPEN=$(grep -cE '^// >>> if' "$CJS_TEMPLATE")
+CJS_CLOSE=$(grep -cE '^// <<<' "$CJS_TEMPLATE")
+if [ "$ESM_OPEN" -ne "$ESM_CLOSE" ]; then
+  FAIL=$((FAIL + 1))
+  echo "FAIL: 13a ESM template has $ESM_OPEN open markers vs $ESM_CLOSE close markers" >&2
+elif [ "$CJS_OPEN" -ne "$CJS_CLOSE" ]; then
+  FAIL=$((FAIL + 1))
+  echo "FAIL: 13a CJS template has $CJS_OPEN open markers vs $CJS_CLOSE close markers" >&2
+elif [ "$ESM_OPEN" -ne "$CJS_OPEN" ]; then
+  FAIL=$((FAIL + 1))
+  echo "FAIL: 13a ESM/CJS templates drifted (ESM: $ESM_OPEN markers, CJS: $CJS_OPEN markers)" >&2
+else
+  echo "PASS: 13a ESM/CJS template markers balanced + matched ($ESM_OPEN open + $ESM_OPEN close in each)"
+  PASS=$((PASS + 1))
+fi
+
+# Render-level guard: run template_substitution::render on each template
+# under every load-bearing facts combination from the manifest. Render
+# success (rc=0) is the actual proof that the markers parse cleanly. We
+# don't byte-compare ESM vs CJS bodies here — the import/export shape
+# differs by design — but a render failure on either file is a regression
+# that would have caught the orphan-`<<<` bug.
+RENDER_CASES=(
+  "react"                    # ffb / dpr / matchline / swipewatch family
+  "react typescript"         # matchline
+  "typescript"               # nathanpaynedotcom (Astro+TS subset)
+  "astro typescript"         # nathanpaynedotcom full
+  ""                         # swipewatch + overridebroadway (no frameworks)
+)
+RENDER_FAIL=0
+for facts in "${RENDER_CASES[@]}"; do
+  for tpl in "$ESM_TEMPLATE" "$CJS_TEMPLATE"; do
+    (
+      reset_facts
+      export MERGEPATH_FACT_FRAMEWORKS="$facts"
+      # shellcheck disable=SC1090
+      source "$LIB"
+      template_substitution::render "$tpl" >/dev/null 2>&1
+    ) || {
+      RENDER_FAIL=1
+      echo "FAIL: 13b render failed for $(basename "$tpl") with frameworks='$facts'" >&2
+    }
+  done
+done
+if [ "$RENDER_FAIL" -eq 0 ]; then
+  echo "PASS: 13b ESM + CJS templates render cleanly under all ${#RENDER_CASES[@]} fact combos"
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
