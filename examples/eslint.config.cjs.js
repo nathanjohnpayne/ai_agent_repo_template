@@ -17,21 +17,64 @@
 // `facts._template_only_notes`):
 //
 // Rendered per consumer by scripts/lib/template-substitution.sh
-// (#313) using the consumer's `facts.frameworks` from
-// `.mergepath-sync.yml`. The CJS variant exists because ESM-syntax
-// `eslint.config.js` in a CJS package fails to load (Codex P1 on
-// PR #318 by chatgpt-codex-connector caught this gap). Module-
-// format partitioning lives in the manifest's consumers: lists
-// rather than a per-consumer fact, so the template-author only
-// edits one variant at a time and the rendered output is
-// trivially CommonJS for every entry in this template's consumers
-// list.
+// (#313) using the consumer's `facts.*` from `.mergepath-sync.yml`.
+// The CJS variant exists because ESM-syntax `eslint.config.js` in
+// a CJS package fails to load (Codex P1 on PR #318 by chatgpt-
+// codex-connector caught this gap). Module-format partitioning
+// lives in the manifest's consumers: lists rather than a per-
+// consumer fact, so the template-author only edits one variant at
+// a time and the rendered output is trivially CommonJS for every
+// entry in this template's consumers list.
 //
 // Per-consumer facts.frameworks vocabulary (closed set, same as
 // ESM variant):
 //   typescript  → enables typescript-eslint baseline + TS parsing
+//                 (also tightens TS no-unused-vars to ^_-prefix and
+//                 demotes no-explicit-any to warn — see #322)
 //   astro       → enables eslint-plugin-astro
-//   react       → enables eslint-plugin-react + react-hooks
+//   react       → enables eslint-plugin-react + react-hooks. The
+//                 React file glob is `**/*.{jsx,tsx}` by default;
+//                 set `facts.jsx_in_js: true` to add a SECOND React
+//                 rule entry whose glob extends to `.js` (for repos
+//                 that babel-/vite-transpile JSX inside `.js`, e.g.,
+//                 device-platform-reporting, friends-and-family-
+//                 billing). Both entries render together; eslint
+//                 flat-config merges rules across overlapping globs.
+//
+// Per-consumer facts.testing vocabulary (default unset / "none"):
+//   vitest      → enables a vitest globals block on common test
+//                 file patterns (describe/it/test/expect/vi/...)
+//   jest        → same shape but with `jest` global instead of `vi`
+//   (anything else, including "mocha" / "node" / unset) renders
+//                 no testing globals block. Future expansion: add
+//                 mocha / node-test forms as consumers adopt them.
+//
+// Per-consumer facts.jsx_in_js (default unset / false):
+//   When true, an ADDITIONAL React rule entry is rendered whose
+//   files glob includes `.js`. Only meaningful for consumers that
+//   also declare `frameworks: [react]`; setting it on a non-React
+//   consumer renders the React rule block without the React imports
+//   (broken eslint config), so don't do that. v1 templating doesn't
+//   support compound expressions (e.g., `frameworks contains react
+//   && jsx_in_js`), which is why the gate is jsx_in_js alone — the
+//   constraint lives in the manifest review, not the template.
+//
+// Per-consumer facts.react_compiler vocabulary (default unset / false):
+//   unset/false → React Compiler advisory rules
+//                 (react-hooks/set-state-in-effect,
+//                 preserve-manual-memoization, refs, immutability)
+//                 are disabled, because they only fire usefully
+//                 once the codebase has adopted the React
+//                 Compiler. Until then they're noise on idiomatic
+//                 React (set-state in effect for init, ref-during-
+//                 render in TipTap-style editors).
+//   true        → leave the recommended advisories enabled.
+//   Same v1-templating constraint as jsx_in_js: gate is on the fact
+//   alone, not compound with `frameworks contains react`. The
+//   disable block references react-hooks/* keys which ESLint
+//   silently ignores when the plugin isn't loaded, so the no-op
+//   cost on a non-React consumer is the four disabled-rule entries
+//   in the rendered config, not a failed load.
 //
 // A consumer with no frameworks (e.g., swipewatch — pure Node +
 // vitest) gets the JS baseline only. Multiple frameworks stack in
@@ -59,6 +102,10 @@ module.exports = [
   // Ignore generated / vendored output. Customize per-consumer via
   // a follow-up commit on the propagation PR if a repo needs extras
   // (e.g., functions/lib for cloud-functions repos).
+  //
+  // `.claude/worktrees/**` is the per-agent worktree root that
+  // Claude Code creates for parallel sub-tasks; linting the working
+  // copies inside it is duplicative and noisy on every agent run.
   {
     ignores: [
       "node_modules/**",
@@ -68,11 +115,32 @@ module.exports = [
       ".astro/**",
       ".next/**",
       ".vercel/**",
+      ".claude/worktrees/**",
     ],
   },
 
   // Baseline JS recommended — required by the Mergepath policy floor.
   js.configs.recommended,
+
+  // Baseline rule policy applied to all JS sources. `^_`-prefix
+  // unused-vars is the standard convention for marking intentionally-
+  // unused locals (args, vars, caught errors, destructured-array
+  // leftovers); the `allowEmptyCatch` setting permits the
+  // `catch (_) {}` swallow idiom that appears in legacy code.
+  // Both relaxations were added by hand by 5 of 6 consumers during
+  // the Phase D fanout (#250) — folding them into the baseline
+  // removes the per-consumer churn.
+  {
+    rules: {
+      "no-unused-vars": ["error", {
+        argsIgnorePattern: "^_",
+        varsIgnorePattern: "^_",
+        caughtErrorsIgnorePattern: "^_",
+        destructuredArrayIgnorePattern: "^_",
+      }],
+      "no-empty": ["error", { allowEmptyCatch: true }],
+    },
+  },
 
   // Apply browser + node globals to all JS sources by default. Narrow
   // these per-file-pattern in a follow-up commit if the repo has a
@@ -114,14 +182,38 @@ module.exports = [
   ...tseslint.configs.recommended,
 // <<<
 
+// >>> if frameworks contains typescript
+  // Tighten the TS-specific unused-vars rule to match the JS baseline
+  // `^_`-prefix convention, and demote `no-explicit-any` to warn —
+  // legitimate `any` usage shows up in Playwright cross-frame DOM
+  // bridges, Firestore type-erasure, and WIP design-direction code;
+  // an error blocks CI on signals the team has already considered.
+  // Both demotions were hand-added by every TS consumer during the
+  // Phase D fanout (#250); folding into the template removes the
+  // per-consumer churn.
+  {
+    files: ["**/*.{ts,tsx}"],
+    rules: {
+      "@typescript-eslint/no-unused-vars": ["error", {
+        argsIgnorePattern: "^_",
+        varsIgnorePattern: "^_",
+        caughtErrorsIgnorePattern: "^_",
+        destructuredArrayIgnorePattern: "^_",
+      }],
+      "@typescript-eslint/no-explicit-any": "warn",
+    },
+  },
+// <<<
+
 // >>> if frameworks contains astro
   // Astro flat-config recommended ruleset — applied to .astro files.
   // The plugin exposes its flat-config preset under the bracketed
   // `configs['flat/recommended']` key (NOT the legacy
-  // `configs.recommended` which is the eslintrc-shape config). Same
-  // key for ESM and CJS — the plugin's export shape is module-
-  // system-agnostic. Codex P2 round 2 on PR #318 caught this gap
-  // for the CJS variant; ESM variant fixed in parallel for symmetry.
+  // `configs.recommended` which is the eslintrc-shape config).
+  // Same key for ESM and CJS — the plugin's export shape is
+  // module-system-agnostic. Codex P2 round 2 on PR #318 caught this
+  // gap for the CJS variant; ESM variant fixed in parallel for
+  // symmetry.
   ...astro.configs['flat/recommended'],
 // <<<
 
@@ -148,6 +240,110 @@ module.exports = [
     },
     settings: {
       react: { version: "detect" },
+    },
+  },
+// <<<
+
+// >>> if jsx_in_js
+  // jsx_in_js variant — an ADDITIONAL React rule entry whose files
+  // glob includes `.js` so repos that babel-/vite-transpile JSX in
+  // plain `.js` files (e.g., device-platform-reporting, friends-and-
+  // family-billing) lint those files under the React rule set.
+  // Renders alongside the default `**/*.{jsx,tsx}` block above for
+  // React consumers that opt in; eslint flat-config merges rules
+  // across overlapping globs so the .js files inherit the React
+  // rules via this second entry. Setting jsx_in_js: true on a
+  // non-React consumer is a manifest misconfiguration — this block
+  // would reference undeclared `react`/`reactHooks` and the
+  // rendered config would fail to load.
+  {
+    files: ["**/*.{js,jsx,tsx}"],
+    plugins: {
+      react,
+      "react-hooks": reactHooks,
+    },
+    languageOptions: {
+      parserOptions: {
+        ecmaFeatures: { jsx: true },
+      },
+    },
+    rules: {
+      ...react.configs.recommended.rules,
+      ...reactHooks.configs.recommended.rules,
+      "react/react-in-jsx-scope": "off",
+    },
+    settings: {
+      react: { version: "detect" },
+    },
+  },
+// <<<
+
+// >>> if !react_compiler
+  // React Compiler advisories — these rules ship in
+  // eslint-plugin-react-hooks but are only meaningful once the
+  // React Compiler is adopted. Until then, disable them to silence
+  // noise on idiomatic React (set-state-in-effect for init,
+  // ref-during-render in TipTap-style editors). Flip
+  // `facts.react_compiler: true` to suppress this block.
+  //
+  // Gated on `!react_compiler` alone (NOT also on `frameworks
+  // contains react` — v1 templating can't combine expressions).
+  // For non-React consumers the block still renders, but the
+  // react-hooks/* rule keys reference a plugin that ESLint hasn't
+  // loaded; ESLint silently ignores unknown rule keys, so the
+  // no-op cost is the four disabled-rule entries in the rendered
+  // config, not a failed load.
+  {
+    rules: {
+      "react-hooks/set-state-in-effect": "off",
+      "react-hooks/preserve-manual-memoization": "off",
+      "react-hooks/refs": "off",
+      "react-hooks/immutability": "off",
+    },
+  },
+// <<<
+
+// >>> if testing contains vitest
+  // Vitest globals — applied to common test file patterns. Without
+  // this block, `describe`/`it`/`expect`/`vi`/etc. trigger no-undef
+  // in every test file. Pattern covers __tests__ dirs and *.test.*
+  // files; broaden per-consumer if test helpers live elsewhere.
+  {
+    files: ["tests/**", "**/__tests__/**", "**/*.test.{js,jsx,mjs,ts,tsx}"],
+    languageOptions: {
+      globals: {
+        describe: "readonly",
+        it: "readonly",
+        test: "readonly",
+        expect: "readonly",
+        beforeEach: "readonly",
+        afterEach: "readonly",
+        beforeAll: "readonly",
+        afterAll: "readonly",
+        vi: "readonly",
+      },
+    },
+  },
+// <<<
+
+// >>> if testing contains jest
+  // Jest globals — applied to common test file patterns. Without
+  // this block, `describe`/`it`/`expect`/`jest`/etc. trigger
+  // no-undef in every test file.
+  {
+    files: ["tests/**", "**/__tests__/**", "**/*.test.{js,jsx,mjs,ts,tsx}"],
+    languageOptions: {
+      globals: {
+        describe: "readonly",
+        it: "readonly",
+        test: "readonly",
+        expect: "readonly",
+        beforeEach: "readonly",
+        afterEach: "readonly",
+        beforeAll: "readonly",
+        afterAll: "readonly",
+        jest: "readonly",
+      },
     },
   },
 // <<<

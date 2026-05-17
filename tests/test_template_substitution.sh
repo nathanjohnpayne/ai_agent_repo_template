@@ -608,6 +608,106 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 12. Fact-driven defaults added in mergepath#322 — testing globals,
+#     jsx_in_js React glob extension, react_compiler advisory disables.
+#
+# These mirror the per-fact toggles that the ESLint template (post-#322)
+# uses. Each case exercises one fact in isolation against a minimal
+# template snippet so a regression in the lib's evaluator is caught
+# by a tightly-scoped failure rather than a full-template byte diff.
+# ---------------------------------------------------------------------------
+
+# 12a: testing == vitest renders vitest block, jest block does not.
+r=$(render_case "// >>> if testing contains vitest
+vitest globals
+// <<<
+// >>> if testing contains jest
+jest globals
+// <<<
+" "MERGEPATH_FACT_TESTING=vitest")
+expect_output "12a testing=vitest renders only vitest block" "$r" "vitest globals"
+
+# 12b: testing == jest renders jest block, vitest block does not.
+r=$(render_case "// >>> if testing contains vitest
+vitest globals
+// <<<
+// >>> if testing contains jest
+jest globals
+// <<<
+" "MERGEPATH_FACT_TESTING=jest")
+expect_output "12b testing=jest renders only jest block" "$r" "jest globals"
+
+# 12c: testing unset → neither block renders.
+r=$(render_case "// >>> if testing contains vitest
+vitest globals
+// <<<
+// >>> if testing contains jest
+jest globals
+// <<<
+")
+expect_output "12c testing unset → no testing block" "$r" ""
+
+# 12d: jsx_in_js: true (truthy) → js-included files glob renders.
+r=$(render_case "// >>> if jsx_in_js
+files: js+jsx+tsx
+// <<<
+" "MERGEPATH_FACT_JSX_IN_JS=true")
+expect_output "12d jsx_in_js=true → jsx-in-js block renders" "$r" "files: js+jsx+tsx"
+
+# 12e: jsx_in_js unset → block does NOT render (default behavior).
+r=$(render_case "// >>> if jsx_in_js
+files: js+jsx+tsx
+// <<<
+")
+expect_output "12e jsx_in_js unset → jsx-in-js block omitted" "$r" ""
+
+# 12f: !react_compiler when unset → disable block renders (default).
+# This is the load-bearing case: the React Compiler advisory disables
+# must fire by DEFAULT (when the fact is unset) so consumers that
+# haven't adopted the Compiler don't get noisy lint failures.
+r=$(render_case "// >>> if !react_compiler
+react-hooks/set-state-in-effect: off
+// <<<
+")
+expect_output "12f !react_compiler when unset → disable block renders (default)" "$r" "react-hooks/set-state-in-effect: off"
+
+# 12g: !react_compiler when true → disable block does NOT render.
+r=$(render_case "// >>> if !react_compiler
+react-hooks/set-state-in-effect: off
+// <<<
+" "MERGEPATH_FACT_REACT_COMPILER=true")
+expect_output "12g react_compiler=true → disable block omitted" "$r" ""
+
+# 12h: explicit regression for the `!<key>` operator.
+# Drives eval_expr directly across the three states a boolean-style
+# fact can take: unset, empty string, truthy value. The negation
+# operator MUST treat unset and empty as the same truthy condition
+# (so a manifest entry of `react_compiler: ""` reads the same as no
+# fact at all) — a regression here would silently flip every
+# !react_compiler block's gating.
+(
+  reset_facts
+  # shellcheck disable=SC1090
+  source "$LIB"
+  set +e
+  # Unset: !react_compiler should be TRUE (rc 0).
+  template_substitution::eval_expr "!react_compiler"; r1=$?
+  # Empty: !react_compiler should be TRUE (rc 0).
+  export MERGEPATH_FACT_REACT_COMPILER=""
+  template_substitution::eval_expr "!react_compiler"; r2=$?
+  # Truthy: !react_compiler should be FALSE (rc 1).
+  export MERGEPATH_FACT_REACT_COMPILER="true"
+  template_substitution::eval_expr "!react_compiler"; r3=$?
+  set -e
+  if [ "$r1" = "0" ] && [ "$r2" = "0" ] && [ "$r3" = "1" ]; then
+    echo "PASS: 12h !react_compiler operator (unset=true, empty=true, truthy=false)"
+  else
+    echo "FAIL: 12h !react_compiler operator: got $r1/$r2/$r3 (expected 0/0/1)" >&2
+    exit 1
+  fi
+) && PASS=$((PASS + 1)) || FAIL=$((FAIL + 1))
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

@@ -39,7 +39,11 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
-# Fixture manifest with four consumers exercising the value-type matrix.
+# Fixture manifest with consumers exercising the value-type matrix.
+# `with_322_facts` covers the mergepath#322 facts vocabulary (testing
+# scalar, jsx_in_js bool, react_compiler bool) to regression-guard
+# the export pipeline against the bool-as-string serialization that
+# the lib's `<key> == true` / `!<key>` expressions depend on.
 cat > "$WORKDIR/manifest.yml" <<'EOF'
 version: 1
 consumers:
@@ -62,6 +66,14 @@ consumers:
   - name: with_no_facts
     repo: example-org/with-no-facts
     visibility: public
+  - name: with_322_facts
+    repo: example-org/with-322-facts
+    visibility: public
+    facts:
+      frameworks: [react]
+      testing: vitest
+      jsx_in_js: true
+      react_compiler: false
 paths: []
 EOF
 
@@ -134,6 +146,25 @@ if ! grep -qF 'if (tag == "!!seq") then' "$SCRIPT"; then
   pass "Case 6: lib script does not contain the broken yq if/then/else form"
 else
   fail "Case 6: lib script contains the broken 'if (tag == \"!!seq\") then ... else ... end' form — mikefarah/yq rejects this at the lexer"
+fi
+
+# Case 7 (mergepath#322): mixed seq + scalar + bool facts serialize
+# correctly. The template lib's expressions for the #322 facts read:
+#   `>>> if testing contains vitest`     → needs "vitest" string
+#   `>>> if jsx_in_js`                   → needs non-empty value (e.g. "true")
+#   `>>> if !react_compiler`             → needs treat-"false"-as-set
+#     (which is what `_fact_value` does — set-but-empty is rare; set
+#     to "false" is a non-empty value so `!react_compiler` evaluates
+#     FALSE, suppressing the disable block as desired).
+# The yq filter MUST emit one tab-separated row per fact, with bool
+# values rendered as the strings "true" / "false" (not YAML-literal
+# variants). Locks in the bool-serialization shape this depends on.
+out=$(run_filter with_322_facts)
+expected="$(printf 'frameworks\treact\ntesting\tvitest\njsx_in_js\ttrue\nreact_compiler\tfalse')"
+if [ "$out" = "$expected" ]; then
+  pass "Case 7 (#322): seq + scalar + bool facts serialize as expected (booleans → 'true'/'false' strings)"
+else
+  fail "Case 7 (#322): expected:\n$expected\ngot:\n$out"
 fi
 
 echo
