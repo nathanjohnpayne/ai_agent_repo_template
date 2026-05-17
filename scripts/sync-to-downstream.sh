@@ -555,52 +555,17 @@ materialize_templated_targets() {
   done
 }
 
-# Export a consumer's facts:* from the manifest as MERGEPATH_FACT_*
-# env vars in the current (sub)shell. Unsets any prior
-# MERGEPATH_FACT_* exports first so successive callers don't see
-# stale facts from a different consumer. List-valued facts (yaml
-# `[a, b]`) are serialized as space-separated, matching the lib's
-# `<key> contains <value>` expectations.
+# export_consumer_facts lives in scripts/lib/manifest-fact-helpers.sh
+# so both this script AND scripts/workflow/verify-propagation-pr.sh
+# can load consumer facts from a manifest without duplicating the yq
+# filter. The lib has no top-level side effects (function defs only),
+# so sourcing it is cheap and safe.
 #
-# Uses the `env(VAR)` mikefarah/yq form for consumer-name injection
-# (the `--arg` jq-compat flag works too but env-var is the
-# documented mikefarah idiom).
-export_consumer_facts() {
-  local consumer_name=$1
-  local manifest=$2
-
-  # Clean slate — prior consumer's facts must not leak in.
-  local var
-  for var in $(env | awk -F= '/^MERGEPATH_FACT_/ {print $1}'); do
-    unset "$var"
-  done
-
-  while IFS=$'\t' read -r key value; do
-    [ -z "$key" ] && continue
-    local upper
-    upper=$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
-    export "MERGEPATH_FACT_$upper=$value"
-  done < <(MERGEPATH_CONSUMER_NAME="$consumer_name" yq -r '
-    env(MERGEPATH_CONSUMER_NAME) as $cn
-    | .consumers[] | select(.name == $cn) | .facts // {} | to_entries[]
-    | .key + "\t"
-      + ((.value | select(tag == "!!seq") | join(" "))
-         // (.value | tostring))
-  ' "$manifest")
-  # NOTE on the value-typed serialization: mikefarah/yq v4 does NOT
-  # accept `if (tag == "!!X") then ... else ... end` in this filter
-  # position (the lexer rejects `if` at column-after-pipe). The
-  # earlier draft of this query used that form, which silently
-  # produced empty output for every fact, which caused
-  # MERGEPATH_FACT_* to never get exported, which made every templated
-  # render fall through to the "no frameworks" baseline. swipewatch
-  # was the only consumer that didn't notice (its declared frameworks
-  # are []), so the swipewatch canary in Phase D fell-positive on
-  # the bug. The select+// fallback above is the documented
-  # mikefarah idiom for branching on a value's YAML tag.
-  #
-  # Regression-guarded by tests/test_export_consumer_facts.sh.
-}
+# Regression-guarded by tests/test_export_consumer_facts.sh, which
+# greps the documented mikefarah-idiom yq filter directly out of
+# the lib file (the test was updated alongside #323).
+# shellcheck disable=SC1091
+source "$MERGEPATH_ROOT/scripts/lib/manifest-fact-helpers.sh"
 
 # Compare a kit directory: every file under Mergepath's path must
 # exist (byte-identical) in the consumer; consumer-only files are

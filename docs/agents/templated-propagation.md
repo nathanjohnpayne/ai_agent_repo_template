@@ -1,6 +1,6 @@
 # Templated propagation — Layer 5 substitution lib
 
-Status: **lib + sync/audit integration landed.** Propagation-lane verification of templated PRs is deferred to a follow-up (templated PRs go through normal Phase 4 review in v1).
+Status: **lib + sync/audit integration + propagation-lane verification landed.** Templated propagation PRs are now lane-eligible alongside canonical/kit — the verifier re-renders against `mergepath@<sha>` with the consumer's facts and byte-compares against the PR's dest.
 
 This doc covers `scripts/lib/template-substitution.sh` — the rendering engine that activates `type: templated` entries in `.mergepath-sync.yml` — plus the sync integration that wires it into `scripts/sync-to-downstream.sh` for both audit and materialize.
 
@@ -118,7 +118,7 @@ Real templates will accumulate optional-fact references over time (`{{node_versi
 
 - **No live templated entry in the manifest yet.** The lib + sync integration are wired (audit, materialize for per-commit + sync-all), but `.mergepath-sync.yml` has zero entries of `type: templated` today. Phase C adds the first one (`examples/eslint.config.js` → `eslint.config.js`) to unblock the [mergepath#250](https://github.com/nathanjohnpayne/mergepath/issues/250) ESLint rollout.
 - **The lib doesn't know about consumer name or repo.** Facts must be uniform across consumers (e.g., `frameworks`, `node_version`); per-consumer name substitution (`mergepath` → `<consumer>`) still goes through `scripts/bootstrap/substitute.sh`'s allow-list-driven path. Long-term, both should share a single substitution lib (per [#168 Layer 5's original sketch](https://github.com/nathanjohnpayne/mergepath/issues/168) — "factor the substitution logic into `scripts/lib/template-substitution.sh` so bootstrap and sync share the lib"), but that consolidation is non-trivial because the two callers have different semantics (literal name allow-list vs. fact-driven substitution). Tracked as future work.
-- **Propagation-lane verification not yet implemented for templated.** See § Propagation-lane verification — v1 limitation below. Templated propagation PRs route to normal Phase 4 review until `verify-propagation-pr.sh` learns to re-render + byte-verify.
+- **Per-consumer name substitution still goes through `scripts/bootstrap/substitute.sh`.** The templating lib is fact-driven (`MERGEPATH_FACT_*`); consumer-name substitution at bootstrap time still goes through the allow-list-driven bootstrap path. Long-term consolidation tracked in [#168 Layer 5](https://github.com/nathanjohnpayne/mergepath/issues/168).
 
 ## Sync integration — what's wired up
 
@@ -155,17 +155,40 @@ paths:
 
 A render for matchline exports `MERGEPATH_FACT_FRAMEWORKS="react typescript"` and `MERGEPATH_FACT_NODE_VERSION=20`, then runs the lib against `examples/eslint.config.js`. The output lands at `eslint.config.js` in the consumer's PR branch.
 
-## Propagation-lane verification — v1 limitation
+## Propagation-lane verification
 
-The `propagation_prs` review-lane exemption in `.github/review-policy.yml` (#264) currently does NOT cover templated entries: `scripts/workflow/verify-propagation-pr.sh` and its `parse_manifest_paths.sh` helper emit only mergepath-side `.path` values, so a PR touching a templated `dest` (which doesn't equal `.path`) reads as "off propagation surface" and the lane gate denies exemption — the PR routes to normal Phase 4 review.
+The `propagation_prs` review-lane exemption in `.github/review-policy.yml` (#264) covers templated entries via a re-render + byte-verify path that lives alongside the canonical/kit byte-compare ([#323](https://github.com/nathanjohnpayne/mergepath/issues/323)).
 
-This is the **intentional v1 behavior**: templated rendering is new infrastructure, and an external review per templated propagation PR is appropriate while we build confidence. A follow-up PR will extend `verify-propagation-pr.sh` to re-render the source against `mergepath@<sha>` with the consumer's facts and byte-verify the PR content, at which point templated PRs become lane-eligible.
+How it works:
 
-Until then, expect templated propagation PRs to carry `needs-external-review`; they're not stuck — Phase 4a (Codex) or 4b (CLI handoff) will clear the gate normally.
+1. `scripts/workflow/verify-propagation-pr.sh` parses templated entries from the trusted mergepath checkout's manifest.
+2. For each templated entry whose `dest` appears in the PR's diff AND whose consumer matches this PR's repo, the verifier:
+   - resolves the consumer via `$MERGEPATH_CONSUMER` (test/CI escape hatch) OR the consumer dir's `origin` remote URL matched against `.consumers[].repo`,
+   - sources `scripts/lib/manifest-fact-helpers.sh` from the trusted mergepath checkout and calls `export_consumer_facts <consumer> <manifest>` to populate `MERGEPATH_FACT_*`,
+   - sources `scripts/lib/template-substitution.sh` from the trusted mergepath checkout and calls `template_substitution::render <source>` to produce the expected output,
+   - `git show ${HEAD_SHA}:${dest}` to pull the PR's dest content, and byte-compares with `diff -q`.
+3. On match, the verified `dest` is added to a `VERIFIED_TEMPLATED_DESTS` list so the canonical-loop path-confinement check below it skips that file (templated `dest` doesn't equal any `.path`, so without this exemption the canonical check would false-fail it).
+4. On match, a structured stdout line is emitted for the calling workflow to post as a thread tag-reply:
+
+   ```text
+   [mergepath-verify: templated-render] <dest> <consumer> <source>
+   ```
+
+5. Failures fall into three typed buckets in the verifier's stderr summary:
+   - **Canonical / kit drift** — pre-existing canonical surface.
+   - **Templated re-render mismatch** — rendered output differs from PR dest content.
+   - **Templated re-render error** — malformed template, missing source at mergepath@<sha>, or strict-mode unset fact.
+
+Consumer-inference fallback: if neither `$MERGEPATH_CONSUMER` is set nor the `origin` remote matches a `.consumers[].repo` field, the templated arm is skipped with a stderr note. The canonical/kit arm still runs, and the templated dest will then fail the path-confinement check, routing the PR to normal Phase 4 review (pre-#323 status quo).
+
+Wire-up:
+
+- CI gate: `scripts/ci/check_workflow_verify_propagation_templated` (test: `tests/test_verify_propagation_pr_templated.sh`) covers the four cases — pass, drift, template syntax error, strict-mode unset fact. Wired into `.github/workflows/repo_lint.yml` alongside `check_verify_propagation_pr`.
+- Rollup attribution: the `templated-render` tag class lives in `scripts/lib/daily-feedback-rollup-helpers.sh` (mapped to `skip` in `tag_class_action`, same routing as `canonical-coverage`) and `scripts/resolve-pr-threads.sh`'s `derive_tag_class` ladder (slotted at rung 1b, right after `canonical-coverage`). Findings on a templated dest are structurally a mergepath concern — fixes belong in the template or in the consumer's `facts:` block — so they route to mergepath rather than surfacing per-consumer.
 
 ## What's queued next
 
 1. **Phase C** — restructure `examples/eslint.config.js` into a conditional-block template, add `facts.frameworks` to all 8 consumer entries, add the manifest entry for `eslint.config.js`.
 2. **Phase D** — canary propagation to swipewatch (smallest JS surface), then fanout to the remaining 5 consumers. Each consumer's PR carries the rendered config + a devDeps install + findings triage per its consumer-side issue.
 3. **Phase E** — close the 6 consumer issues and the [mergepath#250](https://github.com/nathanjohnpayne/mergepath/issues/250) parent tracker; file a retrospective on Layer 5 cost vs. payoff for future "should we templated-ize X?" judgment calls.
-4. **Lane-eligibility for templated** — extend `verify-propagation-pr.sh` to re-render-and-verify templated entries. Order vs. Phase D is flexible; v1 doesn't block on it.
+4. ~~**Lane-eligibility for templated** — extend `verify-propagation-pr.sh` to re-render-and-verify templated entries.~~ **Landed in [#323](https://github.com/nathanjohnpayne/mergepath/issues/323)** — see § Propagation-lane verification above.

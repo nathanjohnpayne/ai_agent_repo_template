@@ -131,6 +131,16 @@ jobs:
       - name: check_verify_propagation_pr
         run: ./scripts/ci/check_verify_propagation_pr
 
+      # check_workflow_verify_propagation_templated exercises the
+      # templated-surface arm of verify-propagation-pr.sh (#323) —
+      # the re-render + byte-verify path that closes the propagation
+      # lane gate for type:templated entries. Same lane-eligibility
+      # security teeth as check_verify_propagation_pr above; runs
+      # alongside it so a regression in either surface lights up CI
+      # independently.
+      - name: check_workflow_verify_propagation_templated
+        run: ./scripts/ci/check_workflow_verify_propagation_templated
+
       - name: check_phase_4b_classifier
         run: ./scripts/ci/check_phase_4b_classifier
 

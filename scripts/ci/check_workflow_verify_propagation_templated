@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# scripts/ci/check_workflow_verify_propagation_templated — CI entry
+# point for the templated-surface arm of the propagation-PR review
+# lane's faithful-mirror verifier (#323).
+#
+# Wraps tests/test_verify_propagation_pr_templated.sh so the repo_lint
+# workflow's enumerated check_* list picks it up. The templated-surface
+# arm of scripts/workflow/verify-propagation-pr.sh closes the
+# propagation-lane gate for type:templated entries (previously routed
+# to normal Phase 4 review per the v1 limitation in
+# docs/agents/templated-propagation.md § Propagation-lane verification).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_verify_propagation_pr_templated.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  # Missing test script is a hard error, not a skip — silent-skip
+  # would let an accidental delete/rename disable this check
+  # without surfacing in CI.
+  echo "check_workflow_verify_propagation_templated: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"

@@ -634,6 +634,146 @@ path_matches_manifest() {
   return 1
 }
 
+# fetch_manifest_templated_dests — extract dest + eligible consumer
+# slugs for every templated entry in the manifest (#323). Templated
+# entries decouple source from dest (the whole point), so a thread
+# anchored on a templated dest path doesn't match path_matches_manifest
+# above (which reads only .path). Cached.
+#
+# Cache format: one line per entry, `dest<TAB>repo1,repo2,...` where
+# each repoN is the full owner/name slug looked up from
+# `.consumers[].repo` via the entry's `.consumers[] (name)` list. The
+# repo-slug scoping closes the codex P2 from PR #329 round 1: without
+# it, ANY repo whose local file matched the dest path got the
+# `templated-render` class, even repos not opted into that entry —
+# suppressing substantive unresolved feedback on unrelated files in
+# the daily rollup.
+MANIFEST_TEMPLATED_DESTS_CACHE=""
+MANIFEST_TEMPLATED_FETCHED=false
+fetch_manifest_templated_dests() {
+  $MANIFEST_TEMPLATED_FETCHED && return 0
+  MANIFEST_TEMPLATED_FETCHED=true
+  local manifest="$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
+  [ -f "$manifest" ] || return 0
+  if command -v yq >/dev/null 2>&1; then
+    # Resolve each entry's consumer-name list to repo slugs in one
+    # pass. `. as $root` exposes the top-level consumers table for
+    # the inner lookup. Output: `dest<TAB>repo,repo,...`. The yq
+    # `\t` is a literal tab in the format string.
+    MANIFEST_TEMPLATED_DESTS_CACHE=$(yq -r '
+      . as $root |
+      .paths[] | select(.type == "templated") |
+      [
+        (.dest // .path),
+        (.consumers // [] |
+          map(. as $name |
+            $root.consumers[] | select(.name == $name) | .repo) |
+          join(","))
+      ] | @tsv
+    ' "$manifest" 2>/dev/null || true)
+  else
+    # awk fallback — mirrors the canonical-paths fallback above. Pair
+    # `type:` and `dest:` (or fall back to `path:`) within a `paths:`
+    # block entry. Less precise than yq in two ways, both addressed
+    # below per CR Major #329 round 2:
+    #
+    # 1. Order-independent emission. The prior version emitted on the
+    #    `type: templated` line, which broke when `dest:` appeared
+    #    AFTER `type:` (legal YAML, common in manifest practice). Now
+    #    we emit at entry boundaries (start of next entry / end of
+    #    paths block / EOF) so `dest:` and `type:` can appear in any
+    #    order within an entry.
+    #
+    # 2. Strict no-match instead of loose-match. The prior version
+    #    emitted the dest with an empty consumers field, which
+    #    path_matches_templated_dest interpreted as "match any repo"
+    #    — reintroducing the exact cross-repo misclassification this
+    #    fix is trying to close. Now the awk path emits a sentinel
+    #    `__AWK_NO_CONSUMER_SCOPE__` token in the consumers field,
+    #    which path_matches_templated_dest treats as "no match" (the
+    #    cautious failure mode: under-classify rather than over-
+    #    classify; templated-render is a skip-class, and a missed
+    #    skip just falls back to the rollup's general heuristics).
+    MANIFEST_TEMPLATED_DESTS_CACHE=$(awk '
+      function emit() {
+        if (cur_type == "templated") {
+          out = (cur_dest != "" ? cur_dest : cur_path)
+          if (out != "") {
+            printf "%s\t__AWK_NO_CONSUMER_SCOPE__\n", out
+          }
+        }
+      }
+      /^paths:/ { in_p = 1; next }
+      in_p && /^[^[:space:]#]/ { emit(); in_p = 0 }
+      !in_p { next }
+      /^[[:space:]]*-[[:space:]]*path:/ {
+        emit()
+        cur_path = $0
+        sub(/^[[:space:]]*-[[:space:]]*path:[[:space:]]*/, "", cur_path)
+        sub(/[[:space:]]*#.*$/, "", cur_path)
+        gsub(/^[[:space:]]+|[[:space:]]+$|^"|"$/, "", cur_path)
+        cur_dest = ""; cur_type = ""
+      }
+      /^[[:space:]]*dest:/ {
+        cur_dest = $0
+        sub(/^[[:space:]]*dest:[[:space:]]*/, "", cur_dest)
+        sub(/[[:space:]]*#.*$/, "", cur_dest)
+        gsub(/^[[:space:]]+|[[:space:]]+$|^"|"$/, "", cur_dest)
+      }
+      /^[[:space:]]*type:[[:space:]]*templated/ {
+        cur_type = "templated"
+      }
+      END { emit() }
+    ' "$manifest")
+  fi
+}
+
+# path_matches_templated_dest <file-path> → exit 0 if it matches a
+# templated entry's dest path AND the current repo ($REPO) is in that
+# entry's consumers list, 1 otherwise. Used by derive_tag_class to
+# emit the `templated-render` class (#323). The consumer-scope check
+# closes codex P2 from PR #329 round 1.
+path_matches_templated_dest() {
+  local file_path="$1"
+  [ -z "$file_path" ] && return 1
+  [ "$file_path" = "(no path)" ] && return 1
+  fetch_manifest_templated_dests
+  [ -z "$MANIFEST_TEMPLATED_DESTS_CACHE" ] && return 1
+  local line dest consumers
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    # Split on the first tab. Two-field TSV: dest<TAB>repo1,repo2,...
+    dest="${line%%$'\t'*}"
+    consumers="${line#*$'\t'}"
+    [ "$file_path" = "$dest" ] || continue
+    # The awk fallback emits this sentinel when it can't resolve
+    # consumer-name → repo-slug (cross-references in awk are
+    # brittle). Treat sentinel as "no scope information available"
+    # and DO NOT match — better to miss the templated-render skip
+    # tag (falling through to other heuristics in the rollup) than
+    # to over-classify and silently suppress substantive feedback
+    # on unrelated files. (CR Major #329 round 2.)
+    if [ "$consumers" = "__AWK_NO_CONSUMER_SCOPE__" ]; then
+      continue
+    fi
+    # Empty consumers field — yq returned no consumer matches for
+    # this entry (entry has no `consumers:` list, or none of the
+    # named consumers resolve to a repo). Treat as no-scope
+    # information, same as the awk sentinel: don't match.
+    if [ -z "$consumers" ]; then
+      continue
+    fi
+    # The current repo ($REPO, populated from --repo arg or origin
+    # remote at module-load) MUST appear in the comma-separated
+    # consumers list. Anchored grep avoids partial-name false hits
+    # (e.g., `owner/matchline` vs `owner/matchline-app`).
+    if printf ',%s,' "$consumers" | grep -qF ",$REPO,"; then
+      return 0
+    fi
+  done <<< "$MANIFEST_TEMPLATED_DESTS_CACHE"
+  return 1
+}
+
 # Module-load-time: pin the manifest base. We resolve REPO_ROOT_FOR_MANIFEST
 # from the script's on-disk location, NOT $REPO (which is the gh repo
 # slug). This intentionally reads the LOCAL working-tree manifest —
@@ -648,6 +788,15 @@ REPO_ROOT_FOR_MANIFEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Decision ladder (highest-confidence first; matches the
 # spec § Class taxonomy from issue #305):
 #   1. canonical-coverage     anchored path is in the manifest
+#   1b. templated-render      anchored path is a templated dest
+#                             (#323) — same "mergepath concern" class
+#                             as canonical-coverage but on the
+#                             templated surface; emitted only when the
+#                             path is NOT also matched by 1 (the dests
+#                             never appear as .path entries by
+#                             construction — source ≠ dest is the
+#                             point — so the two branches don't
+#                             overlap in practice).
 #   2. addressed-elsewhere    agent-author commit after createdAt
 #                             touching the anchored file
 #   3. rebuttal-recorded      ≥30-char agent-author reply on thread
@@ -672,6 +821,19 @@ derive_tag_class() {
   # 1. canonical-coverage
   if path_matches_manifest "$thread_path"; then
     echo "canonical-coverage"
+    return
+  fi
+
+  # 1b. templated-render (#323) — path matches a templated entry's
+  # dest. Same "mergepath concern" routing as canonical-coverage; the
+  # rendered output came from a template in mergepath, so the fix
+  # should land in mergepath too. We don't (and can't, from here)
+  # re-run verify-propagation-pr.sh to confirm the bytes match — but
+  # the path predicate alone is the right signal: if a thread is
+  # anchored on the templated dest, the durable fix is either in
+  # mergepath's template or in the consumer's facts:* block.
+  if path_matches_templated_dest "$thread_path"; then
+    echo "templated-render"
     return
   fi
 
@@ -796,6 +958,18 @@ synth_rationale() {
         echo "path $thread_path is propagated canonical content (.mergepath-sync.yml)."
       else
         echo "thread is on propagated canonical content (.mergepath-sync.yml)."
+      fi
+      ;;
+    templated-render)
+      # #323 — the dest is rendered from a mergepath template with
+      # consumer facts. verify-propagation-pr.sh re-renders and
+      # byte-compares as part of the propagation-lane gate; if a
+      # thread persists on a templated dest, the durable fix lives in
+      # mergepath's template or the consumer's facts:* block.
+      if [ -n "$thread_path" ] && [ "$thread_path" != "(no path)" ]; then
+        echo "$thread_path is a templated dest rendered from mergepath; fix belongs in the template or consumer facts."
+      else
+        echo "thread is on a templated dest rendered from mergepath; fix belongs in the template or consumer facts."
       fi
       ;;
     nitpick-noted)

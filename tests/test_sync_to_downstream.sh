@@ -33,19 +33,20 @@ trap 'rm -rf "$WORKDIR"' EXIT
 # Fixture: a minimal "mergepath" with two canonical files and one kit dir
 # ---------------------------------------------------------------------------
 MP="$WORKDIR/mergepath"
-mkdir -p "$MP/scripts/hooks" "$MP/scripts/ci" "$MP/scripts/sync" "$MP/.github/workflows"
+mkdir -p "$MP/scripts/hooks" "$MP/scripts/ci" "$MP/scripts/sync" "$MP/scripts/lib" "$MP/.github/workflows"
 echo "canonical-script-v1" >"$MP/scripts/keep-in-sync.sh"
 echo "canonical-hook-v1"   >"$MP/scripts/hooks/the-hook.sh"
 echo "kit-file-1" >"$MP/scripts/ci/check_one"
 echo "kit-file-2" >"$MP/scripts/ci/check_two"
 
-# sync-to-downstream.sh sources scripts/sync/apply-overrides.sh from
-# its MERGEPATH_ROOT at startup (#199 integration). Mirror the real
-# library into the synthetic fixture so the source line resolves
-# instead of failing with "No such file or directory" — that
-# regression would surface as the audit block tests above failing
-# their existence check on the consumer-header line.
+# sync-to-downstream.sh sources scripts/sync/apply-overrides.sh AND
+# scripts/lib/manifest-fact-helpers.sh from its MERGEPATH_ROOT at
+# startup (#199 / #323). Mirror both libs into the synthetic fixture
+# so the source lines resolve instead of failing with "No such file
+# or directory" — that regression would surface as the audit block
+# tests above failing their existence check on the consumer-header line.
 cp "$ROOT/scripts/sync/apply-overrides.sh" "$MP/scripts/sync/apply-overrides.sh"
+cp "$ROOT/scripts/lib/manifest-fact-helpers.sh" "$MP/scripts/lib/manifest-fact-helpers.sh"
 
 cat >"$MP/.mergepath-sync.yml" <<'EOF'
 version: 1
@@ -241,8 +242,9 @@ echo "$hostile_output" | grep -qE "it is a symbolic link|resolves outside MERGEP
 # ---------------------------------------------------------------------------
 sync_workdir="$WORKDIR/sync"
 SYNC_MP="$sync_workdir/mergepath"
-mkdir -p "$SYNC_MP/scripts/hooks" "$SYNC_MP/scripts/ci" "$SYNC_MP/scripts/sync" "$SYNC_MP/.github"
+mkdir -p "$SYNC_MP/scripts/hooks" "$SYNC_MP/scripts/ci" "$SYNC_MP/scripts/sync" "$SYNC_MP/scripts/lib" "$SYNC_MP/.github"
 cp "$ROOT/scripts/sync/apply-overrides.sh" "$SYNC_MP/scripts/sync/apply-overrides.sh"
+cp "$ROOT/scripts/lib/manifest-fact-helpers.sh" "$SYNC_MP/scripts/lib/manifest-fact-helpers.sh"
 cat >"$SYNC_MP/.mergepath-sync.yml" <<'YAML'
 version: 1
 consumers:
@@ -351,8 +353,9 @@ set -e
 # ---------------------------------------------------------------------------
 guard_workdir="$WORKDIR/guard"
 GUARD_MP="$guard_workdir/mergepath"
-mkdir -p "$GUARD_MP/scripts" "$GUARD_MP/scripts/sync" "$GUARD_MP/.github"
+mkdir -p "$GUARD_MP/scripts" "$GUARD_MP/scripts/sync" "$GUARD_MP/scripts/lib" "$GUARD_MP/.github"
 cp "$ROOT/scripts/sync/apply-overrides.sh" "$GUARD_MP/scripts/sync/apply-overrides.sh"
+cp "$ROOT/scripts/lib/manifest-fact-helpers.sh" "$GUARD_MP/scripts/lib/manifest-fact-helpers.sh"
 cat >"$GUARD_MP/.mergepath-sync.yml" <<'YAML'
 version: 1
 consumers:
@@ -637,8 +640,9 @@ grep -q 'trap .rm -rf "\$workspace". RETURN' "$SCRIPT" \
 syncall_workdir="$WORKDIR/syncall"
 SA_MP="$syncall_workdir/mergepath"
 SA_SIBLINGS="$syncall_workdir/siblings"
-mkdir -p "$SA_MP/scripts/hooks" "$SA_MP/scripts/ci" "$SA_MP/scripts/sync" "$SA_MP/.github"
+mkdir -p "$SA_MP/scripts/hooks" "$SA_MP/scripts/ci" "$SA_MP/scripts/sync" "$SA_MP/scripts/lib" "$SA_MP/.github"
 cp "$ROOT/scripts/sync/apply-overrides.sh" "$SA_MP/scripts/sync/apply-overrides.sh"
+cp "$ROOT/scripts/lib/manifest-fact-helpers.sh" "$SA_MP/scripts/lib/manifest-fact-helpers.sh"
 cat >"$SA_MP/.mergepath-sync.yml" <<'YAML'
 version: 1
 consumers:
