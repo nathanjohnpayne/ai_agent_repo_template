@@ -251,16 +251,23 @@ git_quiet -C "$C5" add -A
 git_quiet -C "$C5" commit -q -m base
 BASE_SHA=$(git -C "$C5" rev-parse HEAD)
 printf '%s' "$RENDERED5" >"$C5/rendered.txt"
-chmod +x "$C5/rendered.txt"
 git_quiet -C "$C5" add -A
+# Force the exec bit IN THE INDEX regardless of the filesystem's
+# core.filemode. The prior version used `chmod +x` alone, which only
+# updates the working tree — on a filesystem that ignores mode bits
+# (Windows/WSL, some networked filesystems) or in a repo with
+# `core.filemode=false`, git still records `100644 blob` and the
+# fixture-setup guard below fails BEFORE exercising the actual
+# mode-tampering check. `git update-index --chmod=+x` writes mode
+# 100755 directly into the index, capturing the executable bit on
+# the next commit even when filesystem mode bits are unavailable.
+# (CR Minor on PR #329, addressed as #329 follow-up.)
+git_quiet -C "$C5" update-index --chmod=+x rendered.txt
 git_quiet -C "$C5" commit -q -m head
 HEAD_SHA=$(git -C "$C5" rev-parse HEAD)
-# Confirm fixture set the executable bit correctly before invoking
-# the verifier — `git update-index --chmod=+x` would also work but
-# `chmod +x` + `add -A` is the path most agents would use.
 fixture_entry=$(git -C "$C5" ls-tree HEAD -- rendered.txt | awk '{print $1, $2}')
 if [ "$fixture_entry" != "100755 blob" ]; then
-  fail "Case 5 fixture setup: expected 100755 blob, got [$fixture_entry] — chmod didn't take in the test repo"
+  fail "Case 5 fixture setup: expected 100755 blob, got [$fixture_entry] — update-index --chmod=+x didn't take"
 else
   run_verify "$MP5" "$C5"
   if [ "$RC" -ne 1 ]; then
