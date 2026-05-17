@@ -361,12 +361,18 @@ template_substitution::render_to() {
     return 2
   fi
   # Capture existing dest mode (if any) before render — we need it
-  # before the rename clobbers the dest inode. `stat -f` is BSD/
-  # macOS; `stat -c` is GNU/Linux. Try both, fall back to empty.
+  # before the rename clobbers the dest inode. `stat -c` is GNU/
+  # Linux; `stat -f` is BSD/macOS. Try GNU first because that's the
+  # CI runner — and crucially because GNU `stat -f` means "filesystem
+  # status" (not "format"), so a BSD-first fallback chain writes
+  # filesystem text to stdout on Linux before failing, contaminating
+  # dest_mode with multi-line garbage (Codex P1 round 3 on PR #313).
+  # GNU `stat -c '%a'` and BSD `stat -f '%Mp%Lp'` both yield the
+  # mode in a chmod-acceptable form (e.g. "644" or "0644").
   local dest_mode=""
   if [ -e "$dest" ]; then
-    dest_mode=$(stat -f '%Mp%Lp' "$dest" 2>/dev/null \
-                || stat -c '%a' "$dest" 2>/dev/null \
+    dest_mode=$(stat -c '%a' "$dest" 2>/dev/null \
+                || stat -f '%Mp%Lp' "$dest" 2>/dev/null \
                 || printf '')
   fi
   local tmp

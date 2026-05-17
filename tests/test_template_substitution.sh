@@ -418,9 +418,12 @@ echo "new: {{key}}" > "$src"
   source "$LIB"
   template_substitution::render_to "$src" "$dest"
 )
-# Read mode in a portable way (same logic as the lib).
-actual_mode=$(stat -f '%Mp%Lp' "$dest" 2>/dev/null \
-              || stat -c '%a' "$dest" 2>/dev/null \
+# Read mode in a portable way (same order as the lib — GNU first, BSD
+# fallback; the inverse order breaks on Linux because GNU `stat -f`
+# means filesystem status, not format, and writes garbage to stdout
+# before failing).
+actual_mode=$(stat -c '%a' "$dest" 2>/dev/null \
+              || stat -f '%Mp%Lp' "$dest" 2>/dev/null \
               || echo "??")
 # BSD stat returns "0644", GNU returns "644". Accept both.
 case "$actual_mode" in
