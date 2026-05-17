@@ -278,7 +278,7 @@ module.exports = [
   },
 // <<<
 
-// >>> if !react_compiler
+// >>> if react_compiler != true
   // React Compiler advisories — these rules ship in
   // eslint-plugin-react-hooks but are only meaningful once the
   // React Compiler is adopted. Until then, disable them to silence
@@ -286,13 +286,18 @@ module.exports = [
   // ref-during-render in TipTap-style editors). Flip
   // `facts.react_compiler: true` to suppress this block.
   //
-  // Gated on `!react_compiler` alone (NOT also on `frameworks
-  // contains react` — v1 templating can't combine expressions).
-  // For non-React consumers the block still renders, but the
-  // react-hooks/* rule keys reference a plugin that ESLint hasn't
-  // loaded; ESLint silently ignores unknown rule keys, so the
-  // no-op cost is the four disabled-rule entries in the rendered
-  // config, not a failed load.
+  // Gated on `react_compiler != true` (NOT `!react_compiler`) so
+  // that an explicit `facts.react_compiler: false` correctly
+  // renders the disable block. `!<key>` treats the fact as truthy
+  // when set to the string "false" because eval_expr only checks
+  // non-emptiness; the explicit `!= true` comparison reads as the
+  // documented "unset or anything other than true" semantics
+  // (caught by codex/CodeRabbit on PR #327). For non-React
+  // consumers the block still renders, but the react-hooks/* rule
+  // keys reference a plugin that ESLint hasn't loaded; ESLint
+  // silently ignores unknown rule keys, so the no-op cost is the
+  // four disabled-rule entries in the rendered config, not a
+  // failed load.
   {
     rules: {
       "react-hooks/set-state-in-effect": "off",
