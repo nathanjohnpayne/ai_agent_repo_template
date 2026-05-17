@@ -634,11 +634,20 @@ path_matches_manifest() {
   return 1
 }
 
-# fetch_manifest_templated_dests — extract the dest paths of every
-# templated entry in the manifest (#323). Templated entries decouple
-# source from dest (the whole point), so a thread anchored on a
-# templated dest path doesn't match path_matches_manifest above (which
-# reads only .path). Cached.
+# fetch_manifest_templated_dests — extract dest + eligible consumer
+# slugs for every templated entry in the manifest (#323). Templated
+# entries decouple source from dest (the whole point), so a thread
+# anchored on a templated dest path doesn't match path_matches_manifest
+# above (which reads only .path). Cached.
+#
+# Cache format: one line per entry, `dest<TAB>repo1,repo2,...` where
+# each repoN is the full owner/name slug looked up from
+# `.consumers[].repo` via the entry's `.consumers[] (name)` list. The
+# repo-slug scoping closes the codex P2 from PR #329 round 1: without
+# it, ANY repo whose local file matched the dest path got the
+# `templated-render` class, even repos not opted into that entry —
+# suppressing substantive unresolved feedback on unrelated files in
+# the daily rollup.
 MANIFEST_TEMPLATED_DESTS_CACHE=""
 MANIFEST_TEMPLATED_FETCHED=false
 fetch_manifest_templated_dests() {
@@ -647,13 +656,31 @@ fetch_manifest_templated_dests() {
   local manifest="$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
   [ -f "$manifest" ] || return 0
   if command -v yq >/dev/null 2>&1; then
+    # Resolve each entry's consumer-name list to repo slugs in one
+    # pass. `. as $root` exposes the top-level consumers table for
+    # the inner lookup. Output: `dest<TAB>repo,repo,...`. The yq
+    # `\t` is a literal tab in the format string.
     MANIFEST_TEMPLATED_DESTS_CACHE=$(yq -r '
-      .paths[] | select(.type == "templated") | (.dest // .path)
+      . as $root |
+      .paths[] | select(.type == "templated") |
+      [
+        (.dest // .path),
+        (.consumers // [] |
+          map(. as $name |
+            $root.consumers[] | select(.name == $name) | .repo) |
+          join(","))
+      ] | @tsv
     ' "$manifest" 2>/dev/null || true)
   else
     # awk fallback — mirrors the canonical-paths fallback above. Pair
     # `type:` and `dest:` (or fall back to `path:`) within a `paths:`
-    # block entry. Less precise than yq but enough for the no-yq case.
+    # block entry. Less precise than yq: the consumer-scope filter is
+    # SKIPPED because cross-referencing consumer names to repo slugs
+    # in awk is brittle. In the no-yq case we fall back to the
+    # pre-fix loose-match behavior (over-classify rather than
+    # under-classify); the rollup is advisory and over-classification
+    # is the more recoverable failure mode. Cache lines have empty
+    # consumer-list (tab + empty), interpreted as "match any repo".
     MANIFEST_TEMPLATED_DESTS_CACHE=$(awk '
       /^paths:/ { in_p = 1; next }
       in_p && /^[^[:space:]#]/ { in_p = 0 }
@@ -673,24 +700,43 @@ fetch_manifest_templated_dests() {
       }
       /^[[:space:]]*type:[[:space:]]*templated/ {
         cur_type = "templated"
-        print (cur_dest != "" ? cur_dest : cur_path)
+        printf "%s\t\n", (cur_dest != "" ? cur_dest : cur_path)
       }
     ' "$manifest")
   fi
 }
 
 # path_matches_templated_dest <file-path> → exit 0 if it matches a
-# templated entry's dest path, 1 otherwise. Used by derive_tag_class
-# to emit the `templated-render` class (#323).
+# templated entry's dest path AND the current repo ($REPO) is in that
+# entry's consumers list, 1 otherwise. Used by derive_tag_class to
+# emit the `templated-render` class (#323). The consumer-scope check
+# closes codex P2 from PR #329 round 1.
 path_matches_templated_dest() {
   local file_path="$1"
   [ -z "$file_path" ] && return 1
   [ "$file_path" = "(no path)" ] && return 1
   fetch_manifest_templated_dests
   [ -z "$MANIFEST_TEMPLATED_DESTS_CACHE" ] && return 1
-  while IFS= read -r d; do
-    [ -z "$d" ] && continue
-    [ "$file_path" = "$d" ] && return 0
+  local line dest consumers
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    # Split on the first tab. Two-field TSV: dest<TAB>repo1,repo2,...
+    dest="${line%%$'\t'*}"
+    consumers="${line#*$'\t'}"
+    [ "$file_path" = "$dest" ] || continue
+    # Empty consumers field (yq query returned no matches OR awk
+    # fallback emitted no scoping) — fall back to loose match. See
+    # awk fallback comment above for the trade-off.
+    if [ -z "$consumers" ]; then
+      return 0
+    fi
+    # The current repo ($REPO, populated from --repo arg or origin
+    # remote at module-load) MUST appear in the comma-separated
+    # consumers list. Anchored grep avoids partial-name false hits
+    # (e.g., `owner/matchline` vs `owner/matchline-app`).
+    if printf ',%s,' "$consumers" | grep -qF ",$REPO,"; then
+      return 0
+    fi
   done <<< "$MANIFEST_TEMPLATED_DESTS_CACHE"
   return 1
 }
