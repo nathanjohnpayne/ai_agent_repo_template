@@ -14,14 +14,24 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_export_consumer_facts.sh"
 SYNC_SCRIPT="$REPO_ROOT/scripts/sync-to-downstream.sh"
 
-# Skip when running in a consumer checkout — the script being
-# tested (scripts/sync-to-downstream.sh's export_consumer_facts
-# function) is mergepath-internal and not propagated. Same
-# rationale as check_template_substitution above; same Phase D 4b
-# review surfacing.
+# Disambiguate consumer-side vs mergepath-side misconfig via the
+# .mergepath-sync.yml marker (intentionally not propagated to
+# consumers). Same pattern as check_template_substitution.
+#
+# - sync script missing AND .mergepath-sync.yml missing →
+#   consumer checkout that received the kit-propagated wrapper →
+#   SKIP exit 0
+# - sync script missing AND .mergepath-sync.yml present →
+#   mergepath misconfig (sync script accidentally deleted/renamed)
+#   → FAIL exit 1. Codex P2 round 2 on PR #321 caught the fail-
+#   open risk on the blanket SKIP.
 if [ ! -f "$SYNC_SCRIPT" ]; then
-  echo "check_export_consumer_facts: SKIP (mergepath-only: scripts/sync-to-downstream.sh not present in this checkout)"
-  exit 0
+  if [ ! -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
+    echo "check_export_consumer_facts: SKIP (consumer checkout: scripts/sync-to-downstream.sh + .mergepath-sync.yml both absent)"
+    exit 0
+  fi
+  echo "FAIL: scripts/sync-to-downstream.sh is missing but .mergepath-sync.yml IS present — mergepath misconfig (sync script accidentally deleted/renamed?)" >&2
+  exit 1
 fi
 
 if [ ! -f "$TEST_SCRIPT" ]; then

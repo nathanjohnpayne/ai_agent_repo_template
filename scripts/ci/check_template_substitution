@@ -14,18 +14,26 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_template_substitution.sh"
 LIB="$REPO_ROOT/scripts/lib/template-substitution.sh"
 
-# Skip when running in a consumer checkout — the lib being tested
-# (scripts/lib/template-substitution.sh) is mergepath-internal and
-# isn't propagated to consumers. The wrapper IS propagated (it
-# lives under the scripts/ci/ kit which mirrors as a unit), but
-# its target lib isn't. Without this skip, every consumer running
-# this check ad-hoc gets "missing $TEST_SCRIPT" or a parse error
-# on the missing lib reference inside the test. Detected by lib
-# absence — present in mergepath, absent in consumers. (Phase D
-# 4b review by nathanpayne-codex on consumer PRs surfaced this.)
+# Disambiguate consumer-side vs mergepath-side misconfig using the
+# .mergepath-sync.yml marker (intentionally not propagated to
+# consumers per the inline comment in that file).
+#
+# - lib missing AND .mergepath-sync.yml missing → consumer checkout
+#   that received the kit-propagated wrapper without the
+#   mergepath-internal lib → SKIP (exit 0). Phase D 4b on consumer
+#   PRs surfaced the previous fail-on-consumer behavior.
+# - lib missing AND .mergepath-sync.yml present → mergepath itself
+#   lost the lib (accidental deletion/rename in a PR) → FAIL (exit
+#   1). Without this branch, the SKIP would fail-open on mergepath
+#   and the lib's regression test suite would silently stop
+#   running (Codex P2 round 2 on PR #321).
 if [ ! -f "$LIB" ]; then
-  echo "check_template_substitution: SKIP (mergepath-only: scripts/lib/template-substitution.sh not present in this checkout)"
-  exit 0
+  if [ ! -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
+    echo "check_template_substitution: SKIP (consumer checkout: scripts/lib/template-substitution.sh + .mergepath-sync.yml both absent)"
+    exit 0
+  fi
+  echo "FAIL: scripts/lib/template-substitution.sh is missing but .mergepath-sync.yml IS present — mergepath misconfig (lib accidentally deleted/renamed?)" >&2
+  exit 1
 fi
 
 if [ ! -f "$TEST_SCRIPT" ]; then
