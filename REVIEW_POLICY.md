@@ -75,7 +75,10 @@ matters for audit-trail consistency.
 > mergepath ecosystem. `CLAUDE.md` (project), `AGENTS.md`, and
 > `DEPLOYMENT.md` all reference this section instead of duplicating
 > the table. Machine-level `~/GitHub/CLAUDE.md` mirrors the same
-> rows for cross-repo work.
+> rows for cross-repo work. The same four identities also have SSH
+> signing keys uploaded to GitHub — see the
+> [SSH Signing Keys](#ssh-signing-keys) section below for the
+> inventory + verify/re-upload commands.
 
 | Agent | Reviewer Identity | 1Password Item ID | Cached env var (primary) | `op read` path (setup-only fallback) |
 |-------|-------------------|-------------------|--------------------------|--------------------------------------|
@@ -147,6 +150,79 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
   approve goes through.) If you intentionally skipped `--approve` under
   the no-self-approve scoping rule below (Phase 4 / above-threshold
   PRs), post `--comment` instead and let Phase 4 carry the gate.
+
+### SSH Signing Keys
+
+> This is the **canonical source** for SSH signing key inventory
+> across the mergepath ecosystem. Machine-level `~/GitHub/CLAUDE.md`
+> mirrors the same rows for cross-repo work. Sister-table to the
+> [PAT lookup table](#pat-lookup-table) above: both inventory the
+> same four identities, just for different per-identity artifacts.
+
+Every identity in the [PAT lookup table](#pat-lookup-table) above also
+has an SSH signing key uploaded to its GitHub account so commits and
+tags attributed to that login render as **Verified** instead of the
+"this user has not yet uploaded their public signing key" notice. By
+convention every key on a given machine shares the title
+`<machine-name>-signing-key` (currently `mergepath-mac signing key`
+for the first Mac in the rotation; titles get per-machine suffixes
+once a second machine joins). The local pub keys live in
+`~/.ssh/keys/` and are referenced (for auth, not signing) by
+`~/.ssh/config`.
+
+| Account             | Local pub key                            | GitHub signing key id (mergepath-mac) |
+|---------------------|------------------------------------------|---------------------------------------|
+| nathanjohnpayne     | `~/.ssh/keys/github_nathanjohnpayne.pub` | 928533                                |
+| nathanpayne-claude  | `~/.ssh/keys/github_claude.pub`          | 949665                                |
+| nathanpayne-cursor  | `~/.ssh/keys/github_cursor.pub`          | 949666                                |
+| nathanpayne-codex   | `~/.ssh/keys/github_codex.pub`           | 949667                                |
+
+**Why all four — including the bot accounts.** Local `git commit` only
+ever signs as `nathanjohnpayne` (`git config --global user.signingkey`
+is the human identity per the active-account convention above), so the
+human's key is the one git invokes day-to-day. The bot accounts need
+keys uploaded so that GitHub-attributed activity verifies correctly
+under their logins: web-flow commits a bot makes via the GitHub UI,
+future API-authored commits via `PUT /repos/:owner/:repo/contents/:path`,
+or any other surface where GitHub does the signing on behalf of the
+bot identity. Without the upload, every such commit renders with the
+"this user has not yet uploaded their public signing key" notice and
+a yellow "Partial Verified" badge.
+
+**Verify** — read-only check, should return exactly one entry per
+account (titled `mergepath-mac signing key` on this Mac):
+
+```bash
+eval "$(/opt/homebrew/bin/brew shellenv)"
+for acct in nathanpayne-claude nathanpayne-cursor nathanpayne-codex nathanjohnpayne; do
+  echo "=== $acct ==="
+  GH_TOKEN="$(gh auth token --user "$acct")" \
+    gh api /user/ssh_signing_keys --jq '.[] | {id, title, key: (.key[0:60])}'
+done
+```
+
+**Re-upload (missing key, revoked, or new machine bootstrap):**
+
+```bash
+eval "$(/opt/homebrew/bin/brew shellenv)"
+acct="nathanpayne-<bot>"          # claude | cursor | codex
+pub="$HOME/.ssh/keys/github_<bot>.pub"
+GH_TOKEN="$(gh auth token --user "$acct")" gh api -X POST /user/ssh_signing_keys \
+  -f "title=mergepath-mac signing key" \
+  -f "key=$(cat "$pub")"
+```
+
+The bot PATs already carry the `admin:ssh_signing_key` scope, so no
+re-auth is required for routine uploads. The `/user/ssh_signing_keys`
+endpoint operates on the authenticated user, so `GH_TOKEN` is honored
+directly — no `scripts/gh-as-author.sh` / `gh auth switch` dance is
+needed (unlike reviewer-byline writes covered by the active-account
+convention above).
+
+**On a new machine.** The key-id column above is per-machine; a second
+machine joining the rotation will have its own ids and should use a
+distinguishing title (e.g. `mergepath-linux-signing-key`). The
+verification + re-upload commands above are machine-agnostic.
 
 ### No-self-approve scoping
 
