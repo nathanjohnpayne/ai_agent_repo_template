@@ -311,15 +311,6 @@ module.exports = [
 // don't reference react-hooks/* on files where the plugin isn't
 // loaded — codex P1 #327 round 3). The standalone block previously
 // at this position has been removed.
-  {
-    rules: {
-      "react-hooks/set-state-in-effect": "off",
-      "react-hooks/preserve-manual-memoization": "off",
-      "react-hooks/refs": "off",
-      "react-hooks/immutability": "off",
-    },
-  },
-// <<<
 
 // >>> if testing contains vitest
   // Vitest globals — applied to common test file patterns. Without
