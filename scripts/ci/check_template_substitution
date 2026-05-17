@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# scripts/ci/check_template_substitution — CI entry point for the
+# Layer 5 template-substitution lib tests.
+#
+# Wraps tests/test_template_substitution.sh so the repo_lint workflow's
+# explicit check_* list picks it up. The lib at
+# scripts/lib/template-substitution.sh is the substitution engine for
+# `type: templated` manifest entries (activated in a follow-up PR);
+# this check guards the lib's contract independently of integration.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_template_substitution.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_template_substitution: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
