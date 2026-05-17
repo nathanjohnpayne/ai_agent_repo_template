@@ -542,6 +542,39 @@ else
   fail "Case 18 unexpected (rc=$rc): $out"
 fi
 
+# Case 18c: .paths[] entry missing `path` field rejected (fail-closed,
+# was silent-skip). CodeRabbit Major + Codex Phase 4b CHANGES_REQUESTED
+# on Phase D consumer PRs both flagged the same gap.
+MANIFEST_NO_PATH="$MIN_HEADER
+  - type: canonical
+    consumers: all
+"
+PATHS_NO_PATH="scripts/foo.sh"
+set +e
+out=$(run_with_fixture "$MANIFEST_NO_PATH" "$PATHS_NO_PATH"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'path' field"; then
+  pass "Case 18c: .paths[] entry without path field rejected (fail-closed)"
+else
+  fail "Case 18c unexpected (rc=$rc): $out"
+fi
+
+# Case 18d: .paths[] entry with explicit empty path: "" rejected.
+MANIFEST_EMPTY_PATH="$MIN_HEADER
+  - path: \"\"
+    type: canonical
+    consumers: all
+"
+PATHS_EMPTY_PATH="scripts/foo.sh"
+set +e
+out=$(run_with_fixture "$MANIFEST_EMPTY_PATH" "$PATHS_EMPTY_PATH"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q 'explicit path: ""'; then
+  pass "Case 18d: .paths[] entry with explicit empty path rejected"
+else
+  fail "Case 18d unexpected (rc=$rc): $out"
+fi
+
 # Case 18b: explicit source: "" rejected (parallel to dest).
 MANIFEST_SRC_EMPTY="$MIN_HEADER
   - path: examples/foo.js

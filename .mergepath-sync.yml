@@ -378,6 +378,25 @@ paths:
   - path: tests/test_daily_feedback_rollup.sh
     type: canonical
     consumers: all
+  # Pairs with scripts/lib/template-substitution.sh (#313) +
+  # scripts/ci/check_template_substitution. The check wrapper hard-
+  # fails on the missing test file; without this propagated, every
+  # consumer's check_template_substitution exits 1 on the wrapper's
+  # `missing $TEST_SCRIPT` branch. Same #264 coupling class as the
+  # other paired-test entries above. Surfaced as nathanpayne-codex
+  # Phase 4b CHANGES_REQUESTED on all five Phase D consumer PRs.
+  - path: tests/test_template_substitution.sh
+    type: canonical
+    consumers: all
+  # Pairs with scripts/sync-to-downstream.sh's export_consumer_facts +
+  # scripts/ci/check_export_consumer_facts. Same coupling class as
+  # above — the check wrapper hard-fails on missing test file. Filed
+  # in mergepath#319 alongside the export_consumer_facts hotfix but
+  # the test file itself wasn't added to the manifest at the time.
+  # nathanpayne-codex Phase 4b CHANGES_REQUESTED caught the gap.
+  - path: tests/test_export_consumer_facts.sh
+    type: canonical
+    consumers: all
 
   # Canonical workflows — review policy + automation surfaces that
   # should be lockstep across all consumers.
@@ -473,6 +492,8 @@ paths:
       - "tests/test_disagreement_detector.sh"  # check_disagreement_detector
       - "tests/test_verify_propagation_pr.sh"  # check_verify_propagation_pr
       - "tests/test_resolve_pr_threads_rationale_tag.sh"  # check_resolve_pr_threads (delegated test)
+      - "tests/test_template_substitution.sh"  # check_template_substitution
+      - "tests/test_export_consumer_facts.sh"  # check_export_consumer_facts
       - "scripts/codex-p1-gate.sh"             # check_codex_p1_gate
       - "scripts/codex-review-request.sh"      # check_codex_scripts
       - "scripts/codex-review-check.sh"        # check_codex_scripts, check_canonical_bugs_263caf3
