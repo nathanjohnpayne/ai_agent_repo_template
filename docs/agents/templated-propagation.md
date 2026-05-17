@@ -8,7 +8,7 @@ This doc covers `scripts/lib/template-substitution.sh` — the rendering engine 
 
 Renders a source template to per-consumer output using two surfaces:
 
-1. **Variable substitution** — anywhere in the file, `{{key}}` is replaced by the value of `MERGEPATH_FACT_KEY` (uppercased, hyphens → underscores).
+1. **Variable substitution** — anywhere in the file, `{{key}}` is replaced by the value of `MERGEPATH_FACT_KEY` (uppercased, hyphens → underscores). Keys must match `[a-z0-9_-]+` (lowercase letters, digits, underscore, hyphen); a malformed key — e.g. one containing shell metacharacters — is rejected as malformed template (render exit code 1), distinct from a syntactically valid but unset fact (which is empty in lenient mode or exit code 3 in strict mode).
 2. **Conditional blocks** — `>>> if <expr> ... <<<` markers gate body lines on per-consumer facts. Marker lines are **always stripped** from output regardless of the expression; only the body lines between them are conditional. If `<expr>` is true, body lines are emitted verbatim; if false, body lines are dropped.
 
 Sync-side integration (follow-up PR) is responsible for exporting per-consumer facts from the manifest before invoking the lib. The lib itself reads facts only from the environment.
@@ -58,7 +58,7 @@ Inside `>>> if <expr>`, the lib supports:
 
 `contains` matches at word boundaries — `frameworks contains react` is false when `MERGEPATH_FACT_FRAMEWORKS="react-native"`, true when it's `"react typescript"`. Use distinct values for distinct concepts; don't rely on substring matching.
 
-Anything else in the expression slot is a malformed-template error (exit code 1) with a diagnostic listing the supported forms.
+Anything else in the expression slot (including a `<key>` that fails the `[a-z0-9_-]+` charset check) is a malformed-template error (exit code 1) with a diagnostic listing the supported forms.
 
 ### v1 deliberately omits
 
@@ -86,7 +86,7 @@ template_substitution::eval_expr "frameworks contains react"
 # Returns 0 (true), 1 (false), or 2 (malformed expression).
 ```
 
-The lib is `set -euo pipefail` internally but does not toggle global `set` state during rendering — callers can use the standard `|| rc=$?` pattern to capture the exit code without their own `set -e` being clobbered.
+The lib enables `set -euo pipefail` **only** when the file is executed directly (the noop usage-hint path at the bottom). When sourced — the normal case — no global shell options are toggled, so `render` and `render_to` will not clobber the caller's `set -e` / `set -u` / `pipefail` state. Callers capture exit codes with the standard `|| rc=$?` pattern.
 
 ## Why this syntax — design rationale
 
